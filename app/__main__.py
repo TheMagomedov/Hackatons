@@ -19,6 +19,23 @@ from app.storage import Repository
 
 
 async def execute(args) -> None:
+    if args.command in {"backup", "verify-backup", "restore"}:
+        from app.ops.backup import backup_data, restore_data, verify_backup
+
+        if args.command == "backup":
+            if not args.data_dir or not args.output:
+                raise InvalidInput("Для backup укажите --data-dir и новый --output.")
+            result = backup_data(args.data_dir, args.output)
+        elif args.command == "verify-backup":
+            if not args.backup_dir:
+                raise InvalidInput("Укажите --backup-dir.")
+            result = verify_backup(args.backup_dir)
+        else:
+            if not args.backup_dir or not args.data_dir:
+                raise InvalidInput("Для restore укажите --backup-dir и новый --data-dir.")
+            result = restore_data(args.backup_dir, args.data_dir)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "demo":
         destination = Path(args.data_dir or "var") / f"demo-{uuid4().hex[:12]}"
         with InstanceLock(destination / "backend.lock"):
@@ -75,10 +92,25 @@ def main() -> int:
         description="Backend автономного AI-маркетолога. По умолчанию — офлайн-демо."
     )
     parser.add_argument(
-        "command", nargs="?", choices=("demo", "init", "check", "run", "status", "adopt-data"), default="demo"
+        "command",
+        nargs="?",
+        choices=(
+            "demo",
+            "init",
+            "check",
+            "run",
+            "status",
+            "adopt-data",
+            "backup",
+            "verify-backup",
+            "restore",
+        ),
+        default="demo",
     )
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--output", help="Новый каталог резервной копии для backup")
+    parser.add_argument("--backup-dir", help="Существующая копия для verify-backup/restore")
     parser.add_argument("--once", action="store_true", help="Один цикл backend для команды run")
     parser.add_argument("--mode", choices=("demo", "live"), help="Режим существующих данных для adopt-data")
     parser.add_argument("--owner-id", type=int, help="Владелец существующих данных для adopt-data")
@@ -87,6 +119,12 @@ def main() -> int:
         parser.error("--mode и --owner-id используются только с adopt-data")
     if args.once and args.command != "run":
         parser.error("--once используется только с run")
+    if args.output and args.command != "backup":
+        parser.error("--output используется только с backup")
+    if args.backup_dir and args.command not in {"verify-backup", "restore"}:
+        parser.error("--backup-dir используется только с verify-backup/restore")
+    if args.data_dir and args.command == "verify-backup":
+        parser.error("Для verify-backup используется --backup-dir")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

@@ -1,9 +1,11 @@
 """Role 2's application boundary. Adapters never approve or publish directly."""
 
 import asyncio
+import hashlib
 import ipaddress
+import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -112,6 +114,74 @@ class BackendService:
                 "Внешний сервис вернул ответ, не соответствующий общему контракту."
             ) from None
 
+    async def _ai_operation(
+        self,
+        business: Business,
+        kind: str,
+        payload: dict,
+        model,
+        operation: Callable[[], Awaitable],
+        *,
+        request_id: str | None = None,
+    ):
+        """Reserve one durable logical provider operation before creating its coroutine.
+
+        Retries inside an adapter are bounded separately. This is an operation
+        quota, not a currency or token estimate. Terminal failed/interrupted
+        operations are never paid again for the same incoming event.
+        """
+        if request_id is not None:
+            self._plain_text(request_id, 200, "Некорректный идентификатор действия.")
+        key = request_id if request_id is not None else f"action:{uuid4()}"
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        entry = self.repo.begin_ai_operation(
+            business.owner_id,
+            business.id,
+            kind,
+            key,
+            fingerprint,
+            self.now(),
+            daily_limit=self.settings.max_ai_operations_per_day,
+            max_parallel=self.settings.max_concurrent_ai_operations,
+        )
+        if not entry["created"]:
+            if entry["status"] == "done":
+                return self._provider_result(model, entry["result"])
+            raise Conflict(
+                f"Действие {entry['id']} уже выполняется или завершилось с ошибкой. "
+                "Проверьте состояние; повторная платная обработка этого события отключена."
+            )
+        operation_id = entry["id"]
+        log.info("AI operation started id=%s kind=%s", operation_id, kind)
+        try:
+            result = self._provider_result(model, await operation())
+            self.repo.finish_ai_operation(operation_id, result.model_dump(mode="json"), self.now())
+            log.info("AI operation completed id=%s kind=%s", operation_id, kind)
+            return result
+        except BaseException as exc:
+            code = (
+                "cancelled"
+                if isinstance(exc, asyncio.CancelledError)
+                else (exc.code if isinstance(exc, AppError) else "operation_failed")
+            )
+            try:
+                self.repo.fail_ai_operation(operation_id, code, self.now())
+            except Exception as persist_error:
+                log.warning(
+                    "AI operation persistence failed id=%s code=%s",
+                    operation_id,
+                    type(persist_error).__name__,
+                )
+            log.warning("AI operation failed id=%s kind=%s code=%s", operation_id, kind, code)
+            if isinstance(exc, (AppError, asyncio.CancelledError)):
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            raise ProviderUnavailable(
+                f"Не удалось завершить AI-действие. Код операции: {operation_id}."
+            ) from None
+
     def _notification(
         self, business: Business, kind: str, text: str, post_id: str | None = None, job_id: str | None = None
     ) -> Notification:
@@ -166,6 +236,15 @@ class BackendService:
         self._owner(actor_id)
         return [b for b in self.repo.list_businesses() if b.owner_id == actor_id]
 
+    def accept_telegram_update(self, actor_id: int, event_key: str, digest: str) -> bool:
+        """Persist a receipt before routing, including for non-AI user actions.
+
+        This is at-most-once admission, separate from AI quota. After a process
+        interruption the owner can inspect state and send a new explicit action.
+        """
+        self._owner(actor_id)
+        return self.repo.claim_inbound_event(actor_id, event_key, digest, self.now())
+
     async def connect_channel(self, actor_id: int, business_id: str, channel_id: str) -> Business:
         business = self._business(actor_id, business_id)
         channel = self._provider_result(
@@ -186,6 +265,7 @@ class BackendService:
         self._business(actor_id, business_id)
         if not text.strip() or len(text.encode("utf-8")) > self.settings.max_upload_bytes:
             raise InvalidInput("Пустой или слишком большой источник.")
+        self._check_source_limits(business_id, extra_bytes=len(text.encode("utf-8")))
         source = Source(
             id=str(uuid4()),
             business_id=business_id,
@@ -201,6 +281,7 @@ class BackendService:
         self._business(actor_id, business_id)
         if not content.startswith(b"%PDF-"):
             raise InvalidInput("Ожидается PDF. Извлечение текста выполняет AI-модуль.")
+        self._check_source_limits(business_id, extra_bytes=len(content))
         asset = self.files.write(business_id, filename, content, "application/pdf", self.now())
         self.repo.add_asset(asset)
         source = Source(
@@ -244,6 +325,7 @@ class BackendService:
             raise InvalidInput(
                 "Укажите публичную HTTP(S)-страницу без пароля и нестандартного порта."
             ) from None
+        self._check_source_limits(business_id, extra_bytes=len(url.encode("utf-8")))
         source = Source(
             id=str(uuid4()), business_id=business_id, kind="url", name=url, url=url, created_at=self.now()
         )
@@ -254,9 +336,44 @@ class BackendService:
         self._business(actor_id, business_id)
         return self.repo.list_sources(business_id)
 
-    async def analyze_business(self, actor_id: int, business_id: str) -> Business:
-        business = self._business(actor_id, business_id)
+    def _check_source_limits(self, business_id: str, *, extra_bytes: int | None = None) -> list[Source]:
         sources = self.repo.list_sources(business_id)
+        count = len(sources) + int(extra_bytes is not None)
+        if count > self.settings.max_sources_per_business:
+            raise InvalidInput(
+                f"Для бизнеса допускается до {self.settings.max_sources_per_business} источников."
+            )
+        # Inspect stored sizes before loading PDF bodies into memory.
+        total = extra_bytes or 0
+        for source in sources:
+            total += (
+                self.repo.get_asset(source.asset_id).size
+                if source.asset_id
+                else len((source.text or source.url or "").encode("utf-8"))
+            )
+            if total > self.settings.max_source_bytes_total:
+                raise InvalidInput("Суммарный объём источников превышает лимит бизнеса.")
+        if total > self.settings.max_source_bytes_total:
+            raise InvalidInput("Суммарный объём источников превышает лимит бизнеса.")
+        return sources
+
+    async def analyze_business(
+        self, actor_id: int, business_id: str, *, request_id: str | None = None
+    ) -> Business:
+        business = self._business(actor_id, business_id)
+        await self._ai_operation(
+            business,
+            "analyze",
+            {"business_id": business_id},
+            Business,
+            lambda: self._analyze_business(actor_id, business_id),
+            request_id=request_id,
+        )
+        return self._business(actor_id, business_id)
+
+    async def _analyze_business(self, actor_id: int, business_id: str) -> Business:
+        business = self._business(actor_id, business_id)
+        sources = self._check_source_limits(business_id)
         if not sources:
             raise InvalidInput("Добавьте хотя бы один источник о бизнесе.")
         inputs = [
@@ -296,23 +413,39 @@ class BackendService:
             raise Conflict("Сначала подключите канал.")
 
     async def interpret_request(
-        self, actor_id: int, business_id: str, text: str, post_id: str | None = None
+        self,
+        actor_id: int,
+        business_id: str,
+        text: str,
+        post_id: str | None = None,
+        *,
+        request_id: str | None = None,
     ) -> TaskIntent:
         business = self._business(actor_id, business_id)
-        if not text.strip() or len(text) > 4000:
-            raise InvalidInput("Запрос должен содержать от 1 до 4000 символов.")
+        self._plain_text(text, 4000, "Запрос должен содержать от 1 до 4000 символов.")
         if post_id and self._post(actor_id, post_id).business_id != business_id:
             raise Forbidden("Пост относится к другому бизнесу.")
+
         # Intent is a suggestion only; there is deliberately no 'approve/publish' model action.
-        intent = self._provider_result(
+        async def interpret():
+            intent = self._provider_result(
+                TaskIntent,
+                await self._external(
+                    self.ai.interpret_request(text, {"business_id": business.id, "selected_post_id": post_id})
+                ),
+            )
+            if intent.post_id and intent.post_id != post_id:
+                raise InvalidInput("Выберите пост явно перед изменением.")
+            return intent
+
+        return await self._ai_operation(
+            business,
+            "interpret",
+            {"text": text, "post_id": post_id},
             TaskIntent,
-            await self._external(
-                self.ai.interpret_request(text, {"business_id": business.id, "selected_post_id": post_id})
-            ),
+            interpret,
+            request_id=request_id,
         )
-        if intent.post_id and intent.post_id != post_id:
-            raise InvalidInput("Выберите пост явно перед изменением.")
-        return intent
 
     def request_preparation(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
         business = self._business(actor_id, business_id)
@@ -341,6 +474,54 @@ class BackendService:
         job = self.repo.get_job(job_id)
         self._business(actor_id, job.business_id)
         return job
+
+    def list_jobs(self, actor_id: int, business_id: str) -> list[Job]:
+        self._business(actor_id, business_id)
+        return self.repo.list_jobs(business_id)
+
+    def cancel_job(self, actor_id: int, job_id: str) -> Job:
+        self.get_job(actor_id, job_id)
+        return self.repo.cancel_job(job_id, self.now())
+
+    def set_publications_paused(self, actor_id: int, business_id: str, paused: bool) -> Business:
+        self._business(actor_id, business_id)
+        if type(paused) is not bool:
+            raise InvalidInput("Признак паузы должен быть логическим значением.")
+        return self.repo.set_publications_paused(business_id, paused, self.now())
+
+    def ai_usage(self, actor_id: int) -> dict:
+        self._owner(actor_id)
+        return {
+            **self.repo.ai_usage(actor_id, self.now()),
+            "daily_limit": self.settings.max_ai_operations_per_day,
+            "parallel_limit": self.settings.max_concurrent_ai_operations,
+            "period_timezone": "UTC",
+        }
+
+    def list_ai_operations(
+        self,
+        actor_id: int,
+        business_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        self._owner(actor_id)
+        if business_id is not None:
+            self._business(actor_id, business_id)
+        return self.repo.list_ai_operations(actor_id, business_id, limit)
+
+    def failed_notifications(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
+        self._business(actor_id, business_id)
+        return self.repo.list_failed_notifications(business_id, limit=limit)
+
+    def get_failed_notification(self, actor_id: int, notification_id: str) -> dict:
+        self._owner(actor_id)
+        notification = self.repo.get_failed_notification(notification_id)
+        self._business(actor_id, notification["business_id"])
+        return notification
+
+    def retry_notification(self, actor_id: int, business_id: str, notification_id: str) -> Notification:
+        self._business(actor_id, business_id)
+        return self.repo.retry_notification(notification_id, business_id, self.now())
 
     def get_plan(self, actor_id: int, job_id: str) -> ContentPlan | None:
         self.get_job(actor_id, job_id)
@@ -406,8 +587,15 @@ class BackendService:
         business = self._business(actor_id, post.business_id)
         changes = {}
         if text is not None:
+            self._ready(business)
             changes["text"] = self._validate_caption(text)
             changes["is_demo"] = post.is_demo or self.settings.mode == "demo"
+            changes["profile_version"] = business.profile_version
+            changes["warnings"] = list(
+                dict.fromkeys(
+                    [*post.warnings, "Текст изменён вручную: проверьте соответствие указанным источникам."]
+                )
+            )
         if image_asset_id is not None:
             asset = self.repo.get_asset(image_asset_id)
             if asset.business_id != post.business_id or asset.mime_type not in {"image/png", "image/jpeg"}:
@@ -427,6 +615,18 @@ class BackendService:
         if not changes:
             raise InvalidInput("Нет изменений.")
         return self.repo.revise_post(post_id, expected_revision, changes, self.now())
+
+    def refresh_post_context(self, actor_id: int, post_id: str, expected_revision: int) -> PostView:
+        """Explicit human review against the current profile; never an approval."""
+        post = self._post(actor_id, post_id)
+        business = self._business(actor_id, post.business_id)
+        self._ready(business)
+        return self.repo.revise_post(
+            post_id,
+            expected_revision,
+            {"profile_version": business.profile_version},
+            self.now(),
+        )
 
     def _reserve_edit(
         self, actor_id: int, post_id: str, expected_revision: int, feedback: str
@@ -469,7 +669,32 @@ class BackendService:
         return None
 
     async def revise_text(
-        self, actor_id: int, post_id: str, expected_revision: int, feedback: str
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
+        *,
+        request_id: str | None = None,
+    ) -> PostView:
+        post = self._post(actor_id, post_id)
+        self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        await self._ai_operation(
+            self._business(actor_id, post.business_id),
+            "revise_text",
+            {"post_id": post_id, "revision": expected_revision, "feedback": feedback},
+            PostView,
+            lambda: self._revise_text(actor_id, post_id, expected_revision, feedback),
+            request_id=request_id,
+        )
+        return self._post(actor_id, post_id)
+
+    async def _revise_text(
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
     ) -> PostView:
         business, editing = self._reserve_edit(actor_id, post_id, expected_revision, feedback)
         try:
@@ -485,7 +710,13 @@ class BackendService:
             return self.repo.complete_edit(
                 editing.id,
                 editing.revision,
-                {"text": text, "is_demo": editing.is_demo or self.settings.mode == "demo"},
+                {
+                    "text": text,
+                    "is_demo": editing.is_demo or self.settings.mode == "demo",
+                    "profile_version": business.profile_version,
+                    "used_source_ids": draft.used_source_ids,
+                    "warnings": draft.warnings,
+                },
                 self.now(),
                 expected_profile_version=business.profile_version,
                 expected_channel_id=business.channel_id,
@@ -507,7 +738,32 @@ class BackendService:
             raise ProviderUnavailable("Не удалось завершить правку текста.") from None
 
     async def revise_image(
-        self, actor_id: int, post_id: str, expected_revision: int, feedback: str
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
+        *,
+        request_id: str | None = None,
+    ) -> PostView:
+        post = self._post(actor_id, post_id)
+        self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        await self._ai_operation(
+            self._business(actor_id, post.business_id),
+            "revise_image",
+            {"post_id": post_id, "revision": expected_revision, "feedback": feedback},
+            PostView,
+            lambda: self._revise_image(actor_id, post_id, expected_revision, feedback),
+            request_id=request_id,
+        )
+        return self._post(actor_id, post_id)
+
+    async def _revise_image(
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
     ) -> PostView:
         business, editing = self._reserve_edit(actor_id, post_id, expected_revision, feedback)
         try:
@@ -589,15 +845,29 @@ class BackendService:
         )
 
     async def prepare_next_job(self) -> bool:
+        usage = self.repo.ai_usage(self.settings.owner_id, self.now())
+        if (
+            usage["running"] >= self.settings.max_concurrent_ai_operations
+            or usage["used_today"] >= self.settings.max_ai_operations_per_day
+        ):
+            # Leave queued jobs pending while the owner has no capacity. The
+            # transactional operation reservation remains the final race guard.
+            return False
         job = self.repo.claim_job(self.now())
         if job is None:
             return False
         business = self.repo.get_business(job.business_id)
         try:
             self._ready(business)
+            self.repo.set_job_progress(job.id, "plan", 0, 0, self.now())
             request = f"{job.request}\nПодготовь не более {self.settings.max_posts_per_job} публикаций."
-            plan = self._provider_result(
-                ContentPlan, await self._external(self.ai.make_plan(business.profile, request))
+            plan = await self._ai_operation(
+                business,
+                "plan",
+                {"request": request, "profile_version": business.profile_version},
+                ContentPlan,
+                lambda: self._external(self.ai.make_plan(business.profile, request)),
+                request_id=f"job:{job.id}:plan",
             )
             self._current_context(business)
             if len(plan.items) > self.settings.max_posts_per_job:
@@ -605,18 +875,38 @@ class BackendService:
             self.repo.save_plan(business.id, job.id, plan, self.now())
             drafts = []
             source_ids = {source.id for source in self.repo.list_sources(business.id)}
-            for item in plan.items:
+            total = 1 + 2 * len(plan.items)
+            for index, item in enumerate(plan.items):
                 self._current_context(business)
-                text = self._provider_result(
-                    TextDraft, await self._external(self.ai.write_post(business.profile, item))
+                self.repo.set_job_progress(job.id, "text", 1 + 2 * index, total, self.now())
+                text = await self._ai_operation(
+                    business,
+                    "text",
+                    {"item": item.model_dump(mode="json"), "profile_version": business.profile_version},
+                    TextDraft,
+                    lambda: self._external(self.ai.write_post(business.profile, item)),
+                    request_id=f"job:{job.id}:text:{index}",
                 )
                 self._current_context(business)
                 self._validate_caption(text.text)
                 if set(text.used_source_ids) - source_ids:
                     raise InvalidInput("Текст ссылается на неизвестные источники.")
-                generated = await self._external(self.images.generate(business.profile, text))
+                self.repo.set_job_progress(job.id, "image", 2 + 2 * index, total, self.now())
+
+                async def generate_image():
+                    generated = await self._external(self.images.generate(business.profile, text))
+                    self._current_context(business)
+                    return self._store_image(business.id, generated)
+
+                asset = await self._ai_operation(
+                    business,
+                    "image",
+                    {"text": text.model_dump(mode="json"), "profile_version": business.profile_version},
+                    Asset,
+                    generate_image,
+                    request_id=f"job:{job.id}:image:{index}",
+                )
                 self._current_context(business)
-                asset = self._store_image(business.id, generated)
                 proposed = as_utc(item.suggested_at) if item.suggested_at else None
                 drafts.append(
                     {
@@ -625,8 +915,12 @@ class BackendService:
                         "channel_id": business.channel_id,
                         "scheduled_at": proposed if proposed and proposed > self.now() else None,
                         "is_demo": asset.is_demo or self.settings.mode == "demo",
+                        "profile_version": business.profile_version,
+                        "used_source_ids": text.used_source_ids,
+                        "warnings": text.warnings,
                     }
                 )
+            self.repo.set_job_progress(job.id, "saving", total, total, self.now())
             self.repo.create_posts(
                 business.id,
                 drafts,
@@ -652,11 +946,13 @@ class BackendService:
                 log.warning("Generation cancellation persistence failed: %s", type(exc).__name__)
             raise
         except Exception as exc:
-            log.warning("Preparation failed: %s", type(exc).__name__)
+            code = exc.code if isinstance(exc, AppError) else "preparation_failed"
+            log.warning("Preparation failed job_id=%s code=%s", job.id, code)
             self._fail_preparation(
                 business,
                 job,
-                "Не удалось подготовить материалы. Проверьте профиль и доступность провайдеров.",
+                f"Не удалось подготовить материалы. Код: {code}. Задание: {job.id}. "
+                "Проверьте профиль, лимиты и доступность провайдеров.",
             )
             return True
         return True
@@ -664,7 +960,7 @@ class BackendService:
     def _fail_preparation(self, business: Business, job: Job, message: str) -> None:
         current = self.repo.get_job(job.id)
         # A transaction may have committed before the caller saw an exception.
-        if current.status in {"done", "failed"}:
+        if current.status in {"done", "failed", "cancelled"}:
             return
         self.repo.fail_job(
             job.id,

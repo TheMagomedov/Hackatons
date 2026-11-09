@@ -17,9 +17,10 @@ AI самостоятельно готовит материалы; публик�
 | №3, Telegram/UI | `app/bot/`, собственные тесты | Диалог владельца, загрузка материалов, предпросмотр, callbacks, события реакций |
 | №4, изображения/аналитика | `app/media/`, `app/reports/`, собственные тесты | ImageProvider и ReportProvider |
 
-Пути ролей №1, №3, №4 зарезервированы для этих участников. Backend не подменяет их
-готовыми production-реализациями. Офлайн demo-провайдеры нужны для проверки общей
-сборки и не являются результатом работы настоящих AI/image сервисов.
+Реализации всех ролей уже подключены к общему runtime. AI взят из командной
+`codex/ai-integration` с последующими исправлениями общей интеграции. Офлайн
+demo-провайдеры остаются отдельными тестовыми адаптерами; они не выдают свои
+тексты, изображения и измерения за результаты настоящих AI/image сервисов.
 
 Не создавайте параллельные модели Post/Business, ещё одну SQLite-базу, scheduler или
 альтернативную функцию публикации. Разные Git-ветки не устраняют логические
@@ -61,10 +62,11 @@ AI самостоятельно готовит материалы; публик�
 координирует общий runtime.
 
 В `Settings`: `ai_factory`, `image_factory`, `report_factory`, `bot_factory`.
-Секреты конкретного AI/image-провайдера пока не стандартизованы общими Settings.
-Их названия и способ загрузки согласуйте с №2, внесите пустые примеры в
-`.env.example`, не добавляйте реальные значения. `Settings` запрещает неизвестные
-поля, поэтому нельзя просто передать ему произвольный API key аргумент.
+Секреты провайдеров загружаются их конфигурацией, а не произвольными полями Settings.
+Рабочий пример — `.env.live.example`; `.env.example` оставляет demo и пустую фабрику
+бота. Для текста используется одно семейство настроек: `TEXT_*` при наличии
+`TEXT_API_KEY`, иначе `AI_*` при наличии `AI_API_KEY`. Ключ и URL из разных семейств
+не смешиваются. Изображения используют `IMAGE_*`. Реальные значения в Git не добавляются.
 
 `APP_MODE=demo` означает полностью локальное выполнение без настоящего Telegram,
 языковой модели, скачивания сайтов или платной генерации картинок. `APP_MODE=live`
@@ -78,9 +80,9 @@ SaaS: не обещайте поддержку нескольких незави
 
 Для реальной работы явно укажите `DATA_DIR=var/live`, для постоянного demo —
 `DATA_DIR=var/demo`. Новая база привязывается к режиму и владельцу до запуска
-провайдеров; уже записанную привязку нельзя изменить через `.env`. Схема v1
-мигрирует в v2, но непустая старая база без привязки требует отдельного принятия.
-Сначала остановите приложение и сохраните весь каталог данных. Затем проверьте
+провайдеров; уже записанную привязку нельзя изменить через `.env`. Схемы v1/v2
+мигрируют в v3, но непустая старая база без привязки требует отдельного принятия.
+Сначала остановите приложение и сделайте `backup` по [OPERATIONS.md](OPERATIONS.md). Затем проверьте
 `python -m app status --data-dir var/live` и только для подтверждённой legacy-базы
 выполните `python -m app adopt-data --data-dir var/live --mode live --owner-id 123`
 с реальным ID вместо `123`. Эти команды не читают `.env` и не вызывают провайдеров;
@@ -280,19 +282,25 @@ Reporter не читает SQLite, не вызывает Telegram и не пол
 | Создать/получить/список бизнесов | create_business(actor_id, name, timezone=None), get_business(actor_id, business_id), list_businesses(actor_id) | Нет |
 | Подключить канал | connect_channel(actor_id, business_id, channel_id) | Да |
 | Добавить текст/PDF/URL | add_text_source(actor_id, business_id, text, name=...), add_pdf_source(actor_id, business_id, filename, content), add_url_source(actor_id, business_id, url) | Нет |
-| Изучить бизнес | analyze_business(actor_id, business_id) | Да |
+| Изучить бизнес | analyze_business(actor_id, business_id, *, request_id=None) | Да |
 | Исправить/подтвердить профиль | save_profile(actor_id, business_id, expected_version, profile), confirm_profile(actor_id, business_id, expected_version) | Нет |
-| Распознать намерение | interpret_request(actor_id, business_id, text, post_id=None) | Да |
+| Распознать намерение | interpret_request(actor_id, business_id, text, post_id=None, *, request_id=None) | Да |
 | Создать задание | request_preparation(actor_id, business_id, request, request_id) | Нет |
 | Статус/план/посты задания | get_job(actor_id, job_id), get_plan(actor_id, job_id), get_job_posts(actor_id, job_id) | Нет |
 | Посты/изображение | list_posts(actor_id, business_id), get_post(actor_id, post_id), read_asset(actor_id, asset_id) | Нет |
-| Правка по замечанию | revise_text(actor_id, post_id, expected_revision, feedback), revise_image(actor_id, post_id, expected_revision, feedback) | Да |
+| Правка по замечанию | revise_text/revise_image(actor_id, post_id, expected_revision, feedback, *, request_id=None) | Да |
 | Ручная правка | edit_post(actor_id, post_id, expected_revision, *, text=None, image_asset_id=None, scheduled_at=None, channel_id=None) | Нет |
 | Согласовать/отклонить | approve_post(actor_id, post_id, expected_revision), reject_post(actor_id, post_id, expected_revision) | Нет |
 | Автоподготовка | configure_automation(actor_id, business_id, enabled, request=..., interval_hours=24, first_run_at=None) | Нет |
 | Отчёт/данные | build_report(actor_id, business_id, start, end), report_data(actor_id, business_id, start, end) | Нет |
 
 `request_id` — стабильный ID Telegram update, не случайная строка на каждую попытку.
+Передавайте его во все пользовательские AI-вызовы. До маршрутизации самого update
+бот вызывает `accept_telegram_update(actor_id, event_key, digest)`: ключ включает
+ID бота и update, digest — SHA-256 стабильного содержимого. Повтор уже принятого
+события не обрабатывается даже после перезапуска и изменения диалогового контекста.
+Получение зафиксировано до выполнения; после аварии для незавершённого действия
+пользователь отправляет новое сообщение или нажимает кнопку заново.
 `expected_revision` — версия из показанного предпросмотра. Старые кнопки нельзя
 «исправлять» подстановкой текущей версии перед согласованием. Время — aware datetime.
 
@@ -301,6 +309,31 @@ Reporter не читает SQLite, не вызывает Telegram и не пол
 из возвращённого PostView: у одной AI-правки есть резервирование и завершение,
 поэтому нельзя вычислять номер как `старый + 1`. При ошибке обновите пост из backend
 и покажите `failed`/`last_error`, не возвращайте старое согласование в интерфейсе.
+
+`PostView` содержит `profile_version`, `used_source_ids`, `warnings`. Источники и
+предупреждения сохраняются вместе с ревизией и показываются в предпросмотре. Если
+версия профиля устарела или равна `None` у legacy-поста, согласование блокируется.
+После проверки владельцем `refresh_post_context(actor_id, post_id, expected_revision)`
+создаёт новую ревизию без согласования. Ручная правка текста и AI-правка текста также
+обновляют контекст; смена времени/картинки не подтверждает старый текст автоматически.
+
+Новые пользовательские методы:
+
+| Действие | Метод BackendService |
+| --- | --- |
+| Очередь и отмена pending | `list_jobs(actor_id, business_id)`, `cancel_job(actor_id, job_id)` |
+| Пауза новых публикаций | `set_publications_paused(actor_id, business_id, paused)` |
+| Использование AI и безопасная история | `ai_usage(actor_id)`, `list_ai_operations(actor_id, business_id=None, limit=20)` |
+| Неудачные уведомления | `failed_notifications(actor_id, business_id, limit=20)`, `get_failed_notification(actor_id, notification_id)` |
+| Повтор конкретного уведомления | `retry_notification(actor_id, business_id, notification_id)` |
+
+Прогресс задания: `stage`, `processed`, `total`, `updated_at`; `cancelled` — отдельный
+конечный статус. Отменяется только pending. Пауза публикаций независима от
+`automation_enabled` и не обещает остановить уже начавшуюся отправку.
+
+Общий журнал ограничивает все логические AI-операции владельца: по умолчанию
+100/сутки UTC и 2 одновременно. Ошибки входят в лимит. Это не деньги и не число
+HTTP-попыток: внутренние повторы клиента ограничены отдельно (`AI_MAX_RETRIES=1`).
 
 `prepare_next_job`, `publish_due_once`, `schedule_automations`,
 `dispatch_notifications`, `collect_metrics`, `recover_interrupted` вызываются

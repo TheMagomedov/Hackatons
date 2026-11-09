@@ -25,6 +25,7 @@ from app.shared.models import (
     Source,
 )
 from app.storage import Repository
+from app.storage.repository import SCHEMA_VERSION
 
 NOW = datetime(2026, 11, 9, 9, tzinfo=timezone.utc)
 
@@ -93,6 +94,8 @@ class HardeningTests(unittest.TestCase):
         # Runtime-binding is v2's sole schema addition. Remove it from a populated
         # compatible fixture to recreate the exact v1 table shape and contents.
         with closing(sqlite3.connect(self.path)) as conn:
+            conn.execute("DROP TABLE ai_operations")
+            conn.execute("DROP TABLE inbound_events")
             conn.execute("DROP TABLE runtime_binding")
             conn.execute("PRAGMA user_version = 1")
             conn.commit()
@@ -102,7 +105,7 @@ class HardeningTests(unittest.TestCase):
             names = [
                 row[0]
                 for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name!='runtime_binding' ORDER BY name"
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('runtime_binding','ai_operations','inbound_events') ORDER BY name"
                 )
             ]
             return {name: conn.execute(f'SELECT * FROM "{name}" ORDER BY rowid').fetchall() for name in names}
@@ -141,7 +144,7 @@ class HardeningTests(unittest.TestCase):
         self.repo.initialize()
         self.assertEqual(self.rows_snapshot(), before)
         self.assertIsNone(self.repo.runtime_binding())
-        self.assertEqual(self.repo.diagnostics()["schema_version"], 2)
+        self.assertEqual(self.repo.diagnostics()["schema_version"], SCHEMA_VERSION)
         self.assertEqual(self.repo.get_post(posts[0].id), posts[0])
         self.assertEqual(self.repo.get_plan_for_job(job.id), plan)
 
@@ -165,7 +168,7 @@ class HardeningTests(unittest.TestCase):
                 conn.execute("SELECT name FROM sqlite_master WHERE name='runtime_binding'").fetchone()
             )
         self.repo.initialize()
-        self.assertEqual(self.repo.diagnostics()["schema_version"], 2)
+        self.assertEqual(self.repo.diagnostics()["schema_version"], SCHEMA_VERSION)
 
     def test_empty_runtime_binding_is_durable_and_cannot_switch_owner_or_mode(self):
         path = Path(self.temp.name) / "empty.sqlite3"
@@ -424,7 +427,7 @@ class HardeningTests(unittest.TestCase):
         before = self.rows_snapshot()
         diagnostics = self.repo.diagnostics()
         self.assertEqual(
-            diagnostics,
+            {key: diagnostics[key] for key in ("schema_version", "binding", "counts")},
             {
                 "schema_version": 1,
                 "binding": None,

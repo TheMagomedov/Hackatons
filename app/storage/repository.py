@@ -10,6 +10,7 @@ not retried: an operator must resolve their delivery status.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -35,7 +36,7 @@ from app.shared.models import (
     Source,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
@@ -127,6 +128,9 @@ class Repository:
                 return
             if version == 1:
                 self._migrate_v1_to_v2(conn)
+                version = 2
+            if version == 2:
+                self._migrate_v2_to_v3(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if version != 0:
@@ -156,6 +160,7 @@ class Repository:
             for statement in statements:
                 conn.execute(statement)
             self._migrate_v1_to_v2(conn)
+            self._migrate_v2_to_v3(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -166,6 +171,54 @@ class Repository:
             "mode TEXT NOT NULL CHECK(mode IN ('demo','live')), "
             "owner_id INTEGER NOT NULL CHECK(owner_id>0))"
         )
+
+    @staticmethod
+    def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+        # Additive DTO fields use defaults when old JSON is read. Preserve all
+        # original data and immutable revisions, including unknown provenance.
+        conn.execute(
+            "CREATE TABLE ai_operations (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, "
+            "business_id TEXT NOT NULL REFERENCES businesses(id), kind TEXT NOT NULL, "
+            "request_key TEXT NOT NULL, payload_hash TEXT NOT NULL, status TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT, error_code TEXT, "
+            "UNIQUE(owner_id,request_key))"
+        )
+        conn.execute("CREATE INDEX ai_operations_usage ON ai_operations(owner_id,created_at,status)")
+        conn.execute(
+            "CREATE TABLE inbound_events (owner_id INTEGER NOT NULL, event_key TEXT NOT NULL, "
+            "digest TEXT NOT NULL, received_at TEXT NOT NULL, PRIMARY KEY(owner_id,event_key))"
+        )
+
+    def claim_inbound_event(self, owner_id: int, event_key: str, digest: str, now: datetime) -> bool:
+        """Claim an incoming event once, before mutable dialog state routes it.
+
+        Receipts intentionally survive handler failure and process restarts. An
+        interrupted user action requires a fresh event, not ambiguous replay.
+        """
+        now = _utc(now)
+        if type(owner_id) is not int or owner_id <= 0:
+            raise InvalidInput("Некорректный владелец входящего события")
+        if not isinstance(event_key, str) or not 1 <= len(event_key.strip()) <= 200:
+            raise InvalidInput("Некорректный ключ входящего события")
+        try:
+            event_key.encode("utf-8")
+        except UnicodeEncodeError:
+            raise InvalidInput("Некорректный ключ входящего события") from None
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise InvalidInput("Некорректный отпечаток входящего события")
+        with self._transaction() as conn:
+            existing = conn.execute(
+                "SELECT digest FROM inbound_events WHERE owner_id=? AND event_key=?", (owner_id, event_key)
+            ).fetchone()
+            if existing is not None:
+                if existing["digest"] != digest:
+                    raise Conflict("Ключ входящего события уже использован с другим содержимым")
+                return False
+            conn.execute(
+                "INSERT INTO inbound_events(owner_id,event_key,digest,received_at) VALUES (?,?,?,?)",
+                (owner_id, event_key, digest, _stamp(now)),
+            )
+            return True
 
     @staticmethod
     def _runtime_binding(conn: sqlite3.Connection) -> dict[str, Any] | None:
@@ -259,7 +312,63 @@ class Repository:
                     ).fetchone()[0],
                 },
             }
-            return {"schema_version": version, "binding": self._runtime_binding(conn), "counts": counts}
+            operation_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_operations'"
+            ).fetchone()
+            operations = []
+            if operation_table is not None:
+                counts["ai_operations"] = {
+                    row["status"]: row["count"]
+                    for row in conn.execute(
+                        "SELECT status,COUNT(*) AS count FROM ai_operations GROUP BY status"
+                    )
+                }
+                operations = [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT id,business_id,kind,status,created_at,updated_at,error_code "
+                        "FROM ai_operations ORDER BY created_at DESC,id DESC LIMIT 20"
+                    )
+                ]
+            jobs = []
+            for row in conn.execute(
+                "SELECT data FROM jobs WHERE status IN ('pending','running','failed') ORDER BY created_at DESC,id DESC LIMIT 20"
+            ):
+                job = Job.model_validate_json(row["data"])
+                jobs.append(
+                    {
+                        "id": job.id,
+                        "business_id": job.business_id,
+                        "status": job.status,
+                        "stage": job.stage,
+                        "processed": job.processed,
+                        "total": job.total,
+                        "updated_at": _stamp(
+                            job.updated_at or job.finished_at or job.started_at or job.created_at
+                        ),
+                        "error_code": "preparation_failed" if job.status == "failed" else None,
+                    }
+                )
+            notifications = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT id,business_id,attempts,last_attempt_at FROM notifications "
+                    "WHERE acknowledged_at IS NULL AND attempts>=? ORDER BY created_at DESC,id DESC LIMIT 20",
+                    (MAX_NOTIFICATION_ATTEMPTS,),
+                )
+            ]
+            last_activity = conn.execute("SELECT MAX(at) FROM audit").fetchone()[0]
+            return {
+                "schema_version": version,
+                "binding": self._runtime_binding(conn),
+                "counts": counts,
+                "recent_activity_at": last_activity,
+                "details": {
+                    "jobs": jobs,
+                    "ai_operations": operations,
+                    "exhausted_notifications": notifications,
+                },
+            }
 
     @staticmethod
     def _audit(
@@ -491,6 +600,25 @@ class Repository:
             )
             return new
 
+    def set_publications_paused(self, business_id: str, paused: bool, now: datetime) -> Business:
+        if type(paused) is not bool:
+            raise InvalidInput("Пауза публикаций требует логического значения")
+        now = _utc(now)
+        with self._transaction() as conn:
+            business = self._business(conn, business_id)
+            if business.publications_paused == paused:
+                return business
+            updated = business.model_copy(update={"publications_paused": paused})
+            self._save_business(conn, updated)
+            self._audit(
+                conn,
+                "business",
+                business_id,
+                "publications_paused" if paused else "publications_resumed",
+                now,
+            )
+            return updated
+
     def add_source(self, source: Source) -> Source:
         with self._transaction() as conn:
             business = self._business(conn, source.business_id)
@@ -568,7 +696,16 @@ class Repository:
     def _validate_post_data(
         conn: sqlite3.Connection, business: Business, data: dict[str, Any]
     ) -> dict[str, Any]:
-        allowed = {"text", "image_asset_id", "channel_id", "scheduled_at", "is_demo"}
+        allowed = {
+            "text",
+            "image_asset_id",
+            "channel_id",
+            "scheduled_at",
+            "is_demo",
+            "profile_version",
+            "used_source_ids",
+            "warnings",
+        }
         if set(data) - allowed:
             raise InvalidInput("Неизвестные поля публикации")
         text = data.get("text")
@@ -583,12 +720,43 @@ class Repository:
         scheduled = data.get("scheduled_at")
         if scheduled is not None:
             scheduled = _utc(scheduled)
+        profile_version = data.get("profile_version", business.profile_version)
+        if profile_version is not None and (
+            type(profile_version) is not int or not 0 <= profile_version <= business.profile_version
+        ):
+            raise InvalidInput("Некорректная версия профиля публикации")
+        source_ids = data.get("used_source_ids", [])
+        if (
+            not isinstance(source_ids, list)
+            or len(source_ids) > 100
+            or any(not isinstance(value, str) or not value or len(value) > 200 for value in source_ids)
+        ):
+            raise InvalidInput("Некорректные источники публикации")
+        for source_id in source_ids:
+            row = conn.execute("SELECT business_id FROM sources WHERE id=?", (source_id,)).fetchone()
+            if row is None or row["business_id"] != business.id:
+                raise InvalidInput("Источник публикации неизвестен или принадлежит другому бизнесу")
+        warnings = data.get("warnings", [])
+        if (
+            not isinstance(warnings, list)
+            or len(warnings) > 50
+            or any(not isinstance(value, str) or not value.strip() or len(value) > 2000 for value in warnings)
+        ):
+            raise InvalidInput("Некорректные предупреждения публикации")
+        try:
+            for warning in warnings:
+                warning.encode("utf-16-le")
+        except UnicodeEncodeError:
+            raise InvalidInput("Некорректные предупреждения публикации") from None
         return {
             "text": text,
             "image_asset_id": asset.id,
             "channel_id": channel_id,
             "scheduled_at": scheduled,
             "is_demo": bool(data.get("is_demo", False) or asset.is_demo),
+            "profile_version": profile_version,
+            "used_source_ids": list(dict.fromkeys(source_ids)),
+            "warnings": list(warnings),
         }
 
     def create_posts(
@@ -617,6 +785,8 @@ class Repository:
             posts = []
             for item in items:
                 values = self._validate_post_data(conn, business, item)
+                if values["profile_version"] != business.profile_version:
+                    raise Conflict("Новая публикация должна использовать текущую версию профиля")
                 post = PostView(
                     id=_new_id(),
                     business_id=business_id,
@@ -647,7 +817,16 @@ class Repository:
                 self._audit(conn, "post", post.id, "created", now, revision=1, job_id=job_id)
                 posts.append(post)
             if job:
-                done = job.model_copy(update={"status": "done", "finished_at": now})
+                done = job.model_copy(
+                    update={
+                        "status": "done",
+                        "stage": "done",
+                        "processed": max(job.total, 1 + 2 * len(posts)),
+                        "total": max(job.total, 1 + 2 * len(posts)),
+                        "updated_at": now,
+                        "finished_at": now,
+                    }
+                )
                 changed = conn.execute(
                     "UPDATE jobs SET status='done',data=? WHERE id=? AND status='running'",
                     (_dump(done), job.id),
@@ -676,7 +855,16 @@ class Repository:
         self, post_id: str, expected_revision: int, changes: dict[str, Any], now: datetime
     ) -> PostView:
         now = _utc(now)
-        allowed = {"text", "image_asset_id", "channel_id", "scheduled_at", "is_demo"}
+        allowed = {
+            "text",
+            "image_asset_id",
+            "channel_id",
+            "scheduled_at",
+            "is_demo",
+            "profile_version",
+            "used_source_ids",
+            "warnings",
+        }
         if not changes or set(changes) - allowed:
             raise InvalidInput("Укажите допустимые изменения публикации")
         with self._transaction() as conn:
@@ -771,7 +959,16 @@ class Repository:
         expected_channel_id: str | None = None,
     ) -> PostView:
         now = _utc(now)
-        allowed = {"text", "image_asset_id", "channel_id", "scheduled_at", "is_demo"}
+        allowed = {
+            "text",
+            "image_asset_id",
+            "channel_id",
+            "scheduled_at",
+            "is_demo",
+            "profile_version",
+            "used_source_ids",
+            "warnings",
+        }
         if not changes or set(changes) - allowed:
             raise InvalidInput("Укажите допустимые изменения публикации")
         with self._transaction() as conn:
@@ -856,6 +1053,12 @@ class Repository:
                 raise Forbidden("Согласовывать публикации может только владелец")
             if post.channel_id != business.channel_id:
                 raise Conflict("Канал бизнеса изменился; обновите предпросмотр")
+            if post.profile_version != business.profile_version:
+                raise Conflict(
+                    "Профиль бизнеса изменился или версия источников неизвестна; проверьте и обновите текст поста"
+                )
+            if business.profile is not None and not business.profile_confirmed:
+                raise Conflict("Подтвердите актуальный профиль бизнеса")
             if post.status == PostStatus.APPROVED and post.approved_revision == post.revision:
                 return post
             if post.status != PostStatus.REVIEW:
@@ -904,10 +1107,14 @@ class Repository:
             for row in rows:
                 post = PostView.model_validate_json(row["data"])
                 business = self._business(conn, post.business_id)
+                if business.publications_paused:
+                    continue
                 if (
                     post.approved_revision != post.revision
                     or post.approved_by != business.owner_id
                     or post.channel_id != business.channel_id
+                    or post.profile_version != business.profile_version
+                    or (business.profile is not None and not business.profile_confirmed)
                 ):
                     new = post.model_copy(
                         update={
@@ -1087,6 +1294,7 @@ class Repository:
             status="pending",
             dedup_key=dedup_key,
             created_at=now,
+            updated_at=now,
         )
         conn.execute(
             "INSERT INTO jobs(id,business_id,dedup_key,status,created_at,data) VALUES (?,?,?,?,?,?)",
@@ -1135,6 +1343,178 @@ class Repository:
             ).fetchone()
             return Job.model_validate_json(row["data"]) if row is not None else None
 
+    @staticmethod
+    def _operation_dict(row: sqlite3.Row) -> dict[str, Any]:
+        values = dict(row)
+        values["result"] = json.loads(values["result"]) if values["result"] is not None else None
+        return values
+
+    def get_ai_operation(self, operation_id: str) -> dict[str, Any]:
+        with self._reader() as conn:
+            row = conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
+            if row is None:
+                raise NotFound("AI-операция не найдена")
+            return self._operation_dict(row)
+
+    def begin_ai_operation(
+        self,
+        owner_id: int,
+        business_id: str,
+        kind: str,
+        request_key: str,
+        payload_hash: str,
+        now: datetime,
+        *,
+        daily_limit: int,
+        max_parallel: int,
+    ) -> dict[str, Any]:
+        """Reserve one logical provider operation before doing paid work.
+
+        An owner-wide key cannot be reused for another business, kind or input.
+        Failed/interrupted operations consume their quota and never auto-retry.
+        """
+        now = _utc(now)
+        if type(owner_id) is not int or owner_id <= 0:
+            raise InvalidInput("Некорректный владелец AI-операции")
+        if not isinstance(kind, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,39}", kind) is None:
+            raise InvalidInput("Некорректный тип AI-операции")
+        if not isinstance(request_key, str) or not 1 <= len(request_key.strip()) <= 400:
+            raise InvalidInput("Укажите стабильный ключ AI-операции до 400 символов")
+        if not isinstance(payload_hash, str) or re.fullmatch(r"[0-9a-f]{64}", payload_hash) is None:
+            raise InvalidInput("Некорректный отпечаток AI-запроса")
+        if any(type(value) is not int or value < 1 for value in (daily_limit, max_parallel)):
+            raise InvalidInput("Лимиты AI-операций должны быть положительными целыми числами")
+        with self._transaction() as conn:
+            business = self._business(conn, business_id)
+            if business.owner_id != owner_id:
+                raise Forbidden("AI-операция относится к другому владельцу")
+            row = conn.execute(
+                "SELECT * FROM ai_operations WHERE owner_id=? AND request_key=?", (owner_id, request_key)
+            ).fetchone()
+            if row is not None:
+                if (row["business_id"], row["kind"], row["payload_hash"]) != (
+                    business_id,
+                    kind,
+                    payload_hash,
+                ):
+                    raise Conflict("Ключ AI-операции уже использован для другого действия")
+                return {**self._operation_dict(row), "created": False}
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            used = conn.execute(
+                "SELECT COUNT(*) FROM ai_operations WHERE owner_id=? AND created_at>=? AND created_at<?",
+                (owner_id, _stamp(start), _stamp(start + timedelta(days=1))),
+            ).fetchone()[0]
+            if used >= daily_limit:
+                raise Conflict("Достигнут дневной лимит AI-операций владельца (сутки UTC)")
+            running = conn.execute(
+                "SELECT COUNT(*) FROM ai_operations WHERE owner_id=? AND status='running'", (owner_id,)
+            ).fetchone()[0]
+            if running >= max_parallel:
+                raise Conflict("Достигнут лимит одновременных AI-операций; дождитесь завершения текущих")
+            operation_id = _new_id()
+            conn.execute(
+                "INSERT INTO ai_operations(id,owner_id,business_id,kind,request_key,payload_hash,status,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,'running',?,?)",
+                (
+                    operation_id,
+                    owner_id,
+                    business_id,
+                    kind,
+                    request_key,
+                    payload_hash,
+                    _stamp(now),
+                    _stamp(now),
+                ),
+            )
+            self._audit(
+                conn, "ai_operation", operation_id, "started", now, business_id=business_id, kind=kind
+            )
+            row = conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
+            return {**self._operation_dict(row), "created": True}
+
+    def finish_ai_operation(self, operation_id: str, result: dict | None, now: datetime) -> dict[str, Any]:
+        now = _utc(now)
+        if result is not None and not isinstance(result, dict):
+            raise InvalidInput("Результат AI-операции должен быть JSON-объектом")
+        try:
+            encoded = json.dumps(result, ensure_ascii=False, allow_nan=False) if result is not None else None
+            if encoded is not None and len(encoded.encode("utf-8")) > 2_000_000:
+                raise ValueError
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise InvalidInput("Результат AI-операции не подходит для хранения") from None
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
+            if row is None:
+                raise NotFound("AI-операция не найдена")
+            if row["status"] == "done" and self._operation_dict(row)["result"] == result:
+                return self._operation_dict(row)
+            if row["status"] != "running":
+                raise Conflict("AI-операция уже завершена")
+            conn.execute(
+                "UPDATE ai_operations SET status='done',result=?,updated_at=? WHERE id=?",
+                (encoded, _stamp(now), operation_id),
+            )
+            self._audit(conn, "ai_operation", operation_id, "done", now)
+            return self._operation_dict(
+                conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
+            )
+
+    def fail_ai_operation(self, operation_id: str, error_code: str, now: datetime) -> dict[str, Any]:
+        now = _utc(now)
+        if not isinstance(error_code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) is None:
+            raise InvalidInput("Укажите безопасный код ошибки AI-операции")
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
+            if row is None:
+                raise NotFound("AI-операция не найдена")
+            if row["status"] == "failed" and row["error_code"] == error_code:
+                return self._operation_dict(row)
+            if row["status"] != "running":
+                raise Conflict("AI-операция уже завершена")
+            conn.execute(
+                "UPDATE ai_operations SET status='failed',error_code=?,updated_at=? WHERE id=?",
+                (error_code, _stamp(now), operation_id),
+            )
+            self._audit(conn, "ai_operation", operation_id, "failed", now, error_code=error_code)
+            return self._operation_dict(
+                conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
+            )
+
+    def ai_usage(self, owner_id: int, now: datetime) -> dict[str, Any]:
+        now = _utc(now)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        with self._reader() as conn:
+            rows = conn.execute(
+                "SELECT status,COUNT(*) AS count FROM ai_operations WHERE owner_id=? AND created_at>=? AND created_at<? GROUP BY status",
+                (owner_id, _stamp(start), _stamp(start + timedelta(days=1))),
+            )
+            counts = {row["status"]: row["count"] for row in rows}
+            running = conn.execute(
+                "SELECT COUNT(*) FROM ai_operations WHERE owner_id=? AND status='running'", (owner_id,)
+            ).fetchone()[0]
+            return {
+                "used_today": sum(counts.values()),
+                "running": running,
+                "done_today": counts.get("done", 0),
+                "failed_today": counts.get("failed", 0),
+                "day_start": _stamp(start),
+            }
+
+    def list_ai_operations(
+        self, owner_id: int, business_id: str | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise InvalidInput("Лимит AI-операций должен быть от 1 до 100")
+        with self._reader() as conn:
+            if business_id is not None and self._business(conn, business_id).owner_id != owner_id:
+                raise Forbidden("Бизнес принадлежит другому владельцу")
+            rows = conn.execute(
+                "SELECT id,business_id,kind,status,created_at,updated_at,error_code FROM ai_operations "
+                "WHERE owner_id=? AND (? IS NULL OR business_id=?) ORDER BY created_at DESC,id DESC LIMIT ?",
+                (owner_id, business_id, business_id, limit),
+            )
+            return [dict(row) for row in rows]
+
     def list_jobs(self, business_id: str) -> list[Job]:
         with self._reader() as conn:
             self._business(conn, business_id)
@@ -1177,7 +1557,9 @@ class Repository:
             if row is None:
                 return None
             job = Job.model_validate_json(row["data"])
-            claimed = job.model_copy(update={"status": "running", "started_at": now})
+            claimed = job.model_copy(
+                update={"status": "running", "stage": "plan", "started_at": now, "updated_at": now}
+            )
             result = conn.execute(
                 "UPDATE jobs SET status='running',data=? WHERE id=? AND status='pending'",
                 (_dump(claimed), job.id),
@@ -1186,6 +1568,41 @@ class Repository:
                 raise Conflict("Задание уже забрано другим обработчиком")
             self._audit(conn, "job", job.id, "claimed", now)
             return claimed
+
+    def set_job_progress(self, job_id: str, stage: str, processed: int, total: int, now: datetime) -> Job:
+        now = _utc(now)
+        if stage not in {"plan", "text", "image", "saving"}:
+            raise InvalidInput("Некорректный этап подготовки")
+        if any(type(value) is not int for value in (processed, total)) or not 0 <= processed <= total <= 11:
+            raise InvalidInput("Некорректный прогресс подготовки")
+        with self._transaction() as conn:
+            job = self._job(conn, job_id)
+            if job.status != "running":
+                raise Conflict("Прогресс доступен только для выполняемого задания")
+            updated = job.model_copy(
+                update={"stage": stage, "processed": processed, "total": total, "updated_at": now}
+            )
+            conn.execute("UPDATE jobs SET data=? WHERE id=? AND status='running'", (_dump(updated), job_id))
+            self._audit(conn, "job", job_id, "progress", now, stage=stage, processed=processed, total=total)
+            return updated
+
+    def cancel_job(self, job_id: str, now: datetime) -> Job:
+        now = _utc(now)
+        with self._transaction() as conn:
+            job = self._job(conn, job_id)
+            if job.status == "cancelled":
+                return job
+            if job.status != "pending":
+                raise Conflict("Отменить можно только ещё не начатое задание")
+            updated = job.model_copy(
+                update={"status": "cancelled", "stage": "cancelled", "finished_at": now, "updated_at": now}
+            )
+            conn.execute(
+                "UPDATE jobs SET status='cancelled',data=? WHERE id=? AND status='pending'",
+                (_dump(updated), job_id),
+            )
+            self._audit(conn, "job", job_id, "cancelled", now)
+            return updated
 
     def fail_job(
         self, job_id: str, error: str, now: datetime, *, notification: Notification | None = None
@@ -1196,7 +1613,13 @@ class Repository:
             if job.status not in {"pending", "running"}:
                 raise Conflict("Задание уже завершено")
             failed = job.model_copy(
-                update={"status": "failed", "finished_at": now, "error": str(error)[:2000]}
+                update={
+                    "status": "failed",
+                    "stage": "failed",
+                    "finished_at": now,
+                    "updated_at": now,
+                    "error": str(error)[:2000],
+                }
             )
             conn.execute(
                 "UPDATE jobs SET status='failed',data=? WHERE id=? AND status=?",
@@ -1263,6 +1686,12 @@ class Repository:
         now = _utc(now)
         counts = {"posts": 0, "jobs": 0, "edits": 0}
         with self._transaction() as conn:
+            for row in conn.execute("SELECT id FROM ai_operations WHERE status='running'").fetchall():
+                conn.execute(
+                    "UPDATE ai_operations SET status='failed',error_code='interrupted',updated_at=? WHERE id=?",
+                    (_stamp(now), row["id"]),
+                )
+                self._audit(conn, "ai_operation", row["id"], "interrupted", now, error_code="interrupted")
             rows = conn.execute(
                 "SELECT data FROM posts WHERE status=?", (PostStatus.PUBLISHING.value,)
             ).fetchall()
@@ -1325,6 +1754,8 @@ class Repository:
                 new = job.model_copy(
                     update={
                         "status": "failed",
+                        "stage": "failed",
+                        "updated_at": now,
                         "finished_at": now,
                         "error": "Генерация прервана перезапуском; автоматический платный повтор отключён",
                     }
@@ -1453,6 +1884,79 @@ class Repository:
                 "UPDATE notifications SET acknowledged_at=? WHERE id=?", (_stamp(now), notification_id)
             )
             self._audit(conn, "notification", notification_id, "acknowledged", now)
+
+    def list_failed_notifications(self, business_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise InvalidInput("Лимит уведомлений должен быть от 1 до 100")
+        with self._reader() as conn:
+            self._business(conn, business_id)
+            result = []
+            for row in conn.execute(
+                "SELECT data,attempts,last_attempt_at FROM notifications WHERE business_id=? "
+                "AND acknowledged_at IS NULL AND attempts>=? ORDER BY created_at DESC,id DESC LIMIT ?",
+                (business_id, MAX_NOTIFICATION_ATTEMPTS, limit),
+            ):
+                notification = Notification.model_validate_json(row["data"])
+                result.append(
+                    {
+                        "id": notification.id,
+                        "business_id": business_id,
+                        "post_id": notification.post_id,
+                        "job_id": notification.job_id,
+                        "kind": notification.kind,
+                        "attempts": row["attempts"],
+                        "created_at": _stamp(notification.created_at),
+                        "last_attempt_at": row["last_attempt_at"],
+                        "error_code": "delivery_failed",
+                    }
+                )
+            return result
+
+    def retry_notification(self, notification_id: str, business_id: str, now: datetime) -> Notification:
+        now = _utc(now)
+        with self._transaction() as conn:
+            self._business(conn, business_id)
+            row = conn.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+            if row is None:
+                raise NotFound("Уведомление не найдено")
+            if row["business_id"] != business_id:
+                raise Forbidden("Уведомление принадлежит другому бизнесу")
+            if row["acknowledged_at"] is not None:
+                raise Conflict("Уведомление уже доставлено")
+            notification = Notification.model_validate_json(row["data"])
+            if row["attempts"] < MAX_NOTIFICATION_ATTEMPTS:
+                # A repeated button must not keep resetting the retry budget.
+                return notification
+            conn.execute(
+                "UPDATE notifications SET attempts=0,next_attempt_at=?,last_attempt_at=NULL WHERE id=?",
+                (_stamp(now), notification_id),
+            )
+            self._audit(
+                conn, "notification", notification_id, "manual_retry", now, previous_attempts=row["attempts"]
+            )
+            return notification
+
+    def get_failed_notification(self, notification_id: str) -> dict[str, Any]:
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT data,attempts,last_attempt_at FROM notifications WHERE id=? "
+                "AND acknowledged_at IS NULL AND attempts>=?",
+                (notification_id, MAX_NOTIFICATION_ATTEMPTS),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Неудачное уведомление не найдено или уже возвращено в очередь")
+            notification = Notification.model_validate_json(row["data"])
+            return {
+                "id": notification.id,
+                "business_id": notification.business_id,
+                "post_id": notification.post_id,
+                "job_id": notification.job_id,
+                "kind": notification.kind,
+                "attempts": row["attempts"],
+                "created_at": _stamp(notification.created_at),
+                "last_attempt_at": row["last_attempt_at"],
+                "error_code": "delivery_failed",
+            }
 
     def record_notification_failure(self, notification_id: str, now: datetime) -> None:
         now = _utc(now)

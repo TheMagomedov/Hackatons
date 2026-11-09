@@ -56,6 +56,7 @@ class Business(Contract):
     profile_version: int = 0
     profile_confirmed: bool = False
     automation_enabled: bool = False
+    publications_paused: bool = False
     automation_request: str = "Подготовь один полезный пост о бизнесе"
     interval_hours: int = 24
     next_generation_at: AwareDatetime | None = None
@@ -137,6 +138,10 @@ class PostView(Contract):
     published_at: AwareDatetime | None = None
     last_error: str | None = None
     is_demo: bool = False
+    # None means legacy content whose original business context is unknown.
+    profile_version: int | None = Field(default=None, ge=0)
+    used_source_ids: list[str] = Field(default_factory=list, max_length=100)
+    warnings: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ChannelInfo(Contract):
@@ -155,12 +160,16 @@ class Job(Contract):
     business_id: str
     kind: Literal["prepare"] = "prepare"
     request: str
-    status: Literal["pending", "running", "done", "failed"]
+    status: Literal["pending", "running", "done", "failed", "cancelled"]
     dedup_key: str
     created_at: AwareDatetime
     started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
     error: str | None = None
+    stage: Literal["queued", "plan", "text", "image", "saving", "done", "failed", "cancelled"] = "queued"
+    processed: int = Field(default=0, ge=0)
+    total: int = Field(default=0, ge=0)
+    updated_at: AwareDatetime | None = None
 
 
 class Notification(Contract):

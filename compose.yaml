@@ -1,0 +1,27 @@
+services:
+  marketer:
+    build: .
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - marketer-data:/data
+      - marketer-backups:/backups
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "python -m app status --data-dir \"$${DATA_DIR}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  marketer-data:
+  marketer-backups:

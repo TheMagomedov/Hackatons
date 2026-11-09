@@ -29,6 +29,10 @@ class Settings(BaseModel):
     max_pending_jobs: int = Field(default=5, ge=1, le=50)
     max_generation_jobs_per_day: int = Field(default=10, ge=1, le=100)
     max_publish_lateness_seconds: int = Field(default=900, ge=0, le=86400)
+    max_ai_operations_per_day: int = Field(default=100, ge=1, le=10000)
+    max_concurrent_ai_operations: int = Field(default=2, ge=1, le=10)
+    max_sources_per_business: int = Field(default=10, ge=1, le=10)
+    max_source_bytes_total: int = Field(default=20_000_000, ge=1024, le=100_000_000)
 
     @field_validator("timezone")
     @classmethod
@@ -71,6 +75,10 @@ class Settings(BaseModel):
             "MAX_PENDING_JOBS": "max_pending_jobs",
             "MAX_GENERATION_JOBS_PER_DAY": "max_generation_jobs_per_day",
             "MAX_PUBLISH_LATENESS_SECONDS": "max_publish_lateness_seconds",
+            "MAX_AI_OPERATIONS_PER_DAY": "max_ai_operations_per_day",
+            "MAX_CONCURRENT_AI_OPERATIONS": "max_concurrent_ai_operations",
+            "MAX_SOURCES_PER_BUSINESS": "max_sources_per_business",
+            "MAX_SOURCE_BYTES_TOTAL": "max_source_bytes_total",
         }
         return cls(
             **{field: os.environ[key] for key, field in names.items() if os.environ.get(key, "").strip()}

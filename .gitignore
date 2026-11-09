@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.live.example
 .venv/
 __pycache__/
 *.py[cod]
@@ -9,6 +10,7 @@ __pycache__/
 .coverage
 htmlcov/
 var/
+backups/
 build/
 dist/
 *.egg-info/
