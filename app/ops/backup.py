@@ -20,7 +20,7 @@ from pathlib import Path
 
 from app.core.instance_lock import InstanceLock
 from app.shared.errors import Conflict, InvalidInput, NotFound
-from app.shared.models import Asset
+from app.shared.models import Asset, PostStatus
 from app.storage import FileStore, Repository
 from app.storage.repository import SCHEMA_VERSION
 
@@ -228,8 +228,15 @@ def restore_data(backup_dir: str | Path, destination: str | Path) -> dict:
             repo.initialize()
             now = datetime.now(UTC)
             cancelled = 0
+            approvals_cleared = 0
             for business in repo.list_businesses():
                 repo.set_publications_paused(business.id, True, now)
+                for post in repo.list_posts(business.id):
+                    if post.status == PostStatus.APPROVED:
+                        # The source may have published this post after the
+                        # snapshot. A bulk resume must never re-use its approval.
+                        repo.revise_post(post.id, post.revision, {"scheduled_at": post.scheduled_at}, now)
+                        approvals_cleared += 1
                 repo.set_automation(
                     business.id, False, business.automation_request, business.interval_hours, None, now
                 )
@@ -249,6 +256,7 @@ def restore_data(backup_dir: str | Path, destination: str | Path) -> dict:
                     "publications_paused": True,
                     "automation_disabled": True,
                     "pending_jobs_cancelled": cancelled,
+                    "approvals_cleared": approvals_cleared,
                     "recovered": recovered,
                 },
                 indent=2,
@@ -262,4 +270,5 @@ def restore_data(backup_dir: str | Path, destination: str | Path) -> dict:
         "publications_paused": True,
         "automation_disabled": True,
         "pending_jobs_cancelled": cancelled,
+        "approvals_cleared": approvals_cleared,
     }

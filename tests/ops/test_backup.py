@@ -2,7 +2,7 @@ import asyncio
 import json
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -10,6 +10,7 @@ from app.core.demo import run_demo
 from app.core.instance_lock import InstanceLock
 from app.ops.backup import backup_data, restore_data, verify_backup
 from app.shared.errors import Conflict, InvalidInput
+from app.shared.models import PostStatus
 from app.storage import FileStore, Repository
 from app.storage.repository import SCHEMA_VERSION
 from tests.ops.test_cli_ops import command
@@ -68,6 +69,27 @@ def test_backup_refuses_running_process_and_never_overwrites(data, tmp_path):
     assert marker.read_text() == "important"
     with pytest.raises(InvalidInput):
         backup_data(source, source / "nested")
+
+
+def test_restore_clears_approval_that_may_have_been_used_after_snapshot(data, tmp_path):
+    source, repo, business = data
+    now = datetime.now(UTC)
+    draft = next(post for post in repo.list_posts(business.id) if post.status == PostStatus.REVIEW)
+    draft = repo.revise_post(draft.id, draft.revision, {"scheduled_at": now + timedelta(minutes=2)}, now)
+    approved = repo.approve_post(draft.id, draft.revision, business.owner_id, now)
+    snapshot, destination = tmp_path / "snapshot", tmp_path / "restored"
+    backup_data(source, snapshot)
+    result = restore_data(snapshot, destination)
+    restored = Repository(destination / "backend.sqlite3")
+    current = restored.get_post(approved.id)
+    assert result["approvals_cleared"] == 1
+    assert current.status == PostStatus.REVIEW
+    assert current.revision == approved.revision + 1
+    assert current.approved_revision is None
+    assert current.text == approved.text and current.image_asset_id == approved.image_asset_id
+    restored.set_publications_paused(business.id, False, now)
+    assert restored.claim_due_post(now + timedelta(minutes=3)) is None
+    assert repo.get_post(approved.id) == approved
 
 
 @pytest.mark.parametrize("corruption", ["database", "asset", "missing", "traversal", "journal"])
