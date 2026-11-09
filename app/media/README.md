@@ -1,0 +1,145 @@
+# Изображения: общий контракт роли №4
+
+Модуль реализует `ImageProvider` из `app.shared.ports`:
+
+```python
+async def generate(
+    self,
+    profile: BusinessProfile,
+    text: TextDraft,
+    feedback: str | None = None,
+) -> GeneratedImage: ...
+```
+
+Все входные и выходные модели импортируются из `app.shared.models`. Собственных
+Post/Business/Image DTO нет. Генерация вызывается до назначения идентификатора
+поста. Модуль возвращает байты в памяти; backend сохраняет Asset, назначает ID,
+версии, согласует и публикует. Media не читает БД, файлы конфигурации и переменные
+окружения, не хранит изображения и не запускает scheduler.
+
+Провайдер проекта пока не выбран. `OpenAIImageProvider` — опциональный пример
+адаптера, а не обязательный провайдер проекта. Он требует явно переданные ключ,
+название модели и таймаут. Модели по умолчанию нет. Пример требует поддержки
+`output_format="png"` и inline `b64_json` выбранной моделью.
+
+```python
+from app.media import OpenAIImageProvider
+from app.shared.models import BusinessProfile, Fact, TextDraft
+
+provider = OpenAIImageProvider(
+    api_key=backend_api_key,
+    model=backend_image_model,
+    timeout_seconds=60,
+)
+image = await provider.generate(
+    BusinessProfile(
+        name="Кофейня",
+        description="",
+        facts=[Fact(text="Кофейня открыта с 09:00")],
+    ),
+    TextDraft(text="Зайдите на чашку кофе", image_brief="Чашка на деревянном столе"),
+    feedback="Больше свободного места справа",  # необязательно
+)
+# GeneratedImage(content=bytes, mime_type="image/png", provider="openai", is_demo=False)
+```
+
+`feedback` добавляется в данные новой генерации. Предыдущие пиксели не передаются
+текущим shared-протоколом, поэтому этот метод не обещает точное редактирование
+старого изображения. Новый вызов может быть платным.
+
+Дополнительный `generate_image(profile, text, feedback=None, *, provider, limits=...)`
+использует тот же shared-контракт и проверяет результат стороннего провайдера;
+runtime backend может вызывать `.generate(...)` напрямую.
+
+## Подключение фабрики
+
+`app.media.provider:build_provider(settings, *, api_key=None, model=None, ...)`
+синхронно возвращает провайдер без сети или длительной работы. В `settings.mode="demo"`
+возвращается только локальный `DemoImageProvider`. В `live` без явно переданных
+`api_key` и `model` возникает понятная `MediaConfigurationError`; fallback нет.
+
+Общие `Settings` пока не содержат image credentials. Поэтому одной строки
+`IMAGE_PROVIDER_FACTORY=app.media.provider:build_provider` **недостаточно для live**.
+После выбора сервиса согласуйте с backend способ загрузки секретов и создайте
+backend-owned wrapper factory, передающую утверждённые значения:
+
+```python
+# Пример интеграционной фабрики после согласования источника конфигурации с №2.
+def build_image_provider(settings):
+    return build_provider(
+        settings,
+        api_key=approved_backend_credentials.image_api_key,
+        model=approved_backend_credentials.image_model,
+    )
+```
+
+Модуль не добавляет собственные env-переменные, глобальный configure-hook и новые
+поля в Settings. Таймаут фабрика берёт из `settings.provider_timeout_seconds`.
+Endpoint и тестовый транспорт также можно передать явно.
+
+## Входные данные и ограничения
+
+В JSON-секцию промпта попадают название бизнеса, `tone`, `constraints`,
+подтверждённые `profile.facts`, полный `text.text`, `text.image_brief` и feedback.
+Assumptions/questions не выдаются за факты и не включаются. Инструкция запрещает
+придумывать цены, скидки, характеристики и другие утверждения.
+**Промпт не является песочницей против prompt injection и не гарантирует точность
+изображения.** Содержание черновика нужно проверить до дальнейшего использования;
+не передавайте секреты в исходных данных.
+
+| Поле | Предел по умолчанию |
+| --- | --- |
+| Полный промпт, включая инструкцию и JSON | 16 000 символов |
+| Подтверждённые факты | 20, каждый до 2 000 символов |
+| `text.text` | 900 символов, shared-контракт |
+| `text.image_brief` / feedback | По 4 000 символов |
+| `tone` | 2 000 символов |
+| `constraints` | 20, каждое до 1 000 символов |
+| HTTP-ответ до декодирования JSON | 8 MiB |
+| Декодированный PNG | 5 MiB |
+| Ширина / высота PNG | 4 096 пикселей |
+| Общее количество пикселей | 16 777 216 |
+| Количество PNG-чанков | 8 192 |
+
+Все лимиты действуют одновременно: большое сочетание допустимых отдельных полей
+может превысить полный размер промпта и завершиться `InvalidImageRequestError`
+до сетевого запроса. `MediaLimits` — frozen конфигурационный dataclass. Backend
+может передать положительные целые значения; image limit не может превышать
+общий контракт в 10 000 000 bytes. Если используется и wrapper `generate_image`,
+и адаптер, передавайте им одинаковые лимиты.
+
+Этот адаптер поддерживает только PNG — допустимое подмножество shared PNG/JPEG.
+Проверяются сигнатура, IHDR, глубина/тип цвета, размеры, границы чанков, CRC,
+наличие IDAT и завершающего IEND. Это структурная проверка, а не полное
+декодирование пикселей.
+
+OpenAI-адаптер делает один `POST /v1/images/generations` с `model`, `prompt`,
+`n=1`, `output_format="png"`; принимает ровно одно изображение из
+`data[0].b64_json`. URL из ответа никогда не скачивается. Endpoint должен быть
+HTTPS без credentials, query или fragment. Редиректы заблокированы, чтобы не
+пересылать `Authorization`. Ключ скрыт из `repr`, ошибки не включают заголовки
+запроса и тело ответа. Автоматических повторов нет.
+
+Синхронный `urllib` работает через `asyncio.to_thread`, сетевое ожидание не
+блокирует event loop. `timeout_seconds` ограничивает ожидание результата и
+передаётся в транспорт. При timeout/cancellation Python не может остановить уже
+работающий поток; исходная удалённая генерация может завершиться и списать
+средства. Повторный запрос не запускается. `asyncio.CancelledError` передаётся
+вызывающей стороне.
+
+Типизированные ошибки наследуют `MediaError` и безопасные shared domain errors:
+`MediaConfigurationError`/`InvalidImageRequestError` — `InvalidInput`;
+`MediaAuthenticationError`, `MediaRateLimitError`, `MediaTimeoutError`,
+`MediaUnavailableError`, `InvalidImageResponseError` — `ProviderUnavailable`.
+
+`DemoImageProvider()` выбирается только явно или фабрикой в demo-режиме и
+возвращает техническую заглушку PNG 1 × 1 с `provider="demo", is_demo=True`.
+Класс demo-провайдера также имеет `is_demo=True`, чтобы runtime отсеивал его
+уже при bootstrap в live; у OpenAI-провайдера `is_demo=False`.
+Backend сохраняет признак результата и запрещает demo в live. Ошибка настоящего
+провайдера не заменяется тестовым результатом.
+
+Контракт API адаптера: [официальная документация OpenAI Images](https://developers.openai.com/api/docs/guides/image-generation).
+Офлайн-проверки: `.venv/bin/python -m unittest discover -s tests/media -v` и
+`.venv/bin/python -m ruff check app/media tests/media`.
+Тесты используют фальшивые провайдеры и транспорт, без платных вызовов.
