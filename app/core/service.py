@@ -656,7 +656,8 @@ class BackendService:
             self._fail_preparation(
                 business,
                 job,
-                "Не удалось подготовить материалы. Проверьте профиль и доступность провайдеров.",
+                str(exc) if isinstance(exc, AppError)
+                else "Не удалось подготовить материалы. Проверьте профиль и доступность провайдеров.",
             )
             return True
         return True
