@@ -24,4 +24,3 @@ multidict==6.8.0
 propcache==0.5.4
 yarl==1.25.1
 pypdf==6.13.3
-pillow==12.3.0

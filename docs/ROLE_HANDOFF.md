@@ -50,7 +50,7 @@ AI самостоятельно готовит материалы; публик�
 | Переменная окружения | Фабрика | Сигнатура и результат |
 | --- | --- | --- |
 | `AI_PROVIDER_FACTORY` | `app.ai.provider:build_provider` | `build_provider(settings) -> AIProvider` |
-| `IMAGE_PROVIDER_FACTORY` | `app.media.provider:build_provider` | `build_provider(settings) -> ImageProvider` |
+| `IMAGE_PROVIDER_FACTORY` | `app.media.runtime:build_provider` | `build_provider(settings) -> ImageProvider` |
 | `REPORT_PROVIDER_FACTORY` | например `app.reports.provider:build_provider` | `build_provider(settings) -> ReportProvider`, необязательно |
 | `BOT_FACTORY` | `app.bot.adapter:build_bot` | `build_bot(service, settings) -> объект с async run(stop_event) и async send(notification)` |
 

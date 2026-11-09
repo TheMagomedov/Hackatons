@@ -1,21 +1,18 @@
 from datetime import UTC, datetime, timedelta
-from io import BytesIO
 
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerCallbackQuery, SendMessage, SendPhoto
 from aiogram.types import Chat, Message, Update
-from PIL import Image
 
 from app.ai.provider import ModelAI
 from app.bot.router import build_router
 from app.config import Settings
 from app.core.runtime import build_runtime
-from app.media.generator import normalize_image
-from app.reports.summary import Reporter
-from app.shared.errors import InvalidInput
-from app.shared.models import MetricSnapshot, ReportInput, Source, SourceInput
+from app.media.runtime import build_provider
+from app.shared.errors import InvalidInput, ProviderUnavailable
+from app.shared.models import BusinessProfile, Source, SourceInput, TextDraft
 
 
 class RecordingSession(BaseSession):
@@ -124,22 +121,13 @@ async def test_ai_uses_backend_source_ids_and_rejects_nonpublic_urls():
         await ai.build_profile([SourceInput(source=unsafe)])
 
 
-def test_report_keeps_latest_reactions_and_measured_zero():
-    end = datetime(2026, 11, 9, tzinfo=UTC)
-    start = end - timedelta(days=7)
-    sample = MetricSnapshot(
-        business_id="b1", name="reactions", post_id="p1", value=5, observed_at=start, source="telegram",
-        event_id="a",
+async def test_live_bot_can_start_without_image_credentials(monkeypatch):
+    monkeypatch.delenv("IMAGE_API_KEY", raising=False)
+    settings = Settings(
+        mode="live", owner_id=42, telegram_bot_token="123456:simulated",
+        ai_factory="app.ai.provider:build_provider", image_factory="app.media.runtime:build_provider",
     )
-    latest = sample.model_copy(update={"value": 0, "observed_at": end, "event_id": "b"})
-    data = ReportInput(business_id="b1", start=start, end=end, posts=[], metrics=[latest, sample])
-    assert "Реакции: 0 по 1 постам" in Reporter().build(data)
-    assert "Реакции: нет данных" in Reporter().build(data.model_copy(update={"metrics": []}))
-
-
-def test_image_converts_to_backend_asset_contract():
-    buffer = BytesIO()
-    Image.new("RGB", (16, 16)).save(buffer, "PNG")
-    image = normalize_image(buffer.getvalue(), "test")
-    assert image.mime_type == "image/jpeg"
-    assert image.content.startswith(b"\xff\xd8")
+    images = build_provider(settings)
+    with pytest.raises(ProviderUnavailable, match="IMAGE_API_KEY"):
+        await images.generate(BusinessProfile(name="Кофейня", description="Тест"),
+                              TextDraft(text="Кофе", image_brief="Чашка"))

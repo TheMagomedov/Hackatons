@@ -24,6 +24,7 @@ from app.shared.models import Business, PostStatus, PostView
 log = logging.getLogger(__name__)
 STATES = {
     PostStatus.REVIEW: "ожидает согласования",
+    PostStatus.EDITING: "редактируется",
     PostStatus.APPROVED: "в расписании",
     PostStatus.PUBLISHING: "отправляется",
     PostStatus.PUBLISHED: "опубликован",

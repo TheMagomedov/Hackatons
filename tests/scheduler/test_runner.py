@@ -230,6 +230,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_iteration_failures_are_isolated_and_do_not_log_secret_text(self) -> None:
         secret = "DO_NOT_LOG_PROVIDER_TOKEN"
+        metrics_recovered = asyncio.Event()
 
         class FailingService(FakeService):
             async def publish_due_once(self) -> bool:
@@ -260,6 +261,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 await super().collect_metrics()
                 if self.metrics_calls == 1:
                     raise ValueError(secret)
+                metrics_recovered.set()
                 return 0
 
         service = FailingService()
@@ -272,6 +274,8 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.wait_for(service.progress.wait(), timeout=1)
                 await asyncio.wait_for(service.generation_started.wait(), timeout=1)
+                # Other workers' progress does not imply a metrics retry ran.
+                await asyncio.wait_for(metrics_recovered.wait(), timeout=1)
             finally:
                 stop.set()
                 await asyncio.wait_for(task, timeout=1)
