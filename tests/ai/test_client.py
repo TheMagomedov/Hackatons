@@ -9,6 +9,15 @@ from app.shared.errors import InvalidInput, ProviderUnavailable
 from app.shared.models import TaskIntent
 
 
+@pytest.fixture(autouse=True)
+def isolate_provider_environment(monkeypatch):
+    for name in (
+        "TEXT_API_KEY", "TEXT_MODEL", "TEXT_API_BASE", "TEXT_TIMEOUT_SECONDS", "TEXT_MAX_RETRIES",
+        "AI_API_KEY", "AI_MODEL", "AI_BASE_URL", "AI_TIMEOUT_SECONDS", "AI_MAX_RETRIES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def response(content, *, finish="stop"):
     return httpx.Response(200, json={
         "choices": [{"finish_reason": finish, "message": {"content": content}}],
@@ -170,3 +179,62 @@ def test_environment_validation_has_no_secret_in_error(monkeypatch):
 def test_insecure_or_credential_bearing_base_url_rejected(url):
     with pytest.raises(ValueError):
         AISettings(api_key="secret", model="model", base_url=url)
+
+
+def test_canonical_text_configuration_wins_when_both_families_complete(monkeypatch):
+    for key, value in {
+        "TEXT_API_KEY": "text-key", "TEXT_MODEL": "text-model", "TEXT_API_BASE": "https://text.example/v1",
+        "TEXT_TIMEOUT_SECONDS": "9", "TEXT_MAX_RETRIES": "0",
+        "AI_API_KEY": "legacy-key", "AI_MODEL": "legacy-model", "AI_BASE_URL": "https://legacy.example/v1",
+        "AI_TIMEOUT_SECONDS": "20", "AI_MAX_RETRIES": "2",
+    }.items():
+        monkeypatch.setenv(key, value)
+    config = AISettings.from_env()
+    assert config.api_key.get_secret_value() == "text-key"
+    assert config.model == "text-model"
+    assert config.base_url == "https://text.example/v1"
+    assert config.timeout_seconds == 9 and config.max_retries == 0
+
+
+def test_legacy_key_ignores_text_example_defaults(monkeypatch):
+    for key, value in {
+        "TEXT_API_KEY": "", "TEXT_MODEL": "example-model", "TEXT_API_BASE": "https://text.example/v1",
+        "AI_API_KEY": "legacy-key", "AI_MODEL": "legacy-model",
+    }.items():
+        monkeypatch.setenv(key, value)
+    config = AISettings.from_env()
+    assert config.api_key.get_secret_value() == "legacy-key"
+    assert config.model == "legacy-model"
+    assert config.base_url == "https://api.openai.com/v1"
+
+
+@pytest.mark.parametrize("values", [
+    {"AI_API_KEY": "legacy-key", "TEXT_MODEL": "text-model", "TEXT_API_BASE": "https://text.example/v1"},
+    {"TEXT_API_KEY": "text-key", "TEXT_MODEL": "", "AI_MODEL": "legacy-model", "AI_BASE_URL": "https://legacy.example/v1"},
+    {"TEXT_API_KEY": "text-key", "TEXT_MODEL": "", "AI_API_KEY": "legacy-key", "AI_MODEL": "legacy-model"},
+])
+def test_partial_families_never_supply_each_others_model_or_url(monkeypatch, values):
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    assert AISettings.from_env_if_configured() is None
+    with pytest.raises(InvalidInput):
+        AISettings.from_env()
+
+
+@pytest.mark.parametrize("key,value", [
+    ("TEXT_API_BASE", "http://insecure.example/v1"), ("TEXT_TIMEOUT_SECONDS", "bad"),
+    ("TEXT_MAX_RETRIES", "99"), ("AI_BASE_URL", "http://insecure.example/v1"),
+])
+def test_invalid_optional_configuration_fails_even_when_unconfigured(monkeypatch, key, value):
+    monkeypatch.setenv(key, value)
+    with pytest.raises(InvalidInput):
+        AISettings.from_env_if_configured()
+
+
+def test_text_family_preserves_main_model_default_without_using_legacy_values(monkeypatch):
+    monkeypatch.setenv("TEXT_API_KEY", "text-key")
+    monkeypatch.setenv("AI_MODEL", "other-model")
+    monkeypatch.setenv("AI_BASE_URL", "https://legacy.example/v1")
+    config = AISettings.from_env()
+    assert config.model == "gpt-4.1-mini"
+    assert config.base_url == "https://api.openai.com/v1"

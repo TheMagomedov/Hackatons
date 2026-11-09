@@ -17,6 +17,16 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, f
 from app.shared.errors import InvalidInput, ProviderUnavailable
 
 T = TypeVar("T", bound=BaseModel)
+_ENV_FAMILIES = {
+    "TEXT": {
+        "TEXT_API_KEY": "api_key", "TEXT_MODEL": "model", "TEXT_API_BASE": "base_url",
+        "TEXT_TIMEOUT_SECONDS": "timeout_seconds", "TEXT_MAX_RETRIES": "max_retries",
+    },
+    "AI": {
+        "AI_API_KEY": "api_key", "AI_MODEL": "model", "AI_BASE_URL": "base_url",
+        "AI_TIMEOUT_SECONDS": "timeout_seconds", "AI_MAX_RETRIES": "max_retries",
+    },
+}
 
 SYSTEM = (
     "Ты редактор русскоязычного бизнес-контента. Верни ровно один JSON-объект по заданной схеме. "
@@ -32,8 +42,8 @@ SYSTEM = (
 class AISettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    api_key: SecretStr | None = None
-    model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=200)
+    api_key: SecretStr
+    model: str = Field(min_length=1, max_length=200)
     base_url: str = "https://api.openai.com/v1"
     timeout_seconds: float = Field(default=35, gt=0, le=120)
     # One shared budget: transport retries and invalid-output repairs together.
@@ -43,8 +53,8 @@ class AISettings(BaseModel):
 
     @field_validator("api_key")
     @classmethod
-    def nonempty_key(cls, value: SecretStr | None) -> SecretStr | None:
-        if value is not None and not value.get_secret_value().strip():
+    def nonempty_key(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
             raise ValueError("Empty API key")
         return value
 
@@ -72,26 +82,52 @@ class AISettings(BaseModel):
 
     @classmethod
     def from_env(cls) -> "AISettings":
-        names = {
-            "api_key": ("TEXT_API_KEY", "AI_API_KEY"),
-            "model": ("TEXT_MODEL", "AI_MODEL"),
-            "base_url": ("TEXT_API_BASE", "AI_BASE_URL"),
-            "timeout_seconds": ("AI_TIMEOUT_SECONDS",),
-            "max_retries": ("AI_MAX_RETRIES",),
-        }
-        values = {}
-        for field, keys in names.items():
-            for key in keys:
-                value = os.getenv(key, "").strip()
-                if value:
-                    values[field] = value
-                    break
+        """Strict configuration loading for an explicitly requested AI operation."""
+        config = cls._from_env(allow_unconfigured=False)
+        assert config is not None
+        return config
+
+    @classmethod
+    def from_env_if_configured(cls) -> "AISettings | None":
+        """Permit missing credentials for startup, but never accept invalid options."""
+        return cls._from_env(allow_unconfigured=True)
+
+    @classmethod
+    def _from_env(cls, *, allow_unconfigured: bool) -> "AISettings | None":
+        # Choose one complete namespace. A key must never travel to a URL taken
+        # from the other namespace, even if that namespace is only partly set.
+        if os.environ.get("TEXT_API_KEY", "").strip():
+            family = "TEXT"
+        elif os.environ.get("AI_API_KEY", "").strip():
+            family = "AI"
+        elif any(os.environ.get(name, "").strip() for name in _ENV_FAMILIES["TEXT"]):
+            family = "TEXT"
+        elif any(os.environ.get(name, "").strip() for name in _ENV_FAMILIES["AI"]):
+            family = "AI"
+        else:
+            family = "TEXT"
+        names = _ENV_FAMILIES[family]
+        values = {field: os.environ[key] for key, field in names.items() if key in os.environ}
+        if family == "TEXT" and "model" not in values:
+            # Preserve the integration's chosen default; an explicitly blank
+            # TEXT_MODEL still disables generation. Legacy AI_MODEL is required.
+            values["model"] = "gpt-4.1-mini"
+        missing = any(not values.get(field, "").strip() for field in ("api_key", "model"))
+        # Validate optional configuration even without a key/model. These local
+        # sentinels are discarded and can never construct a network client.
+        checked = dict(values)
+        if missing and allow_unconfigured:
+            for field in ("api_key", "model"):
+                if not checked.get(field, "").strip():
+                    checked[field] = "unconfigured"
         try:
-            return cls(**values)
+            config = cls(**checked)
         except (ValueError, TypeError):
             raise InvalidInput(
-                "Проверьте TEXT_API_KEY, TEXT_MODEL, TEXT_API_BASE, AI_TIMEOUT_SECONDS и AI_MAX_RETRIES."
+                f"Проверьте настройки семейства {family}: ключ, модель, HTTPS-адрес, тайм-аут и число повторов. "
+                "Используйте TEXT_API_KEY/TEXT_MODEL/TEXT_API_BASE либо AI_API_KEY/AI_MODEL/AI_BASE_URL."
             ) from None
+        return None if missing else config
 
 
 class ChatJSONClient:
@@ -122,8 +158,6 @@ class ChatJSONClient:
         self, schema: type[T], instruction: str, data: dict,
         validate: Callable[[T], bool] | None,
     ) -> T:
-        if self.settings.api_key is None:
-            raise ProviderUnavailable("Укажите TEXT_API_KEY в локальной конфигурации.")
         prompt = json.dumps({"schema": schema.model_json_schema(), "input": data}, ensure_ascii=False)
         if len(prompt) > 160_000:
             raise InvalidInput("Слишком много данных для одного AI-запроса.")

@@ -5,10 +5,19 @@ import httpx
 import pytest
 
 from app.ai.client import AISettings, ChatJSONClient
-from app.ai.provider import ModelAI, build_provider
+from app.ai.provider import ModelAI, UnconfiguredAI, build_provider
 from app.config import Settings
 from app.shared.errors import InvalidInput, ProviderUnavailable
 from app.shared.models import BusinessProfile, Fact, PlanItem, Source, SourceInput
+
+
+@pytest.fixture(autouse=True)
+def isolate_provider_environment(monkeypatch):
+    for name in (
+        "TEXT_API_KEY", "TEXT_MODEL", "TEXT_API_BASE", "TEXT_TIMEOUT_SECONDS", "TEXT_MAX_RETRIES",
+        "AI_API_KEY", "AI_MODEL", "AI_BASE_URL", "AI_TIMEOUT_SECONDS", "AI_MAX_RETRIES",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
@@ -245,3 +254,38 @@ async def test_aggregate_draft_context_is_bounded_including_json_escaping(profil
             await provider.write_post(profile, item)
     finally:
         await provider.close()
+
+
+@pytest.mark.parametrize("values", [{}, {"TEXT_MODEL": "explicit-model"}, {
+    "TEXT_API_KEY": "key-only", "TEXT_MODEL": "",
+}, {
+    "TEXT_MODEL": "other-family-model", "AI_API_KEY": "legacy-key-only",
+}])
+async def test_unconfigured_factory_starts_without_client_and_all_methods_fail_closed(
+    monkeypatch, profile, item, values,
+):
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    def forbidden_client(*args, **kwargs):
+        raise AssertionError("Unconfigured factory must not create a network client")
+
+    monkeypatch.setattr("app.ai.provider.ChatJSONClient", forbidden_client)
+    provider = build_provider(Settings())
+    assert isinstance(provider, UnconfiguredAI)
+    for method, args in [
+        (provider.build_profile, ([source()],)),
+        (provider.interpret_request, ("Отчёт", {})),
+        (provider.make_plan, (profile, "Один пост")),
+        (provider.write_post, (profile, item)),
+        (provider.revise_text, (profile, "Каша и кофе", "Короче")),
+    ]:
+        with pytest.raises(ProviderUnavailable, match="TEXT_API_KEY.*TEXT_MODEL"):
+            await method(*args)
+    await provider.close()
+
+
+def test_factory_rejects_invalid_optional_settings_without_key(monkeypatch):
+    monkeypatch.setenv("TEXT_API_BASE", "http://insecure.example/v1")
+    with pytest.raises(InvalidInput):
+        build_provider(Settings())

@@ -32,8 +32,8 @@ AI_PROVIDER_FACTORY=app.ai.provider:build_provider
 TEXT_API_BASE=https://api.openai.com/v1
 TEXT_API_KEY=
 TEXT_MODEL=gpt-4.1-mini
-AI_TIMEOUT_SECONDS=35
-AI_MAX_RETRIES=1
+TEXT_TIMEOUT_SECONDS=35
+TEXT_MAX_RETRIES=1
 ```
 
 `TEXT_API_KEY` нужен для генерации. Меню, загрузка источников и отчёт доступны без него.
@@ -45,7 +45,7 @@ AI_MAX_RETRIES=1
 Не включайте HTTP wire logging и не коммитьте `.env`.
 
 На один структурированный ответ выделен общий timeout; максимум запросов равен
-`AI_MAX_RETRIES + 1` (настройка 0–2). Исправление неверного JSON и повторы временных
+`TEXT_MAX_RETRIES + 1` (настройка 0–2). Исправление неверного JSON и повторы временных
 ошибок используют один бюджет. Ошибки доступа, отказ модели и исчерпание попыток
 возвращаются как безопасные доменные ошибки, без тела ответа сервиса.
 

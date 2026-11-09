@@ -5,11 +5,12 @@ import unicodedata
 from collections.abc import Awaitable, Callable
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
+from typing import NoReturn
 
 from app.ai.client import AISettings, ChatJSONClient
 from app.ai.sources import ExtractedSource, extract_source
 from app.config import Settings
-from app.shared.errors import InvalidInput
+from app.shared.errors import InvalidInput, ProviderUnavailable
 from app.shared.models import BusinessProfile, ContentPlan, PlanItem, SourceInput, TaskIntent, TextDraft
 
 Extractor = Callable[[SourceInput], Awaitable[ExtractedSource]]
@@ -220,9 +221,42 @@ class ModelAI:
         )
 
 
-def build_provider(settings: Settings) -> ModelAI:
+class UnconfiguredAI:
+    """Let Telegram menus start; generation remains unavailable without explicit setup."""
+
+    is_demo = False
+
+    @staticmethod
+    def _unavailable() -> NoReturn:
+        raise ProviderUnavailable(
+            "Укажите TEXT_API_KEY и TEXT_MODEL в локальной конфигурации "
+            "(или AI_API_KEY и AI_MODEL для прежнего семейства настроек)."
+        )
+
+    async def build_profile(self, sources: list[SourceInput]) -> BusinessProfile:
+        self._unavailable()
+
+    async def interpret_request(self, text: str, context: dict) -> TaskIntent:
+        self._unavailable()
+
+    async def make_plan(self, profile: BusinessProfile, request: str) -> ContentPlan:
+        self._unavailable()
+
+    async def write_post(self, profile: BusinessProfile, item: PlanItem) -> TextDraft:
+        self._unavailable()
+
+    async def revise_text(self, profile: BusinessProfile, current_text: str, feedback: str) -> TextDraft:
+        self._unavailable()
+
+    async def close(self) -> None:
+        pass
+
+
+def build_provider(settings: Settings) -> ModelAI | UnconfiguredAI:
     """Synchronous runtime factory: configuration only, no network or background work."""
-    config = AISettings.from_env()
+    config = AISettings.from_env_if_configured()
+    if config is None:
+        return UnconfiguredAI()
     config = config.model_copy(update={
         "timeout_seconds": min(config.timeout_seconds, settings.provider_timeout_seconds),
     })
