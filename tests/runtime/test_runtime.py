@@ -195,6 +195,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_data_owner_mismatch_rejected_before_live_factories(self):
         repository = Repository(self.directory / "backend.sqlite3")
         repository.initialize()
+        repository.bind_runtime("live", 88)
         business = repository.create_business(88, "Another owner", "UTC", NOW)
         with self.assertRaises(Conflict):
             await build_runtime(self.settings(owner_id=77))
@@ -204,6 +205,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_matching_owner_can_reopen_existing_data(self):
         repository = Repository(self.directory / "backend.sqlite3")
         repository.initialize()
+        repository.bind_runtime("live", 77)
         business = repository.create_business(77, "Same owner", "UTC", NOW)
         runtime = await build_runtime(self.settings())
         self.assertEqual(runtime.service.repo.get_business(business.id).owner_id, 77)

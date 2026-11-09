@@ -25,6 +25,7 @@ from app.shared.models import (
     Asset,
     Business,
     BusinessProfile,
+    ChannelInfo,
     ContentPlan,
     Job,
     MetricSnapshot,
@@ -67,6 +68,7 @@ class BackendService:
         self.notifier = notifier
         self.reporter = reporter
         self.clock = clock
+        self._notification_lock = asyncio.Lock()
 
     def now(self) -> datetime:
         return as_utc(self.clock())
@@ -112,19 +114,38 @@ class BackendService:
 
     def _notification(
         self, business: Business, kind: str, text: str, post_id: str | None = None, job_id: str | None = None
-    ) -> None:
-        self.repo.add_notification(
-            Notification(
-                id=str(uuid4()),
-                business_id=business.id,
-                owner_id=business.owner_id,
-                kind=kind,
-                text=text,
-                post_id=post_id,
-                job_id=job_id,
-                created_at=self.now(),
-            )
+    ) -> Notification:
+        """Construct an outbox entry; the outcome transaction persists it."""
+        return Notification(
+            id=str(uuid4()),
+            business_id=business.id,
+            owner_id=business.owner_id,
+            kind=kind,
+            text=text,
+            post_id=post_id,
+            job_id=job_id,
+            created_at=self.now(),
         )
+
+    @staticmethod
+    def _plain_text(value: str, maximum: int, message: str) -> str:
+        if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+            raise InvalidInput(message)
+        try:
+            value.encode("utf-16-le")
+        except UnicodeEncodeError:
+            raise InvalidInput(message) from None
+        return value
+
+    def _current_context(self, business: Business) -> Business:
+        current = self.repo.get_business(business.id)
+        if (
+            current.profile_version != business.profile_version
+            or current.channel_id != business.channel_id
+            or not current.profile_confirmed
+        ):
+            raise Conflict("Профиль или канал изменились во время подготовки. Повторите запрос.")
+        return current
 
     def create_business(self, actor_id: int, name: str, timezone: str | None = None) -> Business:
         self._owner(actor_id)
@@ -147,7 +168,11 @@ class BackendService:
 
     async def connect_channel(self, actor_id: int, business_id: str, channel_id: str) -> Business:
         business = self._business(actor_id, business_id)
-        channel = await self._external(self.publisher.verify_channel(channel_id, actor_id))
+        channel = self._provider_result(
+            ChannelInfo, await self._external(self.publisher.verify_channel(channel_id, actor_id))
+        )
+        if not channel.id.strip() or not channel.title.strip():
+            raise ProviderUnavailable("Провайдер вернул некорректные данные канала.")
         business = self._business(actor_id, business_id)
         if channel.id != business.channel_id:
             active = {PostStatus.APPROVED, PostStatus.PUBLISHING, PostStatus.DELIVERY_UNKNOWN}
@@ -291,14 +316,21 @@ class BackendService:
 
     def request_preparation(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
         business = self._business(actor_id, business_id)
-        self._ready(business)
-        if not request.strip() or len(request) > 4000 or not request_id or len(request_id) > 200:
+        request = self._plain_text(request, 4000, "Укажите запрос длиной до 4000 символов.").strip()
+        if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 200:
             raise InvalidInput("Укажите запрос и стабильный идентификатор действия.")
+        key = f"manual:{business_id}:{request_id}"
+        existing = self.repo.find_job(business_id, key)
+        if existing is not None:
+            if existing.request != request:
+                raise Conflict("Ключ задания уже использован для другого запроса.")
+            return existing
+        self._ready(business)
         # Same Telegram update/callback ID -> same durable job, including after restart.
         return self.repo.enqueue_job(
             business_id,
             request,
-            f"manual:{business_id}:{request_id}",
+            key,
             self.now(),
             max_pending=self.settings.max_pending_jobs,
             max_per_day=self.settings.max_generation_jobs_per_day,
@@ -353,8 +385,10 @@ class BackendService:
 
     @staticmethod
     def _validate_caption(text: str) -> str:
-        if not text.strip() or len(text) > 900 or len(text.encode("utf-16-le")) // 2 > 1024:
-            raise InvalidInput("Подпись должна быть непустой и помещаться в один пост с изображением.")
+        message = "Подпись должна быть непустой и помещаться в один пост с изображением."
+        BackendService._plain_text(text, 900, message)
+        if len(text.encode("utf-16-le")) // 2 > 1024:
+            raise InvalidInput(message)
         return text
 
     def edit_post(
@@ -373,6 +407,7 @@ class BackendService:
         changes = {}
         if text is not None:
             changes["text"] = self._validate_caption(text)
+            changes["is_demo"] = post.is_demo or self.settings.mode == "demo"
         if image_asset_id is not None:
             asset = self.repo.get_asset(image_asset_id)
             if asset.business_id != post.business_id or asset.mime_type not in {"image/png", "image/jpeg"}:
@@ -393,42 +428,117 @@ class BackendService:
             raise InvalidInput("Нет изменений.")
         return self.repo.revise_post(post_id, expected_revision, changes, self.now())
 
-    async def revise_text(
+    def _reserve_edit(
         self, actor_id: int, post_id: str, expected_revision: int, feedback: str
-    ) -> PostView:
+    ) -> tuple[Business, PostView]:
         post = self._post(actor_id, post_id)
         business = self._business(actor_id, post.business_id)
         self._ready(business)
-        if post.revision != expected_revision:
+        if type(expected_revision) is not int or post.revision != expected_revision:
             raise Conflict("Откройте актуальную версию поста.")
-        if not feedback.strip() or len(feedback) > 4000:
-            raise InvalidInput("Укажите правку длиной до 4000 символов.")
-        draft = self._provider_result(
-            TextDraft, await self._external(self.ai.revise_text(business.profile, post.text, feedback))
-        )
-        known_sources = {source.id for source in self.repo.list_sources(business.id)}
-        if set(draft.used_source_ids) - known_sources:
-            raise InvalidInput("Текст ссылается на неизвестные источники.")
-        if self.repo.get_business(business.id).profile_version != business.profile_version:
-            raise Conflict("Профиль изменился во время подготовки текста.")
-        return self.edit_post(actor_id, post_id, expected_revision, text=draft.text)
+        if post.status not in {
+            PostStatus.REVIEW,
+            PostStatus.APPROVED,
+            PostStatus.REJECTED,
+            PostStatus.FAILED,
+        }:
+            raise Conflict("Пост уже изменяется, отправляется или отправлен.")
+        if post.channel_id != business.channel_id:
+            raise Conflict("Сначала обновите канал в предпросмотре поста.")
+        self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        # This durable reservation invalidates old buttons before any paid call.
+        return business, self.repo.begin_edit(post_id, expected_revision, self.now())
+
+    def _fail_edit_safely(self, business: Business, editing: PostView, message: str) -> PostView | None:
+        """Preserve a committed success; otherwise fail only our reserved revision."""
+        try:
+            current = self.repo.get_post(editing.id)
+            if current.status == PostStatus.REVIEW and current.revision == editing.revision + 1:
+                return current
+            if current.status == PostStatus.EDITING and current.revision == editing.revision:
+                self.repo.fail_edit(
+                    editing.id,
+                    editing.revision,
+                    message,
+                    self.now(),
+                    notification=self._notification(business, "edit_failed", message, editing.id),
+                )
+        except Exception as exc:
+            # An unavailable database leaves EDITING for durable startup recovery.
+            log.warning("Edit recovery persistence failed: %s", type(exc).__name__)
+        return None
+
+    async def revise_text(
+        self, actor_id: int, post_id: str, expected_revision: int, feedback: str
+    ) -> PostView:
+        business, editing = self._reserve_edit(actor_id, post_id, expected_revision, feedback)
+        try:
+            draft = self._provider_result(
+                TextDraft,
+                await self._external(self.ai.revise_text(business.profile, editing.text, feedback)),
+            )
+            self._current_context(business)
+            known_sources = {source.id for source in self.repo.list_sources(business.id)}
+            if set(draft.used_source_ids) - known_sources:
+                raise InvalidInput("Текст ссылается на неизвестные источники.")
+            text = self._validate_caption(draft.text)
+            return self.repo.complete_edit(
+                editing.id,
+                editing.revision,
+                {"text": text, "is_demo": editing.is_demo or self.settings.mode == "demo"},
+                self.now(),
+                expected_profile_version=business.profile_version,
+                expected_channel_id=business.channel_id,
+            )
+        except asyncio.CancelledError:
+            self._fail_edit_safely(business, editing, "Правка прервана. Повторите её отдельным запросом.")
+            raise
+        except Exception as exc:
+            completed = self._fail_edit_safely(
+                business,
+                editing,
+                "Не удалось изменить текст. Пост не будет опубликован без нового согласования.",
+            )
+            if completed is not None:
+                return completed
+            if isinstance(exc, AppError):
+                raise
+            log.warning("Text revision failed: %s", type(exc).__name__)
+            raise ProviderUnavailable("Не удалось завершить правку текста.") from None
 
     async def revise_image(
         self, actor_id: int, post_id: str, expected_revision: int, feedback: str
     ) -> PostView:
-        post = self._post(actor_id, post_id)
-        business = self._business(actor_id, post.business_id)
-        self._ready(business)
-        if post.revision != expected_revision:
-            raise Conflict("Откройте актуальную версию поста.")
-        if not feedback.strip() or len(feedback) > 4000:
-            raise InvalidInput("Укажите пожелание длиной до 4000 символов.")
-        draft = TextDraft(text=post.text, image_brief=feedback)
-        generated = await self._external(self.images.generate(business.profile, draft, feedback))
-        if self.repo.get_business(business.id).profile_version != business.profile_version:
-            raise Conflict("Профиль изменился во время подготовки изображения.")
-        asset = self._store_image(post.business_id, generated)
-        return self.edit_post(actor_id, post_id, expected_revision, image_asset_id=asset.id)
+        business, editing = self._reserve_edit(actor_id, post_id, expected_revision, feedback)
+        try:
+            draft = TextDraft(text=self._validate_caption(editing.text), image_brief=feedback)
+            generated = await self._external(self.images.generate(business.profile, draft, feedback))
+            self._current_context(business)
+            asset = self._store_image(editing.business_id, generated)
+            return self.repo.complete_edit(
+                editing.id,
+                editing.revision,
+                {
+                    "image_asset_id": asset.id,
+                    "is_demo": editing.is_demo or asset.is_demo or self.settings.mode == "demo",
+                },
+                self.now(),
+                expected_profile_version=business.profile_version,
+                expected_channel_id=business.channel_id,
+            )
+        except asyncio.CancelledError:
+            self._fail_edit_safely(business, editing, "Правка прервана. Повторите её отдельным запросом.")
+            raise
+        except Exception as exc:
+            completed = self._fail_edit_safely(
+                business, editing, "Не удалось изменить изображение. Пост требует нового согласования."
+            )
+            if completed is not None:
+                return completed
+            if isinstance(exc, AppError):
+                raise
+            log.warning("Image revision failed: %s", type(exc).__name__)
+            raise ProviderUnavailable("Не удалось завершить правку изображения.") from None
 
     def approve_post(self, actor_id: int, post_id: str, expected_revision: int) -> PostView:
         post = self._post(actor_id, post_id)
@@ -457,9 +567,12 @@ class BackendService:
         first_run_at: datetime | None = None,
     ) -> Business:
         business = self._business(actor_id, business_id)
+        if type(enabled) is not bool:
+            raise InvalidInput("Признак автоматизации должен быть логическим значением.")
         if enabled:
             self._ready(business)
-        if not 1 <= interval_hours <= 720 or not request.strip() or len(request) > 4000:
+        self._plain_text(request, 4000, "Укажите запрос длиной до 4000 символов.")
+        if type(interval_hours) is not int or not 1 <= interval_hours <= 720:
             raise InvalidInput("Период должен быть от 1 до 720 часов, запрос — до 4000 символов.")
         next_at = as_utc(first_run_at) if first_run_at else self.now() + timedelta(hours=interval_hours)
         if enabled and next_at < self.now():
@@ -486,19 +599,23 @@ class BackendService:
             plan = self._provider_result(
                 ContentPlan, await self._external(self.ai.make_plan(business.profile, request))
             )
+            self._current_context(business)
             if len(plan.items) > self.settings.max_posts_per_job:
                 raise InvalidInput("AI превысил лимит публикаций на одно задание.")
             self.repo.save_plan(business.id, job.id, plan, self.now())
             drafts = []
             source_ids = {source.id for source in self.repo.list_sources(business.id)}
             for item in plan.items:
+                self._current_context(business)
                 text = self._provider_result(
                     TextDraft, await self._external(self.ai.write_post(business.profile, item))
                 )
+                self._current_context(business)
                 self._validate_caption(text.text)
                 if set(text.used_source_ids) - source_ids:
                     raise InvalidInput("Текст ссылается на неизвестные источники.")
                 generated = await self._external(self.images.generate(business.profile, text))
+                self._current_context(business)
                 asset = self._store_image(business.id, generated)
                 proposed = as_utc(item.suggested_at) if item.suggested_at else None
                 drafts.append(
@@ -510,40 +627,76 @@ class BackendService:
                         "is_demo": asset.is_demo or self.settings.mode == "demo",
                     }
                 )
-            posts = self.repo.create_posts(
+            self.repo.create_posts(
                 business.id,
                 drafts,
                 self.now(),
                 job_id=job.id,
                 expected_profile_version=business.profile_version,
                 expected_channel_id=business.channel_id,
+                notification=self._notification(
+                    business,
+                    "drafts_ready",
+                    f"Готово черновиков: {len(drafts)}. Откройте план и согласуйте каждый готовый пост.",
+                    job_id=job.id,
+                ),
             )
         except asyncio.CancelledError:
-            self.repo.fail_job(
-                job.id, "Подготовка прервана. Повторный запуск — только по отдельному запросу.", self.now()
-            )
+            try:
+                self._fail_preparation(
+                    business,
+                    job,
+                    "Подготовка прервана. Повторный запуск — только по отдельному запросу.",
+                )
+            except Exception as exc:
+                log.warning("Generation cancellation persistence failed: %s", type(exc).__name__)
             raise
         except Exception as exc:
             log.warning("Preparation failed: %s", type(exc).__name__)
-            self.repo.fail_job(
-                job.id,
-                "Не удалось подготовить материалы. Проверьте профиль и доступность провайдеров.",
-                self.now(),
-            )
-            self._notification(
+            self._fail_preparation(
                 business,
-                "preparation_failed",
-                "Не удалось подготовить материалы. Откройте статус задания.",
-                job_id=job.id,
+                job,
+                "Не удалось подготовить материалы. Проверьте профиль и доступность провайдеров.",
             )
             return True
-        self._notification(
-            business,
-            "drafts_ready",
-            f"Готово черновиков: {len(posts)}. Откройте план и согласуйте каждый готовый пост.",
-            job_id=job.id,
-        )
         return True
+
+    def _fail_preparation(self, business: Business, job: Job, message: str) -> None:
+        current = self.repo.get_job(job.id)
+        # A transaction may have committed before the caller saw an exception.
+        if current.status in {"done", "failed"}:
+            return
+        self.repo.fail_job(
+            job.id,
+            message,
+            self.now(),
+            notification=self._notification(business, "preparation_failed", message, job_id=job.id),
+        )
+
+    def _fail_publication(
+        self,
+        business: Business,
+        post: PostView,
+        message: str,
+        unknown: bool,
+        kind: str | None = None,
+    ) -> None:
+        current = self.repo.get_post(post.id)
+        if current.status != PostStatus.PUBLISHING or current.revision != post.revision:
+            return
+        self.repo.fail_publication(
+            post.id,
+            post.revision,
+            message,
+            unknown,
+            self.now(),
+            notification=self._notification(
+                business,
+                kind or ("delivery_unknown" if unknown else "publication_failed"),
+                message,
+                post.id,
+            ),
+        )
 
     async def publish_due_once(self) -> bool:
         post = self.repo.claim_due_post(self.now())
@@ -555,18 +708,12 @@ class BackendService:
             or (self.now() - as_utc(post.scheduled_at)).total_seconds()
             > self.settings.max_publish_lateness_seconds
         ):
-            self.repo.fail_publication(
-                post.id,
-                post.revision,
+            self._fail_publication(
+                business,
+                post,
                 "Время публикации пропущено. Выберите новое время и согласуйте пост заново.",
                 False,
-                self.now(),
-            )
-            self._notification(
-                business,
                 "missed_time",
-                "Пост не отправлен: допустимое опоздание превышено. Выберите новое время.",
-                post.id,
             )
             return True
         attempted = False
@@ -585,29 +732,35 @@ class BackendService:
                 )
             if result.channel_id != post.channel_id:
                 raise DeliveryUnknown("Не удалось подтвердить канал опубликованного сообщения.")
-            self.repo.finish_publication(post.id, post.revision, result, self.now())
-        except asyncio.CancelledError:
-            self.repo.fail_publication(
+            self.repo.finish_publication(
                 post.id,
                 post.revision,
-                "Отправка прервана; проверьте канал перед повторением.",
-                attempted,
+                result,
                 self.now(),
+                notification=self._notification(
+                    business,
+                    "published",
+                    "Пост опубликован." + (f" {result.message_url}" if result.message_url else ""),
+                    post.id,
+                ),
             )
+        except asyncio.CancelledError:
+            try:
+                self._fail_publication(
+                    business,
+                    post,
+                    "Отправка прервана; проверьте канал перед повторением.",
+                    attempted,
+                )
+            except Exception as exc:
+                log.warning("Publication cancellation persistence failed: %s", type(exc).__name__)
             raise
         except DeliveryRejected:
-            self.repo.fail_publication(
-                post.id,
-                post.revision,
+            self._fail_publication(
+                business,
+                post,
                 "Telegram отклонил публикацию. Исправьте причину и согласуйте новое время.",
                 False,
-                self.now(),
-            )
-            self._notification(
-                business,
-                "publication_failed",
-                "Telegram отклонил публикацию. Проверьте права и содержимое.",
-                post.id,
             )
         except Exception as exc:
             log.warning("Publication failed: %s", type(exc).__name__)
@@ -616,17 +769,7 @@ class BackendService:
                 if attempted
                 else "Не удалось подготовить файл к отправке. Публикация не отправлена."
             )
-            self.repo.fail_publication(post.id, post.revision, message, attempted, self.now())
-            self._notification(
-                business, "delivery_unknown" if attempted else "publication_failed", message, post.id
-            )
-        else:
-            self._notification(
-                business,
-                "published",
-                "Пост опубликован." + (f" {result.message_url}" if result.message_url else ""),
-                post.id,
-            )
+            self._fail_publication(business, post, message, attempted)
         return True
 
     def resolve_unknown_delivery(
@@ -639,6 +782,8 @@ class BackendService:
         message_id: int | None = None,
     ) -> PostView:
         post = self._post(actor_id, post_id)
+        if type(confirmed_not_sent) is not bool:
+            raise InvalidInput("Подтверждение отсутствия сообщения должно быть логическим значением.")
         if confirmed_not_sent == (message_id is not None):
             raise InvalidInput("Подтвердите либо отсутствие сообщения, либо его идентификатор.")
         if message_id is not None and (type(message_id) is not int or message_id <= 0):
@@ -651,6 +796,10 @@ class BackendService:
         return self.repo.resolve_unknown(post_id, expected_revision, result, self.now())
 
     async def dispatch_notifications(self, limit: int = 20) -> int:
+        async with self._notification_lock:
+            return await self._dispatch_notification_batch(limit)
+
+    async def _dispatch_notification_batch(self, limit: int) -> int:
         delivered = 0
         for notification in self.repo.pending_notifications(limit, now=self.now()):
             try:
@@ -726,20 +875,20 @@ class BackendService:
         return self.repo.report_input(business_id, start, end)
 
     def build_report(self, actor_id: int, business_id: str, start: datetime, end: datetime) -> str:
+        data = self.report_data(actor_id, business_id, start, end)
         if self.reporter is None:
             raise ProviderUnavailable("Модуль отчётов ещё не подключён. Данные доступны через report_data().")
-        return self.reporter.build(self.report_data(actor_id, business_id, start, end))
+        try:
+            result = self.reporter.build(data)
+            if asyncio.iscoroutine(result):
+                result.close()
+            if not isinstance(result, str) or not result.strip():
+                raise ValueError("Invalid report result")
+            result.encode("utf-16-le")
+            return result
+        except Exception as exc:
+            log.warning("Report provider failed: %s", type(exc).__name__)
+            raise ProviderUnavailable("Не удалось подготовить отчёт. Проверьте модуль аналитики.") from None
 
     def recover_interrupted(self) -> dict:
-        result = self.repo.recover_interrupted(self.now())
-        if result.get("posts") or result.get("jobs"):
-            for business in self.repo.list_businesses():
-                if any(
-                    post.status == PostStatus.DELIVERY_UNKNOWN for post in self.repo.list_posts(business.id)
-                ):
-                    self._notification(
-                        business,
-                        "recovery",
-                        "После перезапуска есть отправки с неизвестным результатом. Проверьте канал.",
-                    )
-        return result
+        return self.repo.recover_interrupted(self.now())

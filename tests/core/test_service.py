@@ -330,30 +330,33 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.get_job(job.id).status, "failed")
         self.assertEqual(self.repo.list_posts(self.business.id), [])
 
-    async def test_stale_ai_text_revision_cannot_overwrite_manual_edit(self):
+    async def test_reserved_ai_text_revision_blocks_competing_manual_edit(self):
         post = await self.prepare_post()
         gate = self.ai.gates["revision"] = Gate()
         task = asyncio.create_task(self.service.revise_text(OWNER, post.id, post.revision, "shorten"))
         await asyncio.wait_for(gate.entered.wait(), 1)
-        manual = self.service.edit_post(OWNER, post.id, post.revision, text="Owner's final text.")
-        gate.release.set()
+        editing = self.repo.get_post(post.id)
         with self.assertRaises(Conflict):
-            await task
-        self.assertEqual(self.repo.get_post(post.id).text, manual.text)
-        self.assertEqual(self.repo.get_post(post.id).revision, manual.revision)
+            self.service.edit_post(OWNER, post.id, editing.revision, text="Owner's final text.")
+        gate.release.set()
+        revised = await task
+        self.assertEqual(revised.text, "AI revised text.")
+        self.assertGreater(revised.revision, editing.revision)
+        self.assertEqual(revised.status, PostStatus.REVIEW)
 
-    async def test_stale_generated_image_cannot_replace_new_revision(self):
+    async def test_reserved_generated_image_blocks_competing_manual_edit(self):
         post = await self.prepare_post()
         gate = self.images.gate = Gate()
         task = asyncio.create_task(self.service.revise_image(OWNER, post.id, post.revision, "warmer"))
         await asyncio.wait_for(gate.entered.wait(), 1)
-        manual = self.service.edit_post(OWNER, post.id, post.revision, text="Final owner text.")
-        gate.release.set()
+        editing = self.repo.get_post(post.id)
         with self.assertRaises(Conflict):
-            await task
-        saved = self.repo.get_post(post.id)
-        self.assertEqual(saved.revision, manual.revision)
-        self.assertEqual(saved.image_asset_id, post.image_asset_id)
+            self.service.edit_post(OWNER, post.id, editing.revision, text="Final owner text.")
+        gate.release.set()
+        saved = await task
+        self.assertGreater(saved.revision, editing.revision)
+        self.assertNotEqual(saved.image_asset_id, post.image_asset_id)
+        self.assertEqual(saved.text, post.text)
 
     async def test_channel_change_during_generation_discards_old_destination(self):
         job = self.service.request_preparation(OWNER, self.business.id, "task", "channel-race")
@@ -497,6 +500,8 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.get_job(job.id).status, "failed")
         self.assertFalse(await self.service.prepare_next_job())
         self.assertEqual(self.repo.list_posts(self.business.id), [])
+        notices = [n for n in self.repo.pending_notifications(100, self.clock()) if n.job_id == job.id]
+        self.assertEqual([n.kind for n in notices], ["preparation_failed"])
 
     async def test_publication_cancellation_is_unknown_without_automatic_retry(self):
         post = await self.due_post()
@@ -509,6 +514,8 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.get_post(post.id).status, PostStatus.DELIVERY_UNKNOWN)
         self.assertFalse(await self.service.publish_due_once())
         self.assertEqual(len(self.publisher.calls), 1)
+        notices = [n for n in self.repo.pending_notifications(100, self.clock()) if n.post_id == post.id]
+        self.assertEqual([n.kind for n in notices], ["delivery_unknown"])
 
     async def test_timeout_after_send_is_unknown_and_explicit_rejection_is_failed(self):
         for error, expected in (
@@ -539,15 +546,12 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
             raise sqlite3.OperationalError("response lost after commit")
 
         with patch.object(self.repo, "finish_publication", side_effect=committed_then_raised):
-            # A service may report the persistence fault; the durable successful
-            # state must win over attempted failure handling in either case.
-            try:
-                await self.service.publish_due_once()
-            except (Conflict, sqlite3.OperationalError):
-                pass
+            self.assertTrue(await self.service.publish_due_once())
         self.assertEqual(self.repo.get_post(post.id).status, PostStatus.PUBLISHED)
         self.assertFalse(await self.service.publish_due_once())
         self.assertEqual(len(self.publisher.calls), 1)
+        notices = [n for n in self.repo.pending_notifications(100, self.clock()) if n.post_id == post.id]
+        self.assertEqual([n.kind for n in notices], ["published"])
 
     async def test_persistence_unavailable_after_send_recovers_as_unknown(self):
         post = await self.due_post()
@@ -703,7 +707,8 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.ai, "revise_text", side_effect=bad_revision):
             with self.assertRaises(InvalidInput):
                 await self.service.revise_text(OWNER, post.id, post.revision, "add a fact")
-        self.assertEqual(self.repo.get_post(post.id).revision, post.revision)
+        self.assertEqual(self.repo.get_post(post.id).revision, post.revision + 1)
+        self.assertEqual(self.repo.get_post(post.id).status, PostStatus.FAILED)
         self.assertEqual(self.repo.get_post(post.id).text, post.text)
 
     async def test_ai_cannot_choose_an_unselected_post_or_approve_it(self):
@@ -750,7 +755,8 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(error.__suppress_context__)
                     else:
                         self.fail("Malformed AI result was accepted")
-        self.assertEqual(self.repo.get_post(post.id).revision, post.revision)
+        self.assertEqual(self.repo.get_post(post.id).revision, post.revision + 1)
+        self.assertEqual(self.repo.get_post(post.id).status, PostStatus.FAILED)
 
     async def test_malformed_image_result_fails_job_without_raw_payload_in_logs_or_storage(self):
         secret = "private-image-response-" + uuid4().hex
@@ -764,6 +770,348 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, failed.error)
         self.assertNotIn(secret, "\n".join(captured.output))
         self.assertEqual(self.repo.list_posts(self.business.id), [])
+
+    async def test_slow_ai_edit_revokes_old_approval_and_blocks_old_preview(self):
+        for approved in (False, True):
+            for kind in ("text", "image"):
+                with self.subTest(approved=approved, kind=kind):
+                    post = await self.prepare_post()
+                    if approved:
+                        self.service.approve_post(OWNER, post.id, post.revision)
+                    gate = Gate()
+                    if kind == "text":
+                        self.ai.gates["revision"] = gate
+                        operation = self.service.revise_text
+                    else:
+                        self.images.gate = gate
+                        operation = self.service.revise_image
+                    task = asyncio.create_task(operation(OWNER, post.id, post.revision, "Change"))
+                    await asyncio.wait_for(gate.entered.wait(), 1)
+                    editing = self.repo.get_post(post.id)
+                    self.assertEqual(editing.status, PostStatus.EDITING)
+                    self.assertEqual(editing.revision, post.revision + 1)
+                    self.assertIsNone(editing.approved_revision)
+                    for revision in (post.revision, editing.revision):
+                        with self.assertRaises(Conflict):
+                            self.service.approve_post(OWNER, post.id, revision)
+                    self.clock.advance(minutes=2)
+                    self.assertFalse(await self.service.publish_due_once())
+                    gate.release.set()
+                    changed = await task
+                    self.assertEqual(changed.status, PostStatus.REVIEW)
+                    self.assertEqual(changed.revision, editing.revision + 1)
+                    self.assertIsNone(changed.approved_revision)
+        self.assertEqual(self.publisher.calls, [])
+
+    async def test_terminal_post_states_reject_ai_edit_before_paid_provider(self):
+        for state in (PostStatus.PUBLISHED, PostStatus.PUBLISHING, PostStatus.DELIVERY_UNKNOWN):
+            with self.subTest(state=state):
+                post = await self.due_post()
+                if state == PostStatus.PUBLISHING:
+                    self.repo.claim_due_post(self.clock())
+                else:
+                    self.publisher.error = (
+                        TimeoutError("network") if state == PostStatus.DELIVERY_UNKNOWN else None
+                    )
+                    await self.service.publish_due_once()
+                self.assertEqual(self.repo.get_post(post.id).status, state)
+                with (
+                    patch.object(self.ai, "revise_text", wraps=self.ai.revise_text) as ai_call,
+                    patch.object(self.images, "generate", wraps=self.images.generate) as image_call,
+                ):
+                    for operation in (self.service.revise_text, self.service.revise_image):
+                        with self.assertRaises(Conflict):
+                            await operation(OWNER, post.id, post.revision, "Change")
+                    self.assertEqual(ai_call.await_count, 0)
+                    self.assertEqual(image_call.await_count, 0)
+
+    async def test_concurrent_ai_edit_rejected_even_with_current_editing_revision(self):
+        post = await self.prepare_post()
+        gate = self.ai.gates["revision"] = Gate()
+        first = asyncio.create_task(self.service.revise_text(OWNER, post.id, post.revision, "First"))
+        await asyncio.wait_for(gate.entered.wait(), 1)
+        current = self.repo.get_post(post.id)
+        with patch.object(self.images, "generate", wraps=self.images.generate) as provider:
+            with self.assertRaises(Conflict):
+                await self.service.revise_image(OWNER, post.id, current.revision, "Second")
+            self.assertEqual(provider.await_count, 0)
+        gate.release.set()
+        changed = await first
+        self.assertEqual(changed.status, PostStatus.REVIEW)
+
+    async def test_cancelled_ai_edit_is_failed_and_notified_atomically(self):
+        for kind in ("text", "image"):
+            with self.subTest(kind=kind):
+                post = await self.prepare_post()
+                self.service.approve_post(OWNER, post.id, post.revision)
+                gate = Gate()
+                if kind == "text":
+                    self.ai.gates["revision"] = gate
+                    operation = self.service.revise_text
+                else:
+                    self.images.gate = gate
+                    operation = self.service.revise_image
+                task = asyncio.create_task(operation(OWNER, post.id, post.revision, "Change"))
+                await asyncio.wait_for(gate.entered.wait(), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                saved = self.repo.get_post(post.id)
+                self.assertEqual(saved.status, PostStatus.FAILED)
+                self.assertIsNone(saved.approved_revision)
+                messages = [
+                    n
+                    for n in self.repo.pending_notifications(100, self.clock())
+                    if n.post_id == post.id and n.kind == "edit_failed"
+                ]
+                self.assertEqual(len(messages), 1)
+                self.clock.advance(minutes=2)
+                self.assertFalse(await self.service.publish_due_once())
+                gate.release.set()
+
+    async def test_post_commit_edit_error_preserves_success(self):
+        post = await self.prepare_post()
+        original = self.repo.complete_edit
+
+        def committed_then_raised(*args, **kwargs):
+            original(*args, **kwargs)
+            raise sqlite3.OperationalError("after commit")
+
+        with patch.object(self.repo, "complete_edit", side_effect=committed_then_raised):
+            changed = await self.service.revise_text(OWNER, post.id, post.revision, "Shorten")
+        self.assertEqual(changed.status, PostStatus.REVIEW)
+        self.assertEqual(changed.text, "AI revised text.")
+        self.assertFalse(
+            any(n.kind == "edit_failed" for n in self.repo.pending_notifications(100, self.clock()))
+        )
+
+    async def test_demo_text_revision_marks_a_live_origin_post_as_demo(self):
+        self.settings = Settings(
+            mode="live",
+            owner_id=OWNER,
+            data_dir=self.root,
+            telegram_bot_token="123:TEST_ONLY",
+            ai_factory="test:ai",
+            image_factory="test:image",
+        )
+        self.service = self.new_service()
+        post = await self.prepare_post()
+        self.assertFalse(post.is_demo)
+        self.settings = self.settings.model_copy(update={"mode": "demo"})
+        self.service = self.new_service()
+        changed = await self.service.revise_text(OWNER, post.id, post.revision, "Change")
+        self.assertTrue(changed.is_demo)
+        self.settings = self.settings.model_copy(update={"mode": "live"})
+        self.service = self.new_service()
+        with self.assertRaises(InvalidInput):
+            self.service.approve_post(OWNER, changed.id, changed.revision)
+
+    async def test_boolean_commands_reject_truthy_strings_numbers_and_containers(self):
+        post = await self.due_post()
+        self.publisher.error = TimeoutError("network")
+        await self.service.publish_due_once()
+        for value in ("false", "true", 0, 1, None, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(InvalidInput):
+                    self.service.configure_automation(OWNER, self.business.id, value)
+                with self.assertRaises(InvalidInput):
+                    self.service.resolve_unknown_delivery(
+                        OWNER, post.id, post.revision, confirmed_not_sent=value
+                    )
+        self.assertFalse(self.repo.get_business(self.business.id).automation_enabled)
+        self.assertEqual(self.repo.get_post(post.id).status, PostStatus.DELIVERY_UNKNOWN)
+
+    async def test_existing_request_retry_survives_profile_invalidation(self):
+        job = self.service.request_preparation(OWNER, self.business.id, "task", "same-update")
+        self.service.add_text_source(OWNER, self.business.id, "New information")
+        retried = self.service.request_preparation(OWNER, self.business.id, "  task  ", "same-update")
+        self.assertEqual(retried.id, job.id)
+        with self.assertRaises(Conflict):
+            self.service.request_preparation(OWNER, self.business.id, "different", "same-update")
+        with self.assertRaises(Conflict):
+            self.service.request_preparation(OWNER, self.business.id, "task", "new-update")
+        with self.assertRaises(Forbidden):
+            self.service.request_preparation(999, self.business.id, "task", "same-update")
+        self.assertEqual(len(self.repo.list_jobs(self.business.id)), 1)
+
+    async def test_invalid_feedback_and_caption_fail_before_reservation_or_provider(self):
+        post = await self.prepare_post()
+        invalid = (None, True, 123, [], "", "  ", "\ud800", "a" * 4001)
+        with (
+            patch.object(self.ai, "revise_text", wraps=self.ai.revise_text) as ai_call,
+            patch.object(self.images, "generate", wraps=self.images.generate) as image_call,
+        ):
+            for value in invalid:
+                with self.subTest(value_type=type(value).__name__):
+                    for operation in (self.service.revise_text, self.service.revise_image):
+                        with self.assertRaises(InvalidInput):
+                            await operation(OWNER, post.id, post.revision, value)
+                    with self.assertRaises(InvalidInput):
+                        self.service.edit_post(OWNER, post.id, post.revision, text=value)
+            self.assertEqual(ai_call.await_count, 0)
+            self.assertEqual(image_call.await_count, 0)
+        self.assertEqual(self.repo.get_post(post.id).revision, post.revision)
+
+    async def test_reporter_errors_and_invalid_results_are_sanitized(self):
+        secret = "private-report-" + uuid4().hex
+        start, end = self.clock() - timedelta(days=1), self.clock()
+
+        class Reporter:
+            def __init__(self, value):
+                self.value = value
+
+            def build(self, data):
+                if isinstance(self.value, Exception):
+                    raise self.value
+                return self.value
+
+        for value in (RuntimeError(secret), InvalidInput(secret), None, 42, {}, "", "  ", "\ud800"):
+            with self.subTest(value_type=type(value).__name__):
+                self.service.reporter = Reporter(value)
+                try:
+                    self.service.build_report(OWNER, self.business.id, start, end)
+                except ProviderUnavailable as error:
+                    self.assertNotIn(secret, "".join(traceback.format_exception(error)))
+                else:
+                    self.fail("Invalid reporter output accepted")
+        self.service.reporter = Reporter("Valid report")
+        self.assertEqual(self.service.build_report(OWNER, self.business.id, start, end), "Valid report")
+        self.service.reporter = None
+        with self.assertRaises(Forbidden):
+            self.service.build_report(999, self.business.id, start, end)
+
+    async def test_channel_provider_contract_failure_preserves_destination(self):
+        secret = "private-channel-" + uuid4().hex
+        with patch.object(self.publisher, "verify_channel", return_value={"id": [secret]}):
+            try:
+                await self.service.connect_channel(OWNER, self.business.id, "-100NEW")
+            except ProviderUnavailable as error:
+                self.assertNotIn(secret, "".join(traceback.format_exception(error)))
+            else:
+                self.fail("Invalid channel result accepted")
+        self.assertEqual(self.repo.get_business(self.business.id).channel_id, self.business.channel_id)
+
+    async def test_concurrent_notification_dispatch_sends_each_entry_once(self):
+        await self.prepare_post()
+        gate = Gate()
+        calls = []
+
+        async def slow_send(notification):
+            calls.append(notification.id)
+            await gate.wait()
+
+        with patch.object(self.notifier, "send", side_effect=slow_send):
+            first = asyncio.create_task(self.service.dispatch_notifications())
+            await asyncio.wait_for(gate.entered.wait(), 1)
+            second = asyncio.create_task(self.service.dispatch_notifications())
+            await asyncio.sleep(0)
+            self.assertEqual(len(calls), 1)
+            gate.release.set()
+            results = await asyncio.gather(first, second)
+        self.assertEqual(results, [1, 0])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.repo.pending_notifications(100, self.clock()), [])
+
+    async def test_profile_change_stops_remaining_paid_preparation_stages(self):
+        for stage, next_provider in (("plan", "write"), ("write", "image")):
+            with self.subTest(stage=stage):
+                current = self.repo.get_business(self.business.id)
+                self.service.confirm_profile(OWNER, self.business.id, current.profile_version)
+                job = self.service.request_preparation(OWNER, self.business.id, "task", f"stale-{stage}")
+                gate = self.ai.gates[stage] = Gate()
+                target = self.ai if next_provider == "write" else self.images
+                method = "write_post" if next_provider == "write" else "generate"
+                with patch.object(target, method, wraps=getattr(target, method)) as provider:
+                    task = asyncio.create_task(self.service.prepare_next_job())
+                    await asyncio.wait_for(gate.entered.wait(), 1)
+                    self.service.save_profile(
+                        OWNER,
+                        self.business.id,
+                        current.profile_version,
+                        BusinessProfile(name="Changed", description="New facts"),
+                    )
+                    gate.release.set()
+                    await task
+                    self.assertEqual(provider.await_count, 0)
+                self.assertEqual(self.repo.get_job(job.id).status, "failed")
+        self.assertEqual(self.repo.list_posts(self.business.id), [])
+
+    async def test_outbox_insert_failure_rolls_back_generated_posts_and_done_job(self):
+        job = self.service.request_preparation(OWNER, self.business.id, "task", "atomic-drafts")
+        original = self.repo._add_notification
+
+        def reject_ready(conn, notification):
+            if notification.kind == "drafts_ready":
+                raise sqlite3.OperationalError("outbox unavailable")
+            return original(conn, notification)
+
+        with patch.object(self.repo, "_add_notification", side_effect=reject_ready):
+            await self.service.prepare_next_job()
+        self.assertEqual(self.repo.get_job(job.id).status, "failed")
+        self.assertEqual(self.repo.list_posts(self.business.id), [])
+        self.assertEqual(
+            [n.kind for n in self.repo.pending_notifications(100, self.clock())], ["preparation_failed"]
+        )
+
+    async def test_outbox_insert_failure_after_send_preserves_unknown_without_retry(self):
+        post = await self.due_post()
+        original = self.repo._add_notification
+
+        def reject_published(conn, notification):
+            if notification.kind == "published":
+                raise sqlite3.OperationalError("outbox unavailable")
+            return original(conn, notification)
+
+        with patch.object(self.repo, "_add_notification", side_effect=reject_published):
+            await self.service.publish_due_once()
+        self.assertEqual(self.repo.get_post(post.id).status, PostStatus.DELIVERY_UNKNOWN)
+        self.assertFalse(await self.service.publish_due_once())
+        self.assertEqual(len(self.publisher.calls), 1)
+        notices = [n.kind for n in self.repo.pending_notifications(100, self.clock()) if n.post_id == post.id]
+        self.assertEqual(notices, ["delivery_unknown"])
+
+    async def test_post_commit_generation_exception_preserves_done_and_ready_notification(self):
+        job = self.service.request_preparation(OWNER, self.business.id, "task", "committed-drafts")
+        original = self.repo.create_posts
+
+        def committed_then_raised(*args, **kwargs):
+            original(*args, **kwargs)
+            raise sqlite3.OperationalError("after commit")
+
+        with patch.object(self.repo, "create_posts", side_effect=committed_then_raised):
+            self.assertTrue(await self.service.prepare_next_job())
+        self.assertEqual(self.repo.get_job(job.id).status, "done")
+        self.assertEqual(len(self.repo.list_posts(self.business.id)), 1)
+        self.assertFalse(await self.service.prepare_next_job())
+        self.assertEqual(
+            [n.kind for n in self.repo.pending_notifications(100, self.clock())], ["drafts_ready"]
+        )
+
+    async def test_edit_failure_outbox_failure_is_recovered_atomically_once(self):
+        post = await self.prepare_post()
+        original = self.repo._add_notification
+
+        def reject_edit_failure(conn, notification):
+            if notification.kind == "edit_failed":
+                raise sqlite3.OperationalError("outbox unavailable")
+            return original(conn, notification)
+
+        with (
+            patch.object(self.ai, "revise_text", side_effect=RuntimeError("private provider error")),
+            patch.object(self.repo, "_add_notification", side_effect=reject_edit_failure),
+        ):
+            with self.assertRaises(ProviderUnavailable):
+                await self.service.revise_text(OWNER, post.id, post.revision, "Change")
+        self.assertEqual(self.repo.get_post(post.id).status, PostStatus.EDITING)
+        self.assertEqual(self.service.recover_interrupted()["edits"], 1)
+        self.assertEqual(self.service.recover_interrupted()["edits"], 0)
+        self.assertEqual(self.repo.get_post(post.id).status, PostStatus.FAILED)
+        notices = [
+            n
+            for n in self.repo.pending_notifications(100, self.clock())
+            if n.post_id == post.id and n.kind == "edit_failed"
+        ]
+        self.assertEqual(len(notices), 1)
 
 
 if __name__ == "__main__":

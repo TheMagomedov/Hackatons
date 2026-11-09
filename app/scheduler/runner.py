@@ -42,6 +42,8 @@ class SchedulerSettings:
     notification_interval_seconds: float = 2.0
     metrics_interval_seconds: float = 3600.0
     notification_batch_size: int = 20
+    # Appended to preserve the positional meaning of existing settings.
+    automation_interval_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -49,6 +51,7 @@ class SchedulerSettings:
             "job_interval_seconds",
             "notification_interval_seconds",
             "metrics_interval_seconds",
+            "automation_interval_seconds",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -62,7 +65,7 @@ class SchedulerSettings:
 
 
 class Scheduler:
-    """Three workers, with no queue of unbounded background tasks.
+    """Five independent workers, with no queue of unbounded background tasks.
 
     Use ``await Scheduler(service).run(stop_event)``. Setting stop_event or
     cancelling run cancels in-flight calls and awaits their cleanup. Service
@@ -112,8 +115,28 @@ class Scheduler:
                     name="scheduler-generation",
                 ),
                 asyncio.create_task(
-                    self._maintenance_loop(stop_event),
-                    name="scheduler-maintenance",
+                    self._automation_loop(stop_event),
+                    name="scheduler-automation",
+                ),
+                asyncio.create_task(
+                    self._operation_loop(
+                        "notifications",
+                        lambda: self.service.dispatch_notifications(
+                            limit=self.settings.notification_batch_size
+                        ),
+                        self.settings.notification_interval_seconds,
+                        stop_event,
+                    ),
+                    name="scheduler-notifications",
+                ),
+                asyncio.create_task(
+                    self._operation_loop(
+                        "metrics",
+                        self.service.collect_metrics,
+                        self.settings.metrics_interval_seconds,
+                        stop_event,
+                    ),
+                    name="scheduler-metrics",
                 ),
             ]
             stop_waiter = asyncio.create_task(stop_event.wait(), name="scheduler-stop-waiter")
@@ -141,28 +164,14 @@ class Scheduler:
             await self._call_async(name, operation)
             await self._wait_for_tick(stop_event, interval)
 
-    async def _maintenance_loop(self, stop_event: asyncio.Event) -> None:
-        loop = asyncio.get_running_loop()
-        next_metrics_at = loop.time()  # Collect once on startup, then periodically.
+    async def _automation_loop(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             try:
                 self.service.schedule_automations()
             except Exception as error:
                 self._log_failure("automation scheduling", error)
 
-            if stop_event.is_set():
-                return
-            await self._call_async(
-                "notifications",
-                lambda: self.service.dispatch_notifications(limit=self.settings.notification_batch_size),
-            )
-
-            if stop_event.is_set():
-                return
-            if loop.time() >= next_metrics_at:
-                await self._call_async("metrics", self.service.collect_metrics)
-                next_metrics_at = loop.time() + self.settings.metrics_interval_seconds
-            await self._wait_for_tick(stop_event, self.settings.notification_interval_seconds)
+            await self._wait_for_tick(stop_event, self.settings.automation_interval_seconds)
 
     async def _call_async(self, name: str, operation: Callable[[], Awaitable[object]]) -> None:
         try:

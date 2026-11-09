@@ -1,4 +1,4 @@
-"""CLI: python -m app [demo|init|check|run]. No live requests on default launch."""
+"""CLI with offline diagnostics and explicit legacy-data adoption."""
 
 import argparse
 import asyncio
@@ -14,7 +14,7 @@ from app.config import Settings
 from app.core.demo import run_demo
 from app.core.instance_lock import InstanceLock
 from app.core.runtime import build_runtime, run_application
-from app.shared.errors import AppError
+from app.shared.errors import AppError, InvalidInput, NotFound
 from app.storage import Repository
 
 
@@ -25,13 +25,41 @@ async def execute(args) -> None:
             result = await run_demo(destination)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command in {"status", "adopt-data"}:
+        # Operational commands deliberately do not load API keys or provider factories.
+        # DATA_DIR must be explicit: an operator should never inspect/adopt the wrong database.
+        if not args.data_dir:
+            raise InvalidInput("Укажите --data-dir с существующей базой.")
+        destination = Path(args.data_dir)
+        db_path = destination / "backend.sqlite3"
+        if not db_path.is_file():
+            raise NotFound("В выбранном DATA_DIR нет backend.sqlite3.")
+        repository = Repository(db_path)
+        try:
+            if args.command == "status":
+                # diagnostics() is read-only and can inspect an unbound schema-v1 database.
+                print(json.dumps(repository.diagnostics(), ensure_ascii=False, indent=2))
+            else:
+                if args.mode is None or args.owner_id is None:
+                    raise InvalidInput("Для adopt-data явно укажите --mode и --owner-id.")
+                with InstanceLock(destination / "backend.lock"):
+                    repository.initialize()
+                    repository.bind_runtime(args.mode, args.owner_id, adopt_legacy=True)
+                print(json.dumps({"binding": repository.runtime_binding(), "external_requests": 0}, indent=2))
+        finally:
+            repository.close()
+        return
     settings = Settings.from_env(args.env_file)
     if args.data_dir:
         settings = Settings.model_validate({**settings.model_dump(), "data_dir": Path(args.data_dir)})
     if args.command == "init":
         with InstanceLock(settings.data_dir / "backend.lock"):
             repo = Repository(settings.data_dir / "backend.sqlite3")
-            repo.initialize()
+            try:
+                repo.initialize()
+                repo.bind_runtime(settings.mode, settings.owner_id)
+            finally:
+                repo.close()
         print("Database initialized. No external requests were made.")
     elif args.command == "check":
         with InstanceLock(settings.data_dir / "backend.lock"):
@@ -46,11 +74,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Backend автономного AI-маркетолога. По умолчанию — офлайн-демо."
     )
-    parser.add_argument("command", nargs="?", choices=("demo", "init", "check", "run"), default="demo")
+    parser.add_argument(
+        "command", nargs="?", choices=("demo", "init", "check", "run", "status", "adopt-data"), default="demo"
+    )
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--once", action="store_true", help="Один цикл backend для команды run")
+    parser.add_argument("--mode", choices=("demo", "live"), help="Режим существующих данных для adopt-data")
+    parser.add_argument("--owner-id", type=int, help="Владелец существующих данных для adopt-data")
     args = parser.parse_args()
+    if args.command != "adopt-data" and (args.mode is not None or args.owner_id is not None):
+        parser.error("--mode и --owner-id используются только с adopt-data")
+    if args.once and args.command != "run":
+        parser.error("--once используется только с run")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

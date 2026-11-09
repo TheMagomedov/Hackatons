@@ -42,6 +42,10 @@ class Settings(BaseModel):
     @model_validator(mode="after")
     def live_credentials(self) -> "Settings":
         if self.mode == "live":
+            if "owner_id" not in self.model_fields_set:
+                # A domain error avoids embedding the input mapping (and token)
+                # in a Pydantic validation error printed by an API caller.
+                raise InvalidInput("Укажите OWNER_TELEGRAM_ID явно для live-режима.")
             if not self.telegram_bot_token or not self.telegram_bot_token.get_secret_value().strip():
                 raise ValueError("TELEGRAM_BOT_TOKEN is required in live mode")
             if not self.ai_factory or not self.image_factory:
@@ -51,11 +55,6 @@ class Settings(BaseModel):
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
         load_dotenv(env_file, override=False)
-        if (
-            os.environ.get("APP_MODE", "demo") == "live"
-            and not os.environ.get("OWNER_TELEGRAM_ID", "").strip()
-        ):
-            raise InvalidInput("Укажите OWNER_TELEGRAM_ID явно для live-режима.")
         names = {
             "APP_MODE": "mode",
             "DATA_DIR": "data_dir",
