@@ -1,1 +1,1 @@
-"""Reserved for role 1. Implement AIProvider and expose build_provider(settings)."""
+"""Role 1: source extraction and content via app.ai.provider:build_provider."""
