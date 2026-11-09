@@ -102,7 +102,9 @@ IMAGE_PROVIDER_FACTORY=app.media.runtime:build_provider
 REPORT_PROVIDER_FACTORY=app.reports.provider:build_provider
 BOT_FACTORY=app.bot.adapter:build_bot
 AI_API_KEY=
+AI_MODEL=gpt-4.1-mini
 IMAGE_API_KEY=
+IMAGE_MODEL=gpt-image-1
 ```
 
 Текстовый адаптер использует Chat Completions с JSON-ответом и проверкой Pydantic, графический — Images Generation. В `.env.live.example` указаны `AI_API_KEY`, `AI_MODEL`, `AI_BASE_URL`, `AI_TIMEOUT_SECONDS`, `AI_MAX_RETRIES`; изображения используют `IMAGE_API_KEY`, `IMAGE_MODEL`, `IMAGE_API_BASE`. Также поддерживается семейство `TEXT_API_KEY/TEXT_MODEL/TEXT_API_BASE`: если задан `TEXT_API_KEY`, выбирается целиком семейство `TEXT_*`, иначе при наличии `AI_API_KEY` — целиком `AI_*`. Ключ и URL разных семейств не смешиваются; используйте одно семейство. В примере указаны `gpt-4.1-mini` и `gpt-image-1`; доступ проверяется вашим аккаунтом провайдера. Запускайте один polling-процесс на токен.
