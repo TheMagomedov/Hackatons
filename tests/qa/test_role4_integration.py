@@ -177,7 +177,7 @@ class Role4IntegrationTests(unittest.IsolatedAsyncioTestCase):
             report = build_report(self.service.report_data(OWNER, self.business.id, start, end))
             demo = next(activity for activity in report.activities if activity.is_demo)
             self.assertEqual(dict(demo.current_states)[PostStatus.EDITING], 1)
-            self.assertIn("редакт", text.lower())
+            self.assertIn("редактируются 1", text)
         finally:
             images.release.set()
             revised = await asyncio.wait_for(task, timeout=1)

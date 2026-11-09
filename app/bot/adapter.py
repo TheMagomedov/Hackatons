@@ -1,0 +1,69 @@
+import asyncio
+import logging
+from contextlib import suppress
+
+from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramAPIError
+from aiogram.utils.token import TokenValidationError
+
+from app.bot.router import build_router, menu
+from app.config import Settings
+from app.core.service import BackendService
+from app.shared.errors import InvalidInput, ProviderUnavailable
+from app.shared.models import Notification
+
+log = logging.getLogger(__name__)
+
+
+class TelegramBotAdapter:
+    def __init__(self, service: BackendService, token: str):
+        try:
+            self.bot = Bot(token)
+        except TokenValidationError as exc:
+            raise InvalidInput("Проверьте формат TELEGRAM_BOT_TOKEN.") from exc
+        self.dispatcher = Dispatcher()
+        self.dispatcher.include_router(build_router(service))
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        try:
+            me = await self.bot.get_me(request_timeout=15)
+            webhook = await self.bot.get_webhook_info(request_timeout=15)
+        except TelegramAPIError as exc:
+            raise ProviderUnavailable("Telegram не подтвердил подключение бота.") from exc
+        if webhook.url:
+            raise InvalidInput("У этого бота настроен webhook. Для polling нужен отдельный токен или отключение webhook.")
+        log.info("Telegram bot @%s connected", me.username)
+        polling = asyncio.create_task(self.dispatcher.start_polling(
+            self.bot, handle_signals=False, close_bot_session=False,
+            allowed_updates=self.dispatcher.resolve_used_update_types(),
+        ))
+        stopping = asyncio.create_task(stop_event.wait())
+        try:
+            done, _ = await asyncio.wait((polling, stopping), return_when=asyncio.FIRST_COMPLETED)
+            if polling in done:
+                await polling
+        finally:
+            stopping.cancel()
+            if not polling.done():
+                with suppress(RuntimeError):
+                    await self.dispatcher.stop_polling()
+                polling.cancel()
+            await asyncio.gather(polling, stopping, return_exceptions=True)
+
+    async def send(self, notification: Notification) -> None:
+        rows = []
+        if notification.job_id:
+            rows.append([("Открыть задание", f"job:{notification.job_id}")])
+        if notification.post_id:
+            rows.append([("Открыть пост", f"post:{notification.post_id}")])
+        await self.bot.send_message(notification.owner_id, notification.text, reply_markup=menu(*rows),
+                                    request_timeout=15)
+
+    async def close(self) -> None:
+        await self.bot.session.close()
+
+
+def build_bot(service: BackendService, settings: Settings) -> TelegramBotAdapter:
+    if not settings.telegram_bot_token:
+        raise InvalidInput("Укажите TELEGRAM_BOT_TOKEN.")
+    return TelegramBotAdapter(service, settings.telegram_bot_token.get_secret_value())

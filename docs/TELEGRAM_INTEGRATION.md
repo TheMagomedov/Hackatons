@@ -1,8 +1,7 @@
 # Подключение Telegram-интерфейса к backend
 
-Этот документ предназначен участнику №3. Он описывает существующий Python API
-`BackendService` и контракт подключения будущего Telegram-адаптера. Сам бот и
-зависимость `aiogram` не реализованы backend-командой.
+Этот документ описывает Python API `BackendService` и контракт Telegram-адаптера.
+Реализация на `aiogram` находится в `app/bot`. Запуск описан в README.
 
 Источники истины: `app/core/service.py`, `app/shared/models.py`,
 `app/shared/ports.py`, `app/shared/errors.py`. При расхождении сначала согласуйте
@@ -46,7 +45,7 @@ class TelegramBotAdapter:
         ...
 ```
 
-Это контракт для runtime, а не уже поставленный TelegramBotAdapter. Runtime
+Runtime
 вызывает фабрику один раз, передаёт существующий сервис и запускает адаптер рядом
 с scheduler. Адаптер использует этот же сервис. В фабрике нельзя создавать
 `BackendService`, `Repository`, `FileStore` или второй процесс приложения.
@@ -56,8 +55,7 @@ class TelegramBotAdapter:
 разворачивать его можно только непосредственно для настройки клиента. Не выводите
 его, полный URL Telegram-запроса или сырые provider responses в логи.
 
-Необходимую Telegram-библиотеку участник №3 добавляет в общий файл зависимостей
-через согласованный PR с участником №2. Сейчас наличие aiogram не предполагается.
+Версия `aiogram` закреплена в `requirements.txt`.
 
 В `APP_MODE=demo` нельзя запускать настоящий polling, вызывать Telegram или реальные
 AI/image providers. Demo предназначен для локальной проверки backend. Для проверки
