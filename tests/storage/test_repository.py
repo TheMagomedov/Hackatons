@@ -75,18 +75,18 @@ class RepositoryTests(unittest.TestCase):
     def test_wal_configuration_and_repeat_initialization(self):
         self.repo.initialize()
         with self.repo._reader() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
 
     def test_future_schema_is_rejected_without_downgrade(self):
         with closing(sqlite3.connect(self.path)) as conn:
-            conn.execute("PRAGMA user_version = 2")
+            conn.execute("PRAGMA user_version = 3")
         with self.assertRaises(Conflict):
             self.repo.initialize()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_profile_version_cas_and_confirmation(self):
         one = self.confirmed_profile()
@@ -257,8 +257,8 @@ class RepositoryTests(unittest.TestCase):
         self.repo.claim_due_post(due)
         restarted = Repository(self.path)
         restarted.initialize()
-        self.assertEqual(restarted.recover_interrupted(due), {"posts": 1, "jobs": 1})
-        self.assertEqual(restarted.recover_interrupted(due), {"posts": 0, "jobs": 0})
+        self.assertEqual(restarted.recover_interrupted(due), {"posts": 1, "jobs": 1, "edits": 0})
+        self.assertEqual(restarted.recover_interrupted(due), {"posts": 0, "jobs": 0, "edits": 0})
         self.assertEqual(restarted.get_job(job.id).status, "failed")
         self.assertEqual(restarted.get_post(post.id).status, PostStatus.DELIVERY_UNKNOWN)
         self.assertIsNone(restarted.claim_due_post(due))

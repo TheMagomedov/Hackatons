@@ -13,7 +13,7 @@ from app.core.instance_lock import InstanceLock
 from app.core.service import BackendService
 from app.publishing import TelegramNotifier, TelegramPublisher
 from app.scheduler import Scheduler
-from app.shared.errors import Conflict, InvalidInput
+from app.shared.errors import InvalidInput
 from app.storage import FileStore, Repository
 
 log = logging.getLogger(__name__)
@@ -78,15 +78,14 @@ class Runtime:
 
 async def build_runtime(settings: Settings) -> Runtime:
     repository = Repository(settings.data_dir / "backend.sqlite3")
-    repository.initialize()
-    if any(b.owner_id != settings.owner_id for b in repository.list_businesses()):
-        raise Conflict(
-            "OWNER_TELEGRAM_ID не совпадает с владельцем сохранённых данных. Используйте соответствующий DATA_DIR."
-        )
-    files = FileStore(settings.data_dir / "assets", max_bytes=settings.max_upload_bytes)
     resources = [repository]
     runtime = Runtime(service=None, resources=resources)  # type: ignore[arg-type]
     try:
+        repository.initialize()
+        # Bind before constructing providers or touching jobs/outbox. An
+        # existing unbound database requires explicit operator adoption.
+        repository.bind_runtime(settings.mode, settings.owner_id)
+        files = FileStore(settings.data_dir / "assets", max_bytes=settings.max_upload_bytes)
         if settings.mode == "demo":
             ai, images = DemoAI(), DemoImages()
             publisher, notifier, reporter = DemoPublisher(), DemoNotifier(), DemoReporter()
@@ -170,6 +169,8 @@ async def run_application(settings: Settings, *, once: bool = False) -> None:
                 for task in done:
                     if task is not stopped:
                         task.result()
+                if not stop.is_set():
+                    raise RuntimeError("Application worker stopped unexpectedly.")
             finally:
                 stop.set()
                 for task in [*tasks, stopped]:
