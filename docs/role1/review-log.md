@@ -1,6 +1,6 @@
 # Проверка интеграции роли 1 — 9 ноября 2026
 
-Финальная база: main, commit 54c6de8 (PR #5: Telegram, AI и Media).
+Финальная база: main, commit 63ab83b (PR #8: Telegram workflow и AI hardening).
 Финальная ветка: codex/ai-hardening, создана от принятой общей сборки.
 Первые законченные блоки сохранены в codex/ai-integration; существующая ветка
 codex/ai-content другого каркаса не перезаписывалась.
@@ -16,6 +16,7 @@ codex/ai-content другого каркаса не перезаписывала
 | codex/media-analytics-integration | 631db85 | Общие image_brief, ImageProvider/ReportProvider и лимиты профиля; scheduler-тест ожидает восстановление метрик |
 | codex/media-analytics-integration | bc81c74 | Повторный обзор перед отправкой: явный IMAGE_MODEL и улучшенная ошибка отсутствующей конфигурации; AI-контракты не изменены |
 | codex/main-integration / main | 5aba398 / 54c6de8 | Принята общая сборка, добавлен предварительный AI и TEXT_* конфигурация; роль 1 совместима с новым запуском |
+| codex/hackathon-polish / main | f35c010 / 63ab83b | PR #8 уже включил итоговые app/ai и tests/ai; новые Telegram-сценарии и TEXT timeout/retries совместимы. PR #9 согласует оставшиеся docs и adapter-тест |
 
 Прочитаны текущие shared-модели/порты/ошибки, Settings, service/runtime,
 ROLE_HANDOFF, AI-файлы интеграции, её adapter-тест и ограничения Media.
@@ -43,8 +44,11 @@ ROLE_HANDOFF, AI-файлы интеграции, её adapter-тест и ог�
 
 ## Проверки
 
-Окончательный общий прогон: **386 passed, 2 skipped, 199 subtests passed**.
-CI также доступен в Pull Request.
+Общий прогон после интеграции 54c6de8: **386 passed, 2 skipped, 199 subtests passed**.
+Повторный прогон после разрешения конфликтов с main 63ab83b: **386 passed,
+2 skipped, 199 subtests passed** за 44.32 s; Ruff и diff check без замечаний.
+CI также доступен в Pull Request #9. Сохранены новые Telegram-тесты main
+и восстановлена проверка AI-источников в tests/test_adapters.py.
 Среда локальной проверки: Windows, Python 3.13.9, requirements-dev.txt из main.
 Все 38 source-тестов повторно прошли на принятом pypdf 6.13.3, включая Windows
 spawn, успешный текстовый PDF, пустой PDF и завершение процесса по timeout.

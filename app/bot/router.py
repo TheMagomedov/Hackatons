@@ -1,5 +1,6 @@
 import io
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -33,6 +34,8 @@ STATES = {
     PostStatus.DELIVERY_UNKNOWN: "результат неизвестен",
 }
 EDITABLE = {PostStatus.REVIEW, PostStatus.APPROVED, PostStatus.FAILED, PostStatus.REJECTED}
+POSTS_PER_PAGE = 10
+QUICK_SCHEDULE = {"in15": 15, "in60": 60}
 INPUTS = {
     "name": "Введите название бизнеса.",
     "notes": "Пришлите сведения о бизнесе и пожелания к стилю.",
@@ -65,11 +68,12 @@ async def reply(message: Message, text: str, markup: InlineKeyboardMarkup | None
     await message.answer(text, reply_markup=markup)
 
 
-@dataclass(frozen=True)
+@dataclass
 class Prompt:
     kind: str
     object_id: str = ""
     revision: int = 0
+    in_progress: bool = False
 
 
 class OwnerAccess(BaseMiddleware):
@@ -120,9 +124,28 @@ def build_router(service: BackendService) -> Router:
     pending: Prompt | None = None
     selected: str | None = None
 
-    async def home(message: Message, actor: int) -> None:
+    @contextmanager
+    def use_prompt():
+        context = pending
+        if context is not None:
+            if context.in_progress:
+                raise Conflict("Предыдущий ответ ещё обрабатывается.")
+            context.in_progress = True
+        try:
+            yield context
+        finally:
+            if context is not None:
+                context.in_progress = False
+
+    def finish_prompt(context: Prompt | None) -> None:
         nonlocal pending
+        if pending is context:
+            pending = None
+
+    async def home(message: Message, actor: int) -> None:
+        nonlocal pending, selected
         pending = None
+        selected = None
         businesses = service.list_businesses(actor)
         rows = [[(b.name[:50], f"business:{b.id}")] for b in businesses[-15:]]
         await reply(message, "Автономный AI-маркетолог. Выберите бизнес или создайте карточку.", menu(
@@ -138,8 +161,6 @@ def build_router(service: BackendService) -> Router:
         raise InvalidInput("Выберите бизнес в главном меню.")
 
     async def business_menu(message: Message, actor: int, business: Business) -> None:
-        nonlocal selected
-        selected = business.id
         sources = service.list_sources(actor, business.id)
         profile = business.profile
         parts = [business.name, f"Канал: {business.channel_title or business.channel_id or 'не подключён'}",
@@ -152,7 +173,14 @@ def build_router(service: BackendService) -> Router:
             [("Отчёт за 7 дней", f"report:{business.id}"), ("Автоподготовка", f"input:auto:{business.id}")],
         ]
         if business.automation_enabled:
+            parts.append(f"Следующая автоподготовка: {format_time(business.next_generation_at, business.timezone)}")
             rows.append([("Отключить автоподготовку", f"auto-off:{business.id}")])
+        if not sources:
+            parts.append("Начните с описания бизнеса, сайта или PDF.")
+        elif not profile:
+            parts.append("Соберите профиль по добавленным материалам.")
+        elif business.profile_confirmed and not business.channel_id:
+            parts.append("Подключите канал, чтобы подготовить черновики.")
         if profile:
             parts.extend([
                 "Профиль подтверждён" if business.profile_confirmed else "Проверьте и подтвердите профиль",
@@ -173,16 +201,24 @@ def build_router(service: BackendService) -> Router:
 
     async def preview(message: Message, actor: int, post: PostView) -> None:
         business = service.get_business(actor, post.business_id)
-        asset, content = service.read_asset(actor, post.image_asset_id)
-        await message.answer_photo(BufferedInputFile(content, asset.filename), caption=post.text)
+        try:
+            asset, content = service.read_asset(actor, post.image_asset_id)
+        except AppError:
+            image_available = False
+            await reply(message, f"{post.text}\n\nФото недоступно. Для черновика можно запросить новое.")
+        else:
+            image_available = True
+            await message.answer_photo(BufferedInputFile(content, asset.filename), caption=post.text)
         suffix = f"{post.id}:{post.revision}"
         rows = []
         if post.status in EDITABLE:
             rows.extend([
                 [("Изменить текст", f"text:{suffix}"), ("Изменить фото", f"image:{suffix}")],
-                [("Изменить время", f"time:{suffix}")],
+                [("Через 15 мин", f"in15:{suffix}"), ("Через час", f"in60:{suffix}")],
+                [("Указать время", f"time:{suffix}")],
             ])
-            if post.status == PostStatus.REVIEW:
+            if (post.status == PostStatus.REVIEW and image_available
+                    and post.scheduled_at and post.scheduled_at > service.now()):
                 rows.append([("Согласовать версию", f"approve:{suffix}")])
             if post.status in {PostStatus.REVIEW, PostStatus.APPROVED}:
                 rows.append([("Отклонить", f"reject:{suffix}")])
@@ -200,9 +236,26 @@ def build_router(service: BackendService) -> Router:
                 info += f"\n{detail}"
         await reply(message, info, menu(*rows))
 
-    async def show_posts(message: Message, posts: list[PostView]) -> None:
-        rows = [[(f"{STATES[p.status]} · {p.text[:25]}", f"post:{p.id}")] for p in posts[:20]]
-        await reply(message, "Посты бизнеса" if rows else "Постов пока нет.", menu(*rows))
+    async def show_posts(
+        message: Message, posts: list[PostView], business_id: str = "", page: int = 0,
+    ) -> None:
+        if not posts:
+            await reply(message, "Постов пока нет.", menu())
+            return
+        page_count = (len(posts) + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE
+        page = min(page, page_count - 1)
+        offset = page * POSTS_PER_PAGE
+        ordered = posts[::-1] if business_id else posts
+        visible = ordered[offset:offset + POSTS_PER_PAGE]
+        rows = [[(f"{STATES[p.status]} · {p.text[:25]}", f"post:{p.id}")] for p in visible]
+        if business_id and page_count > 1:
+            navigation = []
+            if page > 0:
+                navigation.append(("← Новее", f"posts:{business_id}:{page - 1}"))
+            if page + 1 < page_count:
+                navigation.append(("Старее →", f"posts:{business_id}:{page + 1}"))
+            rows.append(navigation)
+        await reply(message, f"Посты · {page + 1}/{page_count}", menu(*rows))
 
     async def show_job(message: Message, actor: int, job_id: str) -> None:
         job = service.get_job(actor, job_id)
@@ -226,9 +279,16 @@ def build_router(service: BackendService) -> Router:
     async def start(message: Message) -> None:
         await home(message, message.from_user.id)
 
+    @router.message(Command("help"))
+    async def help_message(message: Message) -> None:
+        await reply(message, "Создайте бизнес, добавьте материалы и соберите профиль. "
+                    "После подтверждения профиля подключите канал и подготовьте посты. "
+                    "Откройте черновик, выберите время и согласуйте именно эту версию. "
+                    "/menu открывает список бизнесов, /cancel отменяет текущий ввод.", menu())
+
     @router.callback_query()
     async def callback(query: CallbackQuery) -> None:
-        nonlocal pending
+        nonlocal pending, selected
         await query.answer()
         message, actor = query.message, query.from_user.id
         action, _, tail = (query.data or "").partition(":")
@@ -237,7 +297,9 @@ def build_router(service: BackendService) -> Router:
         if action == "home":
             await home(message, actor)
         elif action == "business":
-            await business_menu(message, actor, service.get_business(actor, target))
+            business = service.get_business(actor, target)
+            selected = business.id
+            await business_menu(message, actor, business)
         elif action == "input" and target in {"name", "notes", "url", "pdf", "channel", "request", "auto"}:
             business_id = "" if target == "name" else service.get_business(actor, version).id
             await ask(message, Prompt(target, business_id))
@@ -245,7 +307,9 @@ def build_router(service: BackendService) -> Router:
             await reply(message, "Изучаю материалы…")
             await business_menu(message, actor, await service.analyze_business(actor, target))
         elif action == "posts":
-            await show_posts(message, service.list_posts(actor, target))
+            if version and (not version.isascii() or not version.isdigit() or len(version) > 6):
+                raise InvalidInput("Откройте список постов заново.")
+            await show_posts(message, service.list_posts(actor, target), target, int(version or "0"))
         elif action == "post":
             await preview(message, actor, service.get_post(actor, target))
         elif action == "job":
@@ -255,7 +319,10 @@ def build_router(service: BackendService) -> Router:
             await reply(message, service.build_report(actor, target, now - timedelta(days=7), now), menu())
         elif action == "auto-off":
             await business_menu(message, actor, service.configure_automation(actor, target, False))
-        elif action in {"confirm", "profile-tone", "text", "image", "time", "found", "approve", "reject", "missing"}:
+        elif action in {
+            "confirm", "profile-tone", "text", "image", "time", "found", "approve", "reject", "missing",
+            *QUICK_SCHEDULE,
+        }:
             if not version.isascii() or not version.isdigit() or len(version) > 9:
                 raise InvalidInput("Кнопка устарела. Откройте актуальное меню.")
             revision = int(version)
@@ -270,6 +337,10 @@ def build_router(service: BackendService) -> Router:
             elif action == "reject":
                 service.reject_post(actor, target, revision)
                 await reply(message, "Пост отклонён.", menu())
+            elif action in QUICK_SCHEDULE:
+                when = service.now() + timedelta(minutes=QUICK_SCHEDULE[action])
+                post = service.edit_post(actor, target, revision, scheduled_at=when)
+                await preview(message, actor, post)
             elif action == "missing":
                 post = service.resolve_unknown_delivery(actor, target, revision, confirmed_not_sent=True)
                 await preview(message, actor, post)
@@ -283,9 +354,11 @@ def build_router(service: BackendService) -> Router:
 
     @router.message(F.document)
     async def document(message: Message) -> None:
-        nonlocal pending
+        with use_prompt() as context:
+            await receive_document(message, context)
+
+    async def receive_document(message: Message, context: Prompt | None) -> None:
         actor = message.from_user.id
-        context = pending
         if context and context.kind != "pdf":
             raise InvalidInput("Завершите текущее действие или нажмите /cancel перед загрузкой PDF.")
         business = service.get_business(actor, context.object_id) if context else active(actor)
@@ -296,17 +369,21 @@ def build_router(service: BackendService) -> Router:
         with LimitedFile(limit) as destination:
             await message.bot.download(file, destination=destination, timeout=20)
             service.add_pdf_source(actor, business.id, file.file_name, destination.getvalue())
-        if pending is context:
-            pending = None
-        await business_menu(message, actor, business)
+        finish_prompt(context)
+        await business_menu(message, actor, service.get_business(actor, business.id))
 
     async def handle_post_input(message: Message, actor: int, prompt: Prompt, text: str) -> None:
         post_id, revision = prompt.object_id, prompt.revision
         if prompt.kind == "found":
             post = service.get_post(actor, post_id)
             origin = message.forward_origin
-            if not isinstance(origin, MessageOriginChannel) or str(origin.chat.id) != post.channel_id \
-                    or not message.photo or message.caption != post.text:
+            if (
+                not isinstance(origin, MessageOriginChannel)
+                or str(origin.chat.id) != post.channel_id
+                or not message.photo
+                or message.caption != post.text
+                or (post.scheduled_at and origin.date < post.scheduled_at.replace(microsecond=0))
+            ):
                 raise InvalidInput("Перешлите нужный пост с фото и точной подписью из подключённого канала.")
             updated = service.resolve_unknown_delivery(actor, post_id, revision, message_id=origin.message_id)
         elif prompt.kind == "time":
@@ -321,13 +398,17 @@ def build_router(service: BackendService) -> Router:
             updated = await service.revise_text(actor, post_id, revision, text)
         else:
             updated = await service.revise_image(actor, post_id, revision, text)
+        finish_prompt(prompt)
         await preview(message, actor, updated)
 
     @router.message()
     async def receive(message: Message, event_update: Update) -> None:
-        nonlocal pending
+        with use_prompt() as context:
+            await receive_text(message, event_update, context)
+
+    async def receive_text(message: Message, event_update: Update, context: Prompt | None) -> None:
+        nonlocal selected
         actor = message.from_user.id
-        context = pending
         text = (message.text or "").strip()
         if context and context.kind == "found":
             await handle_post_input(message, actor, context, text)
@@ -336,7 +417,10 @@ def build_router(service: BackendService) -> Router:
         elif context and context.kind in {"text", "image", "time"}:
             await handle_post_input(message, actor, context, text)
         elif context and context.kind == "name":
-            await business_menu(message, actor, service.create_business(actor, text))
+            business = service.create_business(actor, text)
+            selected = business.id
+            finish_prompt(context)
+            await business_menu(message, actor, business)
         else:
             business = service.get_business(actor, context.object_id) if context else active(actor)
             kind = context.kind if context else "request"
@@ -360,10 +444,13 @@ def build_router(service: BackendService) -> Router:
             elif kind == "pdf":
                 raise InvalidInput(INPUTS["pdf"])
             elif kind == "request":
-                intent = await service.interpret_request(actor, business.id, text)
-                if intent.action == "prepare":
-                    job = service.request_preparation(actor, business.id, intent.request or text,
-                                                      f"telegram_update:{event_update.update_id}")
+                intent = None if context else await service.interpret_request(actor, business.id, text)
+                if intent is None or intent.action == "prepare":
+                    request = (intent.request or text) if intent else text
+                    job = service.request_preparation(
+                        actor, business.id, request, f"telegram_update:{event_update.update_id}",
+                    )
+                    finish_prompt(context)
                     await show_job(message, actor, job.id)
                 elif intent.action == "report":
                     now = service.now()
@@ -371,12 +458,11 @@ def build_router(service: BackendService) -> Router:
                 else:
                     question = "\n".join(intent.questions) or "Уточните запрос или выберите конкретный пост."
                     await reply(message, question, menu())
-                if pending is context:
-                    pending = None
+                finish_prompt(context)
                 return
+            finish_prompt(context)
             await business_menu(message, actor, service.get_business(actor, business.id))
-        if pending is context:
-            pending = None
+        finish_prompt(context)
 
     @router.message_reaction_count()
     async def reactions(event: MessageReactionCountUpdated, event_update: Update) -> None:
