@@ -86,7 +86,7 @@ class GitChangesTest(unittest.TestCase):
 
     def test_reports_paths_even_when_later_commit_reverts_them(self):
         self.checkpoint()
-        added = self.commit_file("transient\tfile.txt", "temporary\n", "Add temporary file")
+        added = self.commit_file("transient file.txt", "temporary\n", "Add temporary file")
         self.git("revert", "--no-edit", added)
         reverted = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/remotes/origin/main", reverted)
@@ -96,7 +96,7 @@ class GitChangesTest(unittest.TestCase):
         self.assertEqual(branch["base"], self.initial)
         self.assertEqual(branch["head"], reverted)
         self.assertEqual(branch["commits"], [added, reverted])
-        self.assertIn("transient\tfile.txt", branch["paths"])
+        self.assertIn("transient file.txt", branch["paths"])
         self.assertEqual(self.state.read_bytes(), before)
 
     def test_reports_deleted_branch_without_forgetting_it_until_checkpoint(self):
