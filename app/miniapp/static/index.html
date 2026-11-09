@@ -3,10 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#1b2217">
+  <meta name="theme-color" content="#1b2029">
   <meta name="description" content="Тираж — студия публикаций для вашего Telegram-канала.">
   <title>Тираж · Студия публикаций</title>
   <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./overview.css">
   <!-- TELEGRAM_BRIDGE -->
   <script src="./app.js" defer></script>
 </head>
@@ -31,6 +32,81 @@
     <symbol id="i-theme" viewBox="0 0 24 24"><path d="M20 15.2A8.6 8.6 0 0 1 8.8 4 8.6 8.6 0 1 0 20 15.2Z"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2m0 15v2M2.5 12h2m15 0h2M5.3 5.3l1.4 1.4m10.6 10.6 1.4 1.4m0-13.4-1.4 1.4M6.7 17.3l-1.4 1.4"/></symbol>
     <symbol id="i-next" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8 6 4-6 4z"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6"/></symbol>
+    <defs>
+      <linearGradient id="paper-light" x2=".8" y2="1" gradientUnits="objectBoundingBox">
+        <stop stop-color="#fcf2d9"/><stop offset=".54" stop-color="#dcc49d"/><stop offset="1" stop-color="#897452"/>
+      </linearGradient>
+      <linearGradient id="paper-blue" x2=".85" y2="1" gradientUnits="objectBoundingBox">
+        <stop stop-color="#a4b6d5"/><stop offset=".5" stop-color="#5e7aaa"/><stop offset="1" stop-color="#273c65"/>
+      </linearGradient>
+      <linearGradient id="paper-dark" x2=".8" y2="1" gradientUnits="objectBoundingBox">
+        <stop stop-color="#51637b"/><stop offset="1" stop-color="#202c40"/>
+      </linearGradient>
+      <linearGradient id="ink-art" x2=".8" y2="1" gradientUnits="objectBoundingBox">
+        <stop stop-color="#334c70"/><stop offset="1" stop-color="#111b2b"/>
+      </linearGradient>
+      <radialGradient id="art-shadow">
+        <stop stop-color="#070a11" stop-opacity=".72"/><stop offset="1" stop-color="#070a11" stop-opacity="0"/>
+      </radialGradient>
+      <pattern id="print-dots" width="5" height="5" patternUnits="userSpaceOnUse">
+        <circle cx="1" cy="1" r=".45" fill="#0c1422" opacity=".22"/>
+      </pattern>
+    </defs>
+    <symbol id="press-draft" viewBox="0 0 420 390">
+      <ellipse cx="220" cy="348" rx="167" ry="29" fill="url(#art-shadow)"/>
+      <g transform="rotate(17 215 194)">
+        <rect x="120" y="52" width="198" height="283" rx="13" fill="#222c3d" stroke="#8191ac" stroke-opacity=".46"/>
+        <rect x="112" y="45" width="198" height="283" rx="13" fill="url(#paper-dark)" stroke="#8ea2c1" stroke-opacity=".52"/>
+        <path d="M138 76h144m-144 8h92M138 291h101" stroke="#dce6f8" stroke-opacity=".38" stroke-width="2"/>
+      </g>
+      <g transform="rotate(-19 187 201)">
+        <rect x="91" y="51" width="193" height="290" rx="12" fill="#344d75"/>
+        <rect x="86" y="45" width="193" height="290" rx="12" fill="url(#paper-blue)" stroke="#b0c4e5" stroke-opacity=".7"/>
+        <path d="M108 76h145m-145 8h104M108 302h119" stroke="#e9f0fc" stroke-opacity=".6" stroke-width="2"/>
+      </g>
+      <g transform="rotate(-7 205 190)">
+        <rect x="113" y="32" width="194" height="299" rx="11" fill="#77664f"/>
+        <rect x="106" y="27" width="194" height="299" rx="11" fill="url(#paper-light)" stroke="#fff3d5"/>
+        <rect x="107" y="28" width="192" height="297" rx="10" fill="url(#print-dots)" opacity=".38"/>
+        <path d="M128 51h150m-150 253h150" stroke="#5e5143" stroke-width="1"/>
+        <text x="129" y="72" fill="#423a32" font-size="9" font-weight="650" letter-spacing="3">ТИРАЖ / 01</text>
+        <text x="125" y="111" fill="#202732" font-size="35" font-weight="750" letter-spacing="-2">Черновик</text>
+        <rect x="128" y="129" width="150" height="102" rx="4" fill="url(#ink-art)"/>
+        <circle cx="201" cy="180" r="38" fill="none" stroke="#9eafca" stroke-opacity=".38"/>
+        <circle cx="201" cy="180" r="28" fill="none" stroke="#9eafca" stroke-opacity=".38"/>
+        <path d="m160 187 78-33-15 54-21-15-10 9 2-17 28-21-35 20z" fill="url(#paper-light)"/>
+        <path d="M129 248h144m-144 11h128m-128 11h140m-140 11h83" stroke="#564c43" stroke-opacity=".62" stroke-width="3" stroke-linecap="round"/>
+        <circle cx="273" cy="299" r="4" fill="#68583f"/>
+      </g>
+    </symbol>
+    <symbol id="press-calendar" viewBox="0 0 420 390">
+      <ellipse cx="216" cy="333" rx="154" ry="24" fill="url(#art-shadow)"/>
+      <g transform="rotate(-10 210 185)">
+        <path d="m300 88 36 207-39 14-21-202z" fill="#354a6b" stroke="#768dac"/>
+        <rect x="100" y="89" width="211" height="225" rx="14" fill="#665843"/>
+        <rect x="93" y="79" width="211" height="225" rx="14" fill="url(#paper-light)" stroke="#fff0d0"/>
+        <path d="M93 93a14 14 0 0 1 14-14h183a14 14 0 0 1 14 14v54H93z" fill="url(#paper-blue)"/>
+        <path d="M143 72v23m106-23v23" stroke="#263a55" stroke-width="11" stroke-linecap="round"/>
+        <text x="115" y="128" fill="#f8f4ec" font-size="14" font-weight="650" letter-spacing="2">РАСПИСАНИЕ</text>
+        <path d="M118 171h158m-158 33h158m-158 33h158m-158 33h158M148 164v111m36-111v111m36-111v111m36-111v111" stroke="#776348" stroke-opacity=".5"/>
+        <rect x="185" y="205" width="34" height="31" rx="6" fill="#344e79"/>
+        <path d="m195 220 6 6 11-12" stroke="#e9effc" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </g>
+    </symbol>
+    <symbol id="press-send" viewBox="0 0 420 390">
+      <ellipse cx="215" cy="321" rx="157" ry="25" fill="url(#art-shadow)"/>
+      <circle cx="213" cy="188" r="119" fill="none" stroke="#a3bde4" stroke-opacity=".24"/>
+      <circle cx="213" cy="188" r="103" fill="none" stroke="#a3bde4" stroke-opacity=".26" stroke-dasharray="2 7"/>
+      <g transform="rotate(-8 207 195)">
+        <path d="M72 198 345 99 281 288l-68-49-41 40 7-68z" fill="#324b76" stroke="#7892bc" stroke-width="2"/>
+        <path d="M65 191 340 90 275 277l-66-48-40 39 7-65z" fill="url(#paper-blue)" stroke="#a6bce3" stroke-width="2"/>
+        <path d="m65 191 111 12L340 90 205 221l70 56 65-187z" fill="url(#paper-light)" stroke="#edd9b1" stroke-width="2" stroke-linejoin="round"/>
+        <path d="m175 203 30 18-36 47z" fill="#607ca8"/>
+      </g>
+      <path d="M83 256h37m-52 17h31m199-102h27" stroke="#b5c9ee" stroke-opacity=".56" stroke-width="2" stroke-linecap="round"/>
+    </symbol>
     <symbol id="art-coffee" viewBox="0 0 320 148"><path fill="#c37d58" d="M0 0h320v148H0z"/><path fill="#9d593f" d="M0 95 320 22v126H0z"/><circle cx="167" cy="76" r="62" fill="#a36449"/><circle cx="160" cy="70" r="58" fill="#ead3ab"/><circle cx="160" cy="70" r="50" fill="#f0ddb8"/><path d="M195 56c28-13 35 16 10 21" fill="none" stroke="#ecd2a6" stroke-width="9"/><circle cx="160" cy="70" r="38" fill="#fff0d7"/><circle cx="160" cy="70" r="32" fill="#6c3829"/><circle cx="160" cy="70" r="26" fill="#b87346"/><path d="M160 88c-13-7-24-17-20-26 4-8 14-3 20 4 7-7 16-11 21-4 4 9-8 20-21 26z" fill="#f6d4a6"/><path d="M30 35h42m-36 6h29M248 111h38" stroke="#e2a788" stroke-width="2" opacity=".7"/></symbol>
     <symbol id="art-pastry" viewBox="0 0 320 148"><path fill="#d9b576" d="M0 0h320v148H0z"/><path fill="#b88454" d="m0 109 320-79v118H0z"/><circle cx="169" cy="76" r="61" fill="#b58a61"/><circle cx="161" cy="69" r="57" fill="#f3e2c3"/><circle cx="161" cy="69" r="49" fill="#e9d2ad"/><path fill="#925130" d="M104 77c7-50 94-62 115 2-11-14-22-13-35-6-13 13-37 14-50 3-12-7-19-5-30 1z"/><path fill="#bd783e" d="M106 70c14-44 90-55 109 3-11-13-22-12-34-4-12 11-33 12-46 3-10-7-19-6-29-2z"/><path d="M135 48c-7 7-8 15-6 23m20-31c-4 10-2 20 2 31m16-32c6 10 7 20 4 31m15-25c9 7 12 15 12 22" stroke="#e7a651" stroke-width="5" fill="none" stroke-linecap="round"/><path d="m61 111 15-6m-10 14 17-7m150-77 14-8" stroke="#f8e1ba" stroke-width="2" opacity=".7"/></symbol>
     <symbol id="art-cup" viewBox="0 0 320 148"><path fill="#8fa494" d="M0 0h320v148H0z"/><path fill="#667c6e" d="m0 112 320-62v98H0z"/><ellipse cx="163" cy="118" rx="83" ry="12" fill="#4e685e" opacity=".6"/><path d="M189 58h18a18 18 0 0 1 0 36h-18" fill="none" stroke="#dfd7be" stroke-width="10"/><path d="M112 52h88v31c0 23-15 35-44 35s-44-12-44-35z" fill="#f1e8d0"/><ellipse cx="156" cy="52" rx="44" ry="13" fill="#d9c8a9"/><ellipse cx="156" cy="53" rx="36" ry="9" fill="#6b4738"/><path d="M143 34c-9-8 8-11 2-20m14 19c-8-8 9-11 3-22m13 24c-5-8 7-10 4-17" fill="none" stroke="#eee5d0" stroke-width="2" opacity=".8"/></symbol>
@@ -40,6 +116,12 @@
       <a class="brand" href="#overview" data-view="overview" aria-label="Тираж, главная">
         <span class="brand-mark"><svg class="icon"><use href="#i-logo"></use></svg></span><strong>Тираж</strong>
       </a>
+      <nav class="desktop-nav" aria-label="Разделы Тиража">
+        <button data-view="overview" aria-current="page">Главная</button>
+        <button data-view="content">Посты</button>
+        <button data-view="reports">Отчёты</button>
+        <button data-view="business">Бизнес</button>
+      </nav>
       <div class="top-actions">
         <label class="workspace"><svg class="icon"><use href="#i-business"></use></svg>
           <select id="workspace" aria-label="Выбрать бизнес"></select>

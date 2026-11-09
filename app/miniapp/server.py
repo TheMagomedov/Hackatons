@@ -72,7 +72,7 @@ async def guard(request, handler):
         response = web.json_response({"error": str(exc)}, status=status)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cache-Control"] = "no-store"
+    response.headers.setdefault("Cache-Control", "no-store")
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; "
         "img-src 'self' blob: data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
@@ -111,7 +111,11 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         return web.Response(text=html, content_type="text/html")
 
     async def static_file(request):
-        return web.FileResponse(STATIC / request.match_info["name"])
+        name = request.match_info["name"]
+        response = web.FileResponse(STATIC / name, headers={"Cache-Control": "no-cache"})
+        if name.endswith(".woff2"):
+            response.content_type = "font/woff2"
+        return response
 
     async def state(request):
         svc, actor = context(request)
@@ -233,7 +237,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
 
     app.add_routes([
         web.get("/mini/", index),
-        web.get(r"/mini/{name:styles\.css|app\.js|forest-hero\.jpg|inter-variable\.woff2|inter-OFL\.txt}", static_file),
+        web.get(r"/mini/{name:styles\.css|overview\.css|app\.js|inter-variable\.woff2|inter-OFL\.txt}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
         web.post("/mini/api/business", create_business),

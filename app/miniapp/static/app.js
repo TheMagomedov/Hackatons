@@ -39,6 +39,12 @@ const demoWorkspaces = [{
       revision: 2, created_at: sampleDate(-1, -4), scheduled_at: sampleDate(1, 2)},
     {id: "filter", text: "Время для фильтр-кофе\nНебольшая пауза, которая меняет день.", status: "published", art: "cup",
       revision: 3, created_at: sampleDate(-3, 0), published_at: sampleDate(-2, 0), scheduled_at: sampleDate(-2, 0)},
+    {id: "weekend", text: "Завтраки выходного дня\nСуббота за большим столом.", status: "review", art: "pastry",
+      revision: 1, created_at: sampleDate(-4, 0), scheduled_at: null},
+    {id: "beans", text: "Знакомьтесь, новое зерно\nВ чашке — какао и красные ягоды.", status: "approved", art: "coffee",
+      revision: 2, created_at: sampleDate(-5, 0), scheduled_at: sampleDate(3, 0)},
+    {id: "barista", text: "За стойкой с бариста\nКак мы настраиваем первую чашку.", status: "published", art: "cup",
+      revision: 1, created_at: sampleDate(-6, 0), published_at: sampleDate(-5, 0), scheduled_at: sampleDate(-5, 0)},
   ],
 }];
 const demoJobs = new Map();
@@ -54,6 +60,8 @@ let toastTimer;
 let watchedJob = 0;
 const imageUrls = new Map();
 let themeOverride = null;
+let dateFormatter;
+let dateTimezone;
 
 function useTheme() {
   const theme = themeOverride || (insideTelegram ? telegram.colorScheme : "dark");
@@ -94,10 +102,14 @@ function statusLabel(value) {
 }
 function formatDate(value) {
   if (!value) return "Без даты";
-  return new Intl.DateTimeFormat("ru-RU", {
-    day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
-    timeZone: state.business?.timezone || "Europe/Moscow",
-  }).format(new Date(value));
+  const timezone = state.business?.timezone || "Europe/Moscow";
+  if (dateTimezone !== timezone) {
+    dateFormatter = new Intl.DateTimeFormat("ru-RU", {
+      day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: timezone,
+    });
+    dateTimezone = timezone;
+  }
+  return dateFormatter.format(new Date(value));
 }
 function notify(text) {
   clearTimeout(toastTimer);
@@ -239,6 +251,7 @@ async function loadImages(container) {
       const url = await imageUrls.get(id);
       if (url && node.isConnected) {
         const img = new Image();
+        img.decoding = "async";
         img.src = url;
         img.alt = "Изображение к посту";
         node.replaceChildren(img);
@@ -256,31 +269,105 @@ function postCards(posts) {
       + '</div>' + icon("next") + '</button>';
   }).join("") + '</div>';
 }
-function metric(value, label, status, glyph) {
-  return '<button class="metric" data-action="filter" data-status="' + status + '">' + icon(glyph)
-    + '<span><strong>' + value + '</strong><span class="metric-label">' + safe(label) + '</span></span></button>';
+const editorialSteps = [
+  {art: "draft", kicker: "01 / ПОДГОТОВКА", title: "Черновик с AI",
+    text: "Опишите тему и формат. Тираж подготовит текст для вашего канала с учётом профиля бизнеса.",
+    action: "new-post", label: "Создать черновик", icon: "plus"},
+  {art: "calendar", kicker: "02 / РАСПИСАНИЕ", title: "План публикаций",
+    text: "Проверьте черновик, выберите дату и согласуйте версию. Тираж опубликует её в назначенное время.",
+    action: "filter", status: "approved", label: "Открыть расписание", icon: "calendar"},
+  {art: "send", kicker: "03 / ПУБЛИКАЦИЯ", title: "Посты в Telegram",
+    text: "Откройте отправленные посты и проверьте, что уже вышло в вашем канале.",
+    action: "filter", status: "published", label: "Смотреть публикации", icon: "telegram"},
+];
+const editorialStatuses = [
+  ["review", "На проверке", "clock", "Черновики ждут вашего решения."],
+  ["approved", "В расписании", "calendar", "Согласованные посты с датой выхода."],
+  ["published", "Опубликовано", "check", "Посты, которые уже вышли в канале."],
+];
+
+function pressArt(kind, className = "") {
+  return '<svg class="press-art ' + className + '" viewBox="0 0 420 390" aria-hidden="true">'
+    + '<use href="#press-' + kind + '"></use></svg>';
+}
+function pressHeading(id, title) {
+  return '<h2 class="press-heading" id="' + id + '"><span>' + title + '</span></h2>';
+}
+function stepButton(step, label = step.label) {
+  return button(label, step.action, "outline", step.icon, step.status ? 'data-status="' + step.status + '"' : "");
+}
+function stepContent(step, compact = false) {
+  return pressArt(step.art) + '<div class="step-copy"><p class="press-kicker">' + step.kicker + '</p>'
+    + '<h3>' + step.title + '</h3>' + (compact ? "" : '<p class="step-description">' + step.text + '</p>')
+    + stepButton(step, compact ? "Открыть" : step.label) + '</div>';
+}
+function pressCarousel(compact) {
+  const label = compact ? "Инструменты редакции" : "Этапы публикации";
+  return '<div class="press-carousel ' + (compact ? "spotlight" : "guide") + '" data-slide="0"'
+    + (compact ? ' data-compact' : '') + ' role="group" aria-label="' + label + '">'
+    + '<div class="slide-surface glass-card" aria-live="polite">' + stepContent(editorialSteps[0], compact) + '</div>'
+    + '<div class="slide-controls">'
+    + button("Назад", "slide-prev", "slide-arrow", "prev")
+    + '<span class="slide-dots">' + editorialSteps.map((step, index) =>
+      '<button type="button" class="slide-dot" data-action="slide-to" data-index="' + index
+      + '" aria-label="' + step.title + '" aria-pressed="' + (index === 0) + '"></button>').join("") + '</span>'
+    + button("Вперёд", "slide-next", "slide-arrow", "next") + '</div></div>';
+}
+function switchSlide(control, action) {
+  const carousel = control.closest(".press-carousel");
+  const current = Number(carousel.dataset.slide);
+  const count = editorialSteps.length;
+  const next = action === "slide-to" ? Number(control.dataset.index)
+    : (current + (action === "slide-next" ? 1 : -1) + count) % count;
+  if (current === next) return;
+  carousel.dataset.slide = next;
+  const surface = carousel.querySelector(".slide-surface");
+  surface.innerHTML = stepContent(editorialSteps[next], carousel.hasAttribute("data-compact"));
+  carousel.querySelectorAll(".slide-dot").forEach((dot, index) => {
+    dot.setAttribute("aria-pressed", String(index === next));
+  });
+  selectionFeedback();
 }
 function overview() {
-  const counts = state.counts;
-  const review = counts.review || 0;
-  const date = new Intl.DateTimeFormat("ru-RU", {
-    weekday: "short", day: "numeric", month: "long", timeZone: state.business.timezone,
-  }).format(new Date());
-  const recent = state.posts.slice().sort((first, second) =>
-    Number(second.status === "review") - Number(first.status === "review")).slice(0, 4);
-  return headline(date, "Ваш контент", "",
-    '<span class="mode-pill"><span></span>' + (demo ? "Демо" : "Telegram") + '</span>')
-    + '<section class="hero"><img class="hero-art" src="./forest-hero.jpg" alt="">'
-    + '<div class="hero-copy"><span class="hero-tag">' + icon("spark") + ' СТУДИЯ ПУБЛИКАЦИЙ</span>'
-    + '<h2>От идеи<br>до поста</h2><p>Задайте тему. Тираж подготовит черновик для вашего канала.</p>'
-    + button("Создать пост", "new-post", "primary", "plus") + '</div></section>'
-    + '<section class="metrics" aria-label="Фильтры по статусу постов">'
-    + metric(review, "На проверке", "review", "clock")
-    + metric(counts.approved || 0, "В расписании", "approved", "calendar")
-    + metric(counts.published || 0, "Опубликовано", "published", "check") + '</section>'
-    + '<div class="section-title"><h2>Очередь постов</h2>'
-    + '<button class="text-button" data-view="content">Все посты ' + icon("next") + '</button></div>'
-    + (recent.length ? postCards(recent) : '<div class="empty">Первый черновик появится здесь после подготовки.</div>');
+  const upcoming = state.upcoming;
+  const posts = state.posts;
+  return '<div class="press"><div class="press-opening">'
+    + pressArt("draft", "press-backdrop")
+    + '<section class="press-hero" aria-labelledby="press-title"><div class="press-intro">'
+    + '<p class="press-kicker">' + (demo ? "ДЕМО / " : "") + 'СТУДИЯ ПУБЛИКАЦИЙ</p>'
+    + '<h1 id="press-title">От идеи до поста</h1>'
+    + '<p class="press-lede">Готовьте тексты, согласовывайте черновики и планируйте публикации для своего Telegram-канала.</p>'
+    + '<div class="press-actions">' + button("Создать пост", "new-post", "outline")
+    + '<button class="press-jump" type="button" data-action="show-workflow">' + icon("play") + 'Как это работает</button></div></div>'
+    + '<div class="press-note glass-card"><span class="press-badge">' + icon("calendar") + '</span><div>'
+    + '<p class="press-kicker">СЛЕДУЮЩИЙ ПОСТ</p><strong>'
+    + (upcoming ? safe(upcoming.text.split("\n")[0].slice(0, 85)) : 'Пока без даты') + '</strong><p>'
+    + (upcoming ? safe(formatDate(upcoming.scheduled_at)) : 'Согласуйте черновик, чтобы поставить его в расписание.')
+    + '</p></div></div>' + pressCarousel(true) + '</section>'
+    + '<section class="press-section" aria-labelledby="press-workflow">' + pressHeading("press-workflow", "От черновика к публикации")
+    + '<div class="press-features">' + editorialSteps.slice(0, 2).map((step) =>
+      '<article class="glass-card press-feature">' + stepContent(step) + '</article>').join("") + '</div></section></div>'
+    + '<section class="press-section press-posts" aria-labelledby="press-posts">' + pressHeading("press-posts", "Последние посты")
+    + (posts.length ? '<div class="press-grid">' + posts.map((post) => {
+      const art = post.status === "published" ? "send" : post.status === "approved" ? "calendar" : "draft";
+      const [title, ...body] = post.text.split("\n");
+      return '<button class="press-post glass-card" type="button" data-action="open-post" data-id="' + safe(post.id) + '">'
+        + pressArt(art) + '<div class="press-post-copy">' + statusLabel(post.status)
+        + '<h3>' + safe(title.slice(0, 85)) + '</h3><p>' + safe(body.join(" ").slice(0, 110)) + '</p>'
+        + '<span class="press-post-end"><time class="date">' + safe(formatDate(post.scheduled_at || post.created_at))
+        + '</time><span class="press-arrow">' + icon("next") + '</span></span></div></button>';
+    }).join("") + '</div>' : '<div class="empty">Первый черновик появится здесь после подготовки.</div>')
+    + '<button class="button outline press-all" type="button" data-view="content">Все посты ' + icon("arrow") + '</button></section>'
+    + '<section class="press-section" aria-labelledby="press-status">' + pressHeading("press-status", "Статус редакции")
+    + '<div class="press-metrics">' + editorialStatuses.map(([status, label, glyph, detail]) =>
+      '<button class="press-metric glass-card" type="button" data-action="filter" data-status="' + status + '">'
+      + '<span class="press-badge">' + icon(glyph) + '</span><span><strong>' + (state.counts[status] || 0)
+      + ' <span>' + label + '</span></strong><span>' + detail + '</span></span></button>').join("") + '</div></section>'
+    + '<section class="press-section" aria-labelledby="press-guide">' + pressHeading("press-guide", "Рабочий процесс")
+    + pressCarousel(false) + '</section>'
+    + '<footer class="press-footer"><div><strong>Тираж</strong><p>Студия публикаций в Telegram</p></div>'
+    + '<button class="text-button" type="button" data-view="reports">Отчёты ' + icon("arrow") + '</button>'
+    + '<button class="text-button" type="button" data-view="business">Настройки бизнеса ' + icon("arrow") + '</button></footer></div>';
 }
 function contentView() {
   const filters = [["", "Все"], ["review", "На согласовании"], ["approved", "Запланированы"], ["published", "Опубликованы"]];
@@ -346,6 +433,9 @@ function render() {
     else button.removeAttribute("aria-current");
   });
   root.setAttribute("aria-busy", "false");
+  const nextScreen = b ? view : "empty";
+  const screenChanged = root.dataset.screen !== nextScreen;
+  root.dataset.screen = nextScreen;
   syncBackButton();
   if (!b) {
     root.innerHTML = headline("Первый шаг", "Создайте бизнес", "Добавьте карточку, чтобы начать работу с контентом.")
@@ -353,6 +443,10 @@ function render() {
       + button("Создать бизнес", "new-business", "primary", "plus") + '</div>';
   } else {
     root.innerHTML = {overview, content: contentView, reports: reportView, business: businessView}[view]();
+  }
+  if (screenChanged && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    root.animate?.([{opacity: .65, transform: "translateY(5px)"}, {opacity: 1, transform: "none"}],
+      {duration: 210, easing: "ease-out"});
   }
   void loadImages(root);
 }
@@ -463,6 +557,17 @@ document.addEventListener("click", async (event) => {
   }
   const {action, id, revision} = control.dataset;
   if (action === "close") { dialog.close(); return; }
+  if (action === "slide-prev" || action === "slide-next" || action === "slide-to") {
+    switchSlide(control, action);
+    return;
+  }
+  if (action === "show-workflow") {
+    const heading = $("#press-workflow");
+    heading.setAttribute("tabindex", "-1");
+    heading.focus({preventScroll: true});
+    heading.scrollIntoView();
+    return;
+  }
   if (action === "theme") {
     themeOverride = document.body.dataset.theme === "light" ? "dark" : "light";
     useTheme();
