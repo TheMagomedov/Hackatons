@@ -109,6 +109,7 @@ class Asset(Contract):
 
 class PostStatus(StrEnum):
     REVIEW = "review"
+    EDITING = "editing"
     APPROVED = "approved"
     PUBLISHING = "publishing"
     PUBLISHED = "published"

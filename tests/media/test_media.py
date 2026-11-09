@@ -183,6 +183,7 @@ class MediaServiceTests(unittest.IsolatedAsyncioTestCase):
 
         settings = Settings(
             mode="live",
+            owner_id=77,
             telegram_bot_token="test-bot-token",
             ai_factory="test:ai",
             image_factory="test:image",
@@ -200,6 +201,7 @@ class MediaServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_factory_live_without_injected_config_never_falls_back_to_demo(self):
         settings = Settings(
             mode="live",
+            owner_id=77,
             telegram_bot_token="test-bot-token",
             ai_factory="test:ai",
             image_factory="test:image",
@@ -373,6 +375,7 @@ class ConfigurationAndValidationTests(unittest.TestCase):
     def test_runtime_rejects_explicit_demo_image_provider_before_generation_in_live(self):
         settings = Settings(
             mode="live",
+            owner_id=77,
             telegram_bot_token="test-bot-token",
             ai_factory="test:ai",
             image_factory="test:image",

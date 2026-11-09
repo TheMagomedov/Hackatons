@@ -175,7 +175,8 @@ def build_report(data: ReportInput) -> Report:
 
 
 _STATUS_LABELS = {
-    PostStatus.REVIEW: "на проверке", PostStatus.APPROVED: "согласованы",
+    PostStatus.REVIEW: "на проверке", PostStatus.EDITING: "редактируются",
+    PostStatus.APPROVED: "согласованы",
     PostStatus.PUBLISHING: "публикуются", PostStatus.PUBLISHED: "опубликованы",
     PostStatus.REJECTED: "отклонены", PostStatus.FAILED: "с ошибкой",
     PostStatus.DELIVERY_UNKNOWN: "доставка не подтверждена",

@@ -64,12 +64,111 @@ def fast_settings(**overrides: object) -> SchedulerSettings:
         notification_interval_seconds=0.005,
         metrics_interval_seconds=3600.0,
         notification_batch_size=7,
+        automation_interval_seconds=0.005,
     )
     settings.update(overrides)
     return SchedulerSettings(**settings)
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_notifications_do_not_block_automation_or_metrics(self) -> None:
+        class SlowNotifications(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.notification_started = asyncio.Event()
+                self.notification_cancelled = asyncio.Event()
+                self.automation_progress = asyncio.Event()
+                self.metrics_progress = asyncio.Event()
+
+            async def dispatch_notifications(self, limit=20):
+                self.notification_calls += 1
+                self.notification_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.notification_cancelled.set()
+
+            def schedule_automations(self):
+                super().schedule_automations()
+                if self.automation_calls >= 3:
+                    self.automation_progress.set()
+                return 0
+
+            async def collect_metrics(self):
+                await super().collect_metrics()
+                if self.metrics_calls >= 3:
+                    self.metrics_progress.set()
+                return 0
+
+        service = SlowNotifications()
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            Scheduler(service, fast_settings(metrics_interval_seconds=0.005)).run(stop)
+        )
+        try:
+            await asyncio.wait_for(service.notification_started.wait(), timeout=1)
+            await asyncio.wait_for(service.automation_progress.wait(), timeout=1)
+            await asyncio.wait_for(service.metrics_progress.wait(), timeout=1)
+            self.assertEqual(service.notification_calls, 1)
+            self.assertGreater(service.publish_calls, 1)
+            workers = [
+                item.get_name()
+                for item in asyncio.all_tasks()
+                if item.get_name().startswith("scheduler-") and not item.done()
+            ]
+            self.assertCountEqual(
+                workers,
+                [
+                    "scheduler-publication",
+                    "scheduler-generation",
+                    "scheduler-automation",
+                    "scheduler-notifications",
+                    "scheduler-metrics",
+                    "scheduler-stop-waiter",
+                ],
+            )
+        finally:
+            stop.set()
+            await asyncio.wait_for(task, timeout=1)
+        self.assertTrue(service.notification_cancelled.is_set())
+        self.assertTrue(service.generation_cancelled.is_set())
+
+    async def test_slow_metrics_do_not_block_automation_or_notifications(self) -> None:
+        class SlowMetrics(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.metrics_started = asyncio.Event()
+                self.metrics_cancelled = asyncio.Event()
+                self.automation_progress = asyncio.Event()
+
+            def schedule_automations(self):
+                super().schedule_automations()
+                if self.automation_calls >= 3:
+                    self.automation_progress.set()
+                return 0
+
+            async def collect_metrics(self):
+                self.metrics_calls += 1
+                self.metrics_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.metrics_cancelled.set()
+
+        service = SlowMetrics()
+        stop = asyncio.Event()
+        task = asyncio.create_task(Scheduler(service, fast_settings()).run(stop))
+        try:
+            await asyncio.wait_for(service.metrics_started.wait(), timeout=1)
+            await asyncio.wait_for(service.automation_progress.wait(), timeout=1)
+            await asyncio.wait_for(service.progress.wait(), timeout=1)
+            self.assertEqual(service.metrics_calls, 1)
+        finally:
+            stop.set()
+            await asyncio.wait_for(task, timeout=1)
+        self.assertTrue(service.metrics_cancelled.is_set())
+        self.assertTrue(service.generation_cancelled.is_set())
+
     async def test_slow_generation_does_not_stall_publication_or_notifications(self) -> None:
         service = FakeService()
         stop = asyncio.Event()
@@ -245,6 +344,7 @@ class SettingsTests(unittest.TestCase):
             "job_interval_seconds",
             "notification_interval_seconds",
             "metrics_interval_seconds",
+            "automation_interval_seconds",
         ):
             for value in (0, -1, float("nan"), float("inf")):
                 with self.subTest(name=name, value=value):

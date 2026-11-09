@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.shared.errors import Conflict, Forbidden, InvalidInput, NotFound
@@ -35,7 +35,7 @@ from app.shared.models import (
     Source,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
@@ -73,8 +73,13 @@ class Repository:
             self._anchor.close()
             self._anchor = None
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._target, timeout=5, isolation_level=None, uri=self._uri)
+    def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
+        target = self._target
+        use_uri = self._uri
+        if read_only and not self._uri:
+            target = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+            use_uri = True
+        conn = sqlite3.connect(target, timeout=5, isolation_level=None, uri=use_uri)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 5000")
@@ -98,8 +103,8 @@ class Repository:
             conn.close()
 
     @contextmanager
-    def _reader(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
+    def _reader(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+        conn = self._connect(read_only=read_only)
         try:
             yield conn
         finally:
@@ -119,6 +124,10 @@ class Repository:
             if version > SCHEMA_VERSION:
                 raise Conflict("Версия базы новее поддерживаемой приложением")
             if version == SCHEMA_VERSION:
+                return
+            if version == 1:
+                self._migrate_v1_to_v2(conn)
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if version != 0:
                 raise Conflict("Неподдерживаемая версия базы")
@@ -146,7 +155,111 @@ class Repository:
             ]
             for statement in statements:
                 conn.execute(statement)
+            self._migrate_v1_to_v2(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+        """Run inside initialize's transaction; never commit independently."""
+        conn.execute(
+            "CREATE TABLE runtime_binding (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+            "mode TEXT NOT NULL CHECK(mode IN ('demo','live')), "
+            "owner_id INTEGER NOT NULL CHECK(owner_id>0))"
+        )
+
+    @staticmethod
+    def _runtime_binding(conn: sqlite3.Connection) -> dict[str, Any] | None:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_binding'"
+        ).fetchone()
+        if exists is None:
+            return None  # Read-only diagnostics also supports an unmigrated v1.
+        row = conn.execute("SELECT mode,owner_id FROM runtime_binding WHERE singleton=1").fetchone()
+        return dict(row) if row is not None else None
+
+    def runtime_binding(self) -> dict[str, Any] | None:
+        with self._reader(read_only=True) as conn:
+            return self._runtime_binding(conn)
+
+    def bind_runtime(self, mode: str, owner_id: int, *, adopt_legacy: bool = False) -> dict[str, Any]:
+        if not isinstance(mode, str) or mode not in {"demo", "live"}:
+            raise InvalidInput("Режим приложения должен быть demo или live")
+        if type(adopt_legacy) is not bool:
+            raise InvalidInput("Принятие legacy-данных требует явного логического флага")
+        if not isinstance(owner_id, int) or isinstance(owner_id, bool) or owner_id <= 0:
+            raise InvalidInput("Некорректный владелец приложения")
+        requested = {"mode": mode, "owner_id": owner_id}
+        with self._transaction() as conn:
+            existing = self._runtime_binding(conn)
+            if existing is not None and existing != requested:
+                raise Conflict(
+                    "DATA_DIR уже привязан к другому режиму или владельцу; выберите соответствующую папку данных"
+                )
+            businesses = [
+                Business.model_validate_json(row["data"])
+                for row in conn.execute("SELECT data FROM businesses")
+            ]
+            if any(business.owner_id != owner_id for business in businesses):
+                raise Conflict("Владелец сохранённых бизнесов не совпадает с OWNER_TELEGRAM_ID")
+            if existing is not None:
+                return existing
+            if businesses and not adopt_legacy:
+                raise Conflict(
+                    "Существующие данные ещё не привязаны к runtime. Проверьте режим и владельца и выполните явное принятие legacy-данных"
+                )
+            if businesses and mode == "demo":
+                if any(
+                    not PostView.model_validate_json(row["data"]).is_demo
+                    for row in conn.execute("SELECT data FROM posts")
+                ):
+                    raise Conflict(
+                        "Legacy-данные содержат реальные публикации; принятие в demo-режиме запрещено"
+                    )
+            conn.execute(
+                "INSERT INTO runtime_binding(singleton,mode,owner_id) VALUES (1,?,?)", (mode, owner_id)
+            )
+            self._audit(
+                conn,
+                "runtime",
+                "singleton",
+                "bound",
+                datetime.now(timezone.utc),
+                mode=mode,
+                owner_id=owner_id,
+                adopted_legacy=bool(businesses),
+            )
+            return requested
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Read-only metadata/counts, including for populated unmigrated v1 data."""
+        with self._reader(read_only=True) as conn:
+            conn.execute("BEGIN")
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            counts = {
+                "businesses": conn.execute("SELECT COUNT(*) FROM businesses").fetchone()[0],
+                "posts": {
+                    row["status"]: row["count"]
+                    for row in conn.execute("SELECT status,COUNT(*) AS count FROM posts GROUP BY status")
+                },
+                "jobs": {
+                    row["status"]: row["count"]
+                    for row in conn.execute("SELECT status,COUNT(*) AS count FROM jobs GROUP BY status")
+                },
+                "notifications": {
+                    "pending": conn.execute(
+                        "SELECT COUNT(*) FROM notifications WHERE acknowledged_at IS NULL AND attempts<?",
+                        (MAX_NOTIFICATION_ATTEMPTS,),
+                    ).fetchone()[0],
+                    "exhausted": conn.execute(
+                        "SELECT COUNT(*) FROM notifications WHERE acknowledged_at IS NULL AND attempts>=?",
+                        (MAX_NOTIFICATION_ATTEMPTS,),
+                    ).fetchone()[0],
+                    "delivered": conn.execute(
+                        "SELECT COUNT(*) FROM notifications WHERE acknowledged_at IS NOT NULL"
+                    ).fetchone()[0],
+                },
+            }
+            return {"schema_version": version, "binding": self._runtime_binding(conn), "counts": counts}
 
     @staticmethod
     def _audit(
@@ -208,6 +321,8 @@ class Repository:
 
     @staticmethod
     def _check_revision(post: PostView, expected_revision: int) -> None:
+        if type(expected_revision) is not int or expected_revision <= 0:
+            raise InvalidInput("Номер версии должен быть положительным целым числом")
         if post.revision != expected_revision:
             raise Conflict("Версия публикации устарела; откройте актуальный предпросмотр")
 
@@ -485,6 +600,7 @@ class Repository:
         *,
         expected_profile_version: int | None = None,
         expected_channel_id: str | None = None,
+        notification: Notification | None = None,
     ) -> list[PostView]:
         now = _utc(now)
         if not 1 <= len(items) <= 5:
@@ -539,6 +655,7 @@ class Repository:
                 if changed.rowcount != 1:
                     raise Conflict("Задание уже завершено")
                 self._audit(conn, "job", job.id, "done", now, post_ids=[p.id for p in posts])
+            self._outbox(conn, notification, business_id=business_id, job_id=job_id)
             return posts
 
     def get_post(self, post_id: str) -> PostView:
@@ -565,7 +682,12 @@ class Repository:
         with self._transaction() as conn:
             post = self._post(conn, post_id)
             self._check_revision(post, expected_revision)
-            if post.status in {PostStatus.PUBLISHING, PostStatus.PUBLISHED, PostStatus.DELIVERY_UNKNOWN}:
+            if post.status in {
+                PostStatus.EDITING,
+                PostStatus.PUBLISHING,
+                PostStatus.PUBLISHED,
+                PostStatus.DELIVERY_UNKNOWN,
+            }:
                 raise Conflict("Публикация уже отправляется или отправлена; правки запрещены")
             business = self._business(conn, post.business_id)
             values = {key: getattr(post, key) for key in allowed}
@@ -596,6 +718,131 @@ class Repository:
                 previous_revision=post.revision,
                 revision=new.revision,
                 changed_fields=sorted(changes),
+            )
+            return new
+
+    def begin_edit(self, post_id: str, expected_revision: int, now: datetime) -> PostView:
+        """Revoke approval before awaiting a paid external text/image operation."""
+        now = _utc(now)
+        with self._transaction() as conn:
+            post = self._post(conn, post_id)
+            self._check_revision(post, expected_revision)
+            if post.status not in {
+                PostStatus.REVIEW,
+                PostStatus.APPROVED,
+                PostStatus.REJECTED,
+                PostStatus.FAILED,
+            }:
+                raise Conflict("Публикация уже редактируется, отправляется или отправлена")
+            new = post.model_copy(
+                update={
+                    "revision": post.revision + 1,
+                    "status": PostStatus.EDITING,
+                    "approved_revision": None,
+                    "approved_by": None,
+                    "updated_at": now,
+                    "last_error": None,
+                }
+            )
+            self._save_post(conn, new, previous_revision=post.revision, previous_status=post.status)
+            conn.execute(
+                "INSERT INTO post_revisions(post_id,revision,data,created_at) VALUES (?,?,?,?)",
+                (new.id, new.revision, _dump(new), _stamp(now)),
+            )
+            self._audit(
+                conn,
+                "post",
+                post.id,
+                "edit_started",
+                now,
+                previous_revision=post.revision,
+                revision=new.revision,
+            )
+            return new
+
+    def complete_edit(
+        self,
+        post_id: str,
+        editing_revision: int,
+        changes: dict[str, Any],
+        now: datetime,
+        *,
+        expected_profile_version: int | None = None,
+        expected_channel_id: str | None = None,
+    ) -> PostView:
+        now = _utc(now)
+        allowed = {"text", "image_asset_id", "channel_id", "scheduled_at", "is_demo"}
+        if not changes or set(changes) - allowed:
+            raise InvalidInput("Укажите допустимые изменения публикации")
+        with self._transaction() as conn:
+            post = self._post(conn, post_id)
+            self._check_revision(post, editing_revision)
+            if post.status != PostStatus.EDITING:
+                raise Conflict("Публикация не находится в редактировании")
+            business = self._business(conn, post.business_id)
+            if expected_profile_version is not None and business.profile_version != expected_profile_version:
+                raise Conflict("Профиль изменился во время редактирования")
+            if expected_channel_id is not None and business.channel_id != expected_channel_id:
+                raise Conflict("Канал изменился во время редактирования")
+            values = {key: getattr(post, key) for key in allowed}
+            values.update(changes)
+            values = self._validate_post_data(conn, business, values)
+            new = post.model_copy(
+                update={
+                    **values,
+                    "revision": post.revision + 1,
+                    "status": PostStatus.REVIEW,
+                    "approved_revision": None,
+                    "approved_by": None,
+                    "updated_at": now,
+                    "last_error": None,
+                }
+            )
+            self._save_post(conn, new, previous_revision=post.revision, previous_status=post.status)
+            conn.execute(
+                "INSERT INTO post_revisions(post_id,revision,data,created_at) VALUES (?,?,?,?)",
+                (new.id, new.revision, _dump(new), _stamp(now)),
+            )
+            self._audit(
+                conn,
+                "post",
+                post.id,
+                "edit_completed",
+                now,
+                previous_revision=post.revision,
+                revision=new.revision,
+                changed_fields=sorted(changes),
+            )
+            return new
+
+    def fail_edit(
+        self,
+        post_id: str,
+        editing_revision: int,
+        error: str,
+        now: datetime,
+        *,
+        notification: Notification | None = None,
+    ) -> PostView:
+        now = _utc(now)
+        with self._transaction() as conn:
+            post = self._post(conn, post_id)
+            self._check_revision(post, editing_revision)
+            if post.status != PostStatus.EDITING:
+                raise Conflict("Публикация не находится в редактировании")
+            new = post.model_copy(
+                update={
+                    "status": PostStatus.FAILED,
+                    "updated_at": now,
+                    "last_error": str(error)[:2000],
+                    "approved_revision": None,
+                    "approved_by": None,
+                }
+            )
+            self._save_post(conn, new, previous_revision=post.revision, previous_status=post.status)
+            self._audit(conn, "post", post.id, "edit_failed", now, revision=post.revision)
+            self._outbox(
+                conn, notification, business_id=post.business_id, post_id=post.id, job_id=post.job_id
             )
             return new
 
@@ -708,7 +955,13 @@ class Repository:
         return new
 
     def finish_publication(
-        self, post_id: str, revision: int, result: PublicationResult, now: datetime
+        self,
+        post_id: str,
+        revision: int,
+        result: PublicationResult,
+        now: datetime,
+        *,
+        notification: Notification | None = None,
     ) -> PostView:
         now = _utc(now)
         with self._transaction() as conn:
@@ -716,10 +969,21 @@ class Repository:
             self._check_revision(post, revision)
             if post.status != PostStatus.PUBLISHING:
                 raise Conflict("Публикация не находится в отправке")
-            return self._complete_publication(conn, post, result, now, "published")
+            completed = self._complete_publication(conn, post, result, now, "published")
+            self._outbox(
+                conn, notification, business_id=post.business_id, post_id=post.id, job_id=post.job_id
+            )
+            return completed
 
     def fail_publication(
-        self, post_id: str, revision: int, error: str, unknown: bool, now: datetime
+        self,
+        post_id: str,
+        revision: int,
+        error: str,
+        unknown: bool,
+        now: datetime,
+        *,
+        notification: Notification | None = None,
     ) -> PostView:
         now = _utc(now)
         with self._transaction() as conn:
@@ -733,6 +997,9 @@ class Repository:
             )
             self._save_post(conn, new, previous_revision=post.revision, previous_status=post.status)
             self._audit(conn, "post", post.id, status.value, now, revision=revision)
+            self._outbox(
+                conn, notification, business_id=post.business_id, post_id=post.id, job_id=post.job_id
+            )
             return new
 
     def resolve_unknown(
@@ -860,6 +1127,14 @@ class Repository:
         with self._reader() as conn:
             return self._job(conn, job_id)
 
+    def find_job(self, business_id: str, dedup_key: str) -> Job | None:
+        with self._reader() as conn:
+            self._business(conn, business_id)
+            row = conn.execute(
+                "SELECT data FROM jobs WHERE business_id=? AND dedup_key=?", (business_id, dedup_key)
+            ).fetchone()
+            return Job.model_validate_json(row["data"]) if row is not None else None
+
     def list_jobs(self, business_id: str) -> list[Job]:
         with self._reader() as conn:
             self._business(conn, business_id)
@@ -912,7 +1187,9 @@ class Repository:
             self._audit(conn, "job", job.id, "claimed", now)
             return claimed
 
-    def fail_job(self, job_id: str, error: str, now: datetime) -> Job:
+    def fail_job(
+        self, job_id: str, error: str, now: datetime, *, notification: Notification | None = None
+    ) -> Job:
         now = _utc(now)
         with self._transaction() as conn:
             job = self._job(conn, job_id)
@@ -926,6 +1203,7 @@ class Repository:
                 (_dump(failed), job.id, job.status),
             )
             self._audit(conn, "job", job.id, "failed", now)
+            self._outbox(conn, notification, business_id=job.business_id, job_id=job.id)
             return failed
 
     def schedule_automations(
@@ -948,17 +1226,24 @@ class Repository:
                     and due <= now
                 ):
                     continue
-                if not self._has_job_capacity(conn, business, now, max_pending, max_per_day):
-                    # Leave due time unchanged; a later scheduler pass retries
-                    # when the queue clears or a new local calendar day starts.
-                    continue
                 interval = timedelta(hours=business.interval_hours)
                 # At most one job after downtime, anchored to the latest due slot.
                 # Older missed slots are skipped to avoid a paid generation burst.
                 skipped = (now - due) // interval
                 slot = due + skipped * interval
                 key = f"automation:{_stamp(slot)}"
-                _, inserted = self._enqueue(conn, business.id, business.automation_request, key, now)
+                existing = conn.execute(
+                    "SELECT id FROM jobs WHERE business_id=? AND dedup_key=?", (business.id, key)
+                ).fetchone()
+                if existing is not None:
+                    # A settings change must not re-run a paid generation or
+                    # make this slot's previous payload block other businesses.
+                    inserted = False
+                else:
+                    if not self._has_job_capacity(conn, business, now, max_pending, max_per_day):
+                        # A genuinely new job waits until capacity is available.
+                        continue
+                    _, inserted = self._enqueue(conn, business.id, business.automation_request, key, now)
                 count += int(inserted)
                 new = business.model_copy(update={"next_generation_at": slot + interval})
                 self._save_business(conn, new)
@@ -966,7 +1251,7 @@ class Repository:
                     conn,
                     "business",
                     business.id,
-                    "automation_scheduled",
+                    "automation_slot_skipped" if existing is not None else "automation_scheduled",
                     now,
                     slot=_stamp(slot),
                     skipped_slots=int(skipped),
@@ -976,7 +1261,7 @@ class Repository:
 
     def recover_interrupted(self, now: datetime) -> dict[str, int]:
         now = _utc(now)
-        counts = {"posts": 0, "jobs": 0}
+        counts = {"posts": 0, "jobs": 0, "edits": 0}
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT data FROM posts WHERE status=?", (PostStatus.PUBLISHING.value,)
@@ -994,7 +1279,46 @@ class Repository:
                 self._audit(
                     conn, "post", post.id, "interrupted_delivery_unknown", now, revision=post.revision
                 )
+                self._recovery_notification(
+                    conn,
+                    post.business_id,
+                    "delivery_unknown",
+                    post.id,
+                    post.revision,
+                    now,
+                    "После перезапуска результат отправки неизвестен. Проверьте канал перед повтором.",
+                    post_id=post.id,
+                    job_id=post.job_id,
+                )
                 counts["posts"] += 1
+            rows = conn.execute(
+                "SELECT data FROM posts WHERE status=?", (PostStatus.EDITING.value,)
+            ).fetchall()
+            for row in rows:
+                post = PostView.model_validate_json(row["data"])
+                new = post.model_copy(
+                    update={
+                        "status": PostStatus.FAILED,
+                        "updated_at": now,
+                        "approved_revision": None,
+                        "approved_by": None,
+                        "last_error": "Редактирование прервано перезапуском; повторите запрос и согласуйте результат заново",
+                    }
+                )
+                self._save_post(conn, new, previous_revision=post.revision, previous_status=post.status)
+                self._audit(conn, "post", post.id, "interrupted_edit_failed", now, revision=post.revision)
+                self._recovery_notification(
+                    conn,
+                    post.business_id,
+                    "edit_failed",
+                    post.id,
+                    post.revision,
+                    now,
+                    "Редактирование прервано перезапуском. Предыдущее согласование отменено.",
+                    post_id=post.id,
+                    job_id=post.job_id,
+                )
+                counts["edits"] += 1
             rows = conn.execute("SELECT data FROM jobs WHERE status='running'").fetchall()
             for row in rows:
                 job = Job.model_validate_json(row["data"])
@@ -1010,38 +1334,96 @@ class Repository:
                     (_dump(new), job.id),
                 )
                 self._audit(conn, "job", job.id, "interrupted_failed", now)
+                self._recovery_notification(
+                    conn,
+                    job.business_id,
+                    "preparation_failed",
+                    job.id,
+                    None,
+                    now,
+                    "Подготовка материалов прервана перезапуском. Автоматического платного повтора не будет.",
+                    job_id=job.id,
+                )
                 counts["jobs"] += 1
         return counts
 
+    def _recovery_notification(
+        self,
+        conn: sqlite3.Connection,
+        business_id: str,
+        kind: str,
+        entity_id: str,
+        revision: int | None,
+        now: datetime,
+        text: str,
+        *,
+        post_id: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        business = self._business(conn, business_id)
+        notification = Notification(
+            id=str(uuid5(NAMESPACE_URL, f"ai-marketer:recovery:{business_id}:{kind}:{entity_id}:{revision}")),
+            business_id=business_id,
+            owner_id=business.owner_id,
+            kind=kind,
+            text=text,
+            post_id=post_id,
+            job_id=job_id,
+            created_at=now,
+        )
+        self._add_notification(conn, notification)
+
+    def _outbox(
+        self,
+        conn: sqlite3.Connection,
+        notification: Notification | None,
+        *,
+        business_id: str,
+        post_id: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        if notification is None:
+            return
+        if notification.business_id != business_id:
+            raise InvalidInput("Уведомление относится к другому бизнесу")
+        if notification.post_id is not None and notification.post_id != post_id:
+            raise InvalidInput("Уведомление относится к другой публикации")
+        if notification.job_id is not None and notification.job_id != job_id:
+            raise InvalidInput("Уведомление относится к другому заданию")
+        self._add_notification(conn, notification)
+
     def add_notification(self, notification: Notification) -> Notification:
         with self._transaction() as conn:
-            business = self._business(conn, notification.business_id)
-            if notification.owner_id != business.owner_id:
-                raise InvalidInput("Получатель уведомления не владелец бизнеса")
-            if notification.post_id:
-                post = self._post(conn, notification.post_id)
-                if post.business_id != business.id:
-                    raise InvalidInput("Публикация уведомления принадлежит другому бизнесу")
-            if notification.job_id:
-                job = self._job(conn, notification.job_id)
-                if job.business_id != business.id:
-                    raise InvalidInput("Задание уведомления принадлежит другому бизнесу")
-            old = conn.execute("SELECT data FROM notifications WHERE id=?", (notification.id,)).fetchone()
-            if old:
-                if Notification.model_validate_json(old["data"]) != notification:
-                    raise Conflict("Идентификатор уведомления уже используется")
-                return notification
-            conn.execute(
-                "INSERT INTO notifications(id,business_id,created_at,data,next_attempt_at) VALUES (?,?,?,?,?)",
-                (
-                    notification.id,
-                    notification.business_id,
-                    _stamp(notification.created_at),
-                    _dump(notification),
-                    _stamp(notification.created_at),
-                ),
-            )
-            self._audit(conn, "notification", notification.id, "queued", notification.created_at)
+            return self._add_notification(conn, notification)
+
+    def _add_notification(self, conn: sqlite3.Connection, notification: Notification) -> Notification:
+        business = self._business(conn, notification.business_id)
+        if notification.owner_id != business.owner_id:
+            raise InvalidInput("Получатель уведомления не владелец бизнеса")
+        if notification.post_id:
+            post = self._post(conn, notification.post_id)
+            if post.business_id != business.id:
+                raise InvalidInput("Публикация уведомления принадлежит другому бизнесу")
+        if notification.job_id:
+            job = self._job(conn, notification.job_id)
+            if job.business_id != business.id:
+                raise InvalidInput("Задание уведомления принадлежит другому бизнесу")
+        old = conn.execute("SELECT data FROM notifications WHERE id=?", (notification.id,)).fetchone()
+        if old:
+            if Notification.model_validate_json(old["data"]) != notification:
+                raise Conflict("Идентификатор уведомления уже используется")
+            return notification
+        conn.execute(
+            "INSERT INTO notifications(id,business_id,created_at,data,next_attempt_at) VALUES (?,?,?,?,?)",
+            (
+                notification.id,
+                notification.business_id,
+                _stamp(notification.created_at),
+                _dump(notification),
+                _stamp(notification.created_at),
+            ),
+        )
+        self._audit(conn, "notification", notification.id, "queued", notification.created_at)
         return notification
 
     def pending_notifications(self, limit: int, now: datetime | None = None) -> list[Notification]:
