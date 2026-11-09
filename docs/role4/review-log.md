@@ -38,3 +38,48 @@
 
 Настоящий сервис изображений и модель ожидают выбора пользователя.
 Настройка его ключа в общем приложении требует согласования с ролью 2.
+
+## Ветки, появившиеся перед отправкой
+
+Дополнительно просмотрены новые коммиты и все изменённые текстовые файлы:
+
+| Ветка | Коммит | Результат проверки |
+| --- | --- | --- |
+| `codex/bootstrap` | `397ad3b` | Другие Settings, shared-модели, зависимости и entrypoint |
+| `codex/ai-content` | `4626541` | AI работает с bootstrap-моделями, а не моделями main |
+| `codex/media-analytics` | `2d1744c` | Другая генерация/аналитика; имя ветки уже занято |
+| `codex/backend-mvp` | `491151c` | Marketing/Database и альтернативные контракты; общий предок с main — первоначальная лицензия |
+| `codex/telegram-bot` | `37c7813` | UI и запуск используют Marketing/Worker; отсутствует runtime-фабрика main |
+
+Инструкций AGENTS.md в этих деревьях не обнаружено. Для двоичного MP4
+проверены тип и метаданные в Git; этот файл сам по себе не подтверждает
+совместимость приложения с main. Код альтернативных веток не выполнялся.
+
+Потребуется перенос на принятые контракты; прямой merge создаёт несовместимость.
+Основные различия для интеграции:
+
+| Альтернативные ветки | Принятый main и реализация роли 4 |
+| --- | --- |
+| Fact.statement / style / restrictions | Fact.text / tone / constraints |
+| TextDraft.image_prompt, fact_numbers | image_brief, used_source_ids |
+| GeneratedImage(data, format, provider) | GeneratedImage(content, mime_type, provider, is_demo) |
+| generate(profile, item, draft, feedback, current_image) | generate(profile, text, feedback) |
+| ReportData/summarize, прямой доступ к Database | ReportInput/ReportProvider через BackendService |
+| integer post.id и version | string post.id и revision |
+| собственный __main__, Marketing/Worker | единый runtime и BOT_FACTORY |
+
+В `2d1744c:app/reports/summary.py` реакции группируются без source и
+суммируются без разделения demo. Эта реализация не должна заменять reporter
+роли 4 для main: наши сводки разделяют source и demo, а покрытие проверяется
+отдельно. В bootstrap API-ключ хранится обычной строкой dataclass; переносить
+такую конфигурацию без проверки repr/логирования не следует.
+
+Для Telegram адаптировать предпросмотр через service.read_asset, правки через
+service.revise_image, отчёт через service.build_report с parse_mode=None,
+реакции через service.record_reactions. Историю ошибок и версии не восстанавливать
+из текущего PostView. Точное редактирование предыдущих пикселей требует отдельного
+изменения общего image-протокола.
+
+Чтобы сохранить чужую ветку, наша работа отправляется в
+`codex/media-analytics-integration`. Общие контракты и альтернативные ветки
+при этом не перезаписываются.
