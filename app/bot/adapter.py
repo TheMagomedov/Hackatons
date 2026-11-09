@@ -39,7 +39,7 @@ class TelegramBotAdapter:
             try:
                 await self.bot.set_chat_menu_button(
                     chat_id=self.owner_id,
-                    menu_button=MenuButtonWebApp(text="Открыть Пульс", web_app=WebAppInfo(url=self.mini_app_url)),
+                    menu_button=MenuButtonWebApp(text="Открыть Тираж", web_app=WebAppInfo(url=self.mini_app_url)),
                     request_timeout=15,
                 )
             except TelegramAPIError:

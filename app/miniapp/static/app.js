@@ -270,9 +270,9 @@ function overview() {
     Number(second.status === "review") - Number(first.status === "review")).slice(0, 4);
   return headline(date, "Ваш контент", "",
     '<span class="mode-pill"><span></span>' + (demo ? "Демо" : "Telegram") + '</span>')
-    + '<section class="hero"><img class="hero-art" src="./art.svg" alt="">'
-    + '<div class="hero-copy"><span class="hero-tag">' + icon("spark") + ' AI-СТУДИЯ</span>'
-    + '<h2>Что публикуем<br>дальше?</h2><p>Дайте тему. Пульс подготовит черновик для вашего канала.</p>'
+    + '<section class="hero"><img class="hero-art" src="./forest-hero.jpg" alt="">'
+    + '<div class="hero-copy"><span class="hero-tag">' + icon("spark") + ' СТУДИЯ ПУБЛИКАЦИЙ</span>'
+    + '<h2>От идеи<br>до поста</h2><p>Задайте тему. Тираж подготовит черновик для вашего канала.</p>'
     + button("Создать пост", "new-post", "primary", "plus") + '</div></section>'
     + '<section class="metrics" aria-label="Фильтры по статусу постов">'
     + metric(review, "На проверке", "review", "clock")
@@ -583,6 +583,6 @@ if (insideTelegram) {
 useTheme();
 void refresh().catch((error) => {
   root.setAttribute("aria-busy", "false");
-  root.innerHTML = headline("Пульс", "Рабочее пространство", "Telegram Mini App")
+  root.innerHTML = headline("Тираж", "Рабочее пространство", "Telegram Mini App")
     + '<div class="notice" role="alert">' + safe(error.message) + '</div>';
 });

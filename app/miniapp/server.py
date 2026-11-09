@@ -75,7 +75,7 @@ async def guard(request, handler):
     response.headers["Cache-Control"] = "no-store"
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; "
-        "img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+        "img-src 'self' blob: data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
         "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
     )
     return response
@@ -233,7 +233,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
 
     app.add_routes([
         web.get("/mini/", index),
-        web.get(r"/mini/{name:styles\.css|app\.js|art\.svg}", static_file),
+        web.get(r"/mini/{name:styles\.css|app\.js|forest-hero\.jpg|inter-variable\.woff2|inter-OFL\.txt}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
         web.post("/mini/api/business", create_business),
