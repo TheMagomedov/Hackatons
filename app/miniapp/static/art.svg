@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 320" fill="none">
+  <defs>
+    <radialGradient id="halo"><stop stop-color="#8868ff" stop-opacity=".7"/><stop offset="1" stop-color="#8868ff" stop-opacity="0"/></radialGradient>
+    <linearGradient id="tile" x1="123" y1="54" x2="312" y2="247" gradientUnits="userSpaceOnUse"><stop stop-color="#c8baff" stop-opacity=".8"/><stop offset=".43" stop-color="#846afc" stop-opacity=".65"/><stop offset="1" stop-color="#343285" stop-opacity=".65"/></linearGradient>
+    <linearGradient id="wave" x1="136" y1="180" x2="297" y2="106" gradientUnits="userSpaceOnUse"><stop stop-color="#bdf4ff"/><stop offset=".53" stop-color="#f2eaff"/><stop offset="1" stop-color="#f5baff"/></linearGradient>
+    <linearGradient id="edge" x1="134" y1="60" x2="280" y2="245" gradientUnits="userSpaceOnUse"><stop stop-color="#f5e8ff"/><stop offset="1" stop-color="#b7a5ff" stop-opacity=".15"/></linearGradient>
+    <pattern id="grid" width="15" height="15" patternUnits="userSpaceOnUse"><path d="M15 0H0v15" stroke="#e0d8ff" stroke-opacity=".18" stroke-width=".8"/></pattern>
+  </defs>
+  <ellipse cx="228" cy="169" rx="191" ry="153" fill="url(#halo)"/>
+  <g transform="rotate(-24 222 162)" stroke="#ab9bfa">
+    <ellipse cx="222" cy="162" rx="190" ry="72" opacity=".32"/>
+    <ellipse cx="222" cy="162" rx="168" ry="55" opacity=".28" stroke-dasharray="3 7"/>
+    <ellipse cx="222" cy="162" rx="196" ry="92" opacity=".12"/>
+    <circle cx="70" cy="122" r="4" fill="#c8b1ff" stroke="none"/>
+    <circle cx="387" cy="190" r="4" fill="#97dcff" stroke="none"/>
+    <circle cx="369" cy="119" r="2.5" fill="#f1dfff" stroke="none"/>
+  </g>
+  <g transform="rotate(-13 220 160)">
+    <rect x="141" y="76" width="178" height="169" rx="33" fill="#241858" stroke="#8671ed" stroke-opacity=".46"/>
+    <rect x="126" y="60" width="178" height="169" rx="32" fill="url(#tile)" stroke="url(#edge)" stroke-width="1.4"/>
+    <rect x="137" y="71" width="156" height="146" rx="25" fill="url(#grid)"/>
+    <path d="M150 159h32l19-38 22 61 18-33h38" stroke="#342378" stroke-opacity=".55" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M150 151h32l19-38 22 61 18-33h38" stroke="url(#wave)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="150" cy="151" r="6" fill="#d9faff"/><circle cx="279" cy="141" r="6" fill="#fbe1ff"/>
+  </g>
+  <path d="M330 66l4 11 11 4-11 4-4 11-4-11-11-4 11-4z" fill="#e8d7ff"/>
+  <path d="M108 208l3 8 8 3-8 3-3 8-3-8-8-3 8-3z" fill="#acdfff"/>
+  <path d="M294 251l2 5 6 2-6 2-2 6-2-6-5-2 5-2z" fill="#e6bcff" opacity=".8"/>
+  <circle cx="94" cy="88" r="3" fill="#d0b8ff"/><circle cx="354" cy="225" r="3" fill="#ddd3ff"/><circle cx="180" cy="263" r="2" fill="#b5a5ff"/>
+</svg>

@@ -14,11 +14,16 @@ from app.config import Settings
 from app.core.demo import run_demo
 from app.core.instance_lock import InstanceLock
 from app.core.runtime import build_runtime, run_application
+from app.miniapp.server import create_app as create_mini_app
+from app.miniapp.server import serve as serve_mini_app
 from app.shared.errors import AppError, InvalidInput, NotFound
 from app.storage import Repository
 
 
 async def execute(args) -> None:
+    if args.command == "miniapp-preview":
+        await serve_mini_app(create_mini_app(), args.port, asyncio.Event())
+        return
     if args.command == "demo":
         destination = Path(args.data_dir or "var") / f"demo-{uuid4().hex[:12]}"
         with InstanceLock(destination / "backend.lock"):
@@ -75,8 +80,10 @@ def main() -> int:
         description="Backend автономного AI-маркетолога. По умолчанию — офлайн-демо."
     )
     parser.add_argument(
-        "command", nargs="?", choices=("demo", "init", "check", "run", "status", "adopt-data"), default="demo"
+        "command", nargs="?",
+        choices=("demo", "init", "check", "run", "status", "adopt-data", "miniapp-preview"), default="demo"
     )
+    parser.add_argument("--port", type=int, default=8765, help="Локальный порт miniapp-preview")
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--once", action="store_true", help="Один цикл backend для команды run")
@@ -87,6 +94,8 @@ def main() -> int:
         parser.error("--mode и --owner-id используются только с adopt-data")
     if args.once and args.command != "run":
         parser.error("--once используется только с run")
+    if args.command == "miniapp-preview" and not 1024 <= args.port <= 65535:
+        parser.error("--port должен быть от 1024 до 65535")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

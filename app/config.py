@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -23,6 +24,8 @@ class Settings(BaseModel):
     image_factory: str | None = None
     report_factory: str | None = None
     bot_factory: str | None = None
+    mini_app_url: str | None = None
+    mini_app_port: int = Field(default=8766, ge=1024, le=65535)
     provider_timeout_seconds: float = Field(default=120, gt=0, le=600)
     max_upload_bytes: int = Field(default=10_000_000, gt=0, le=20_000_000)
     max_posts_per_job: int = Field(default=3, ge=1, le=5)
@@ -41,6 +44,19 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def live_credentials(self) -> "Settings":
+        if self.mini_app_url:
+            try:
+                url = urlsplit(self.mini_app_url)
+                valid = (
+                    url.scheme == "https" and url.hostname and url.path == "/mini/"
+                    and url.port in (None, 443) and url.username is None and url.password is None
+                    and not url.query and not url.fragment
+                    and not any(char.isspace() for char in self.mini_app_url)
+                )
+            except ValueError:
+                valid = False
+            if not valid or self.mode != "live" or not self.bot_factory:
+                raise InvalidInput("MINI_APP_URL должен быть HTTPS-адресом с путём /mini/ в live-режиме с ботом.")
         if self.mode == "live":
             if "owner_id" not in self.model_fields_set:
                 # A domain error avoids embedding the input mapping (and token)
@@ -65,6 +81,8 @@ class Settings(BaseModel):
             "IMAGE_PROVIDER_FACTORY": "image_factory",
             "REPORT_PROVIDER_FACTORY": "report_factory",
             "BOT_FACTORY": "bot_factory",
+            "MINI_APP_URL": "mini_app_url",
+            "MINI_APP_PORT": "mini_app_port",
             "PROVIDER_TIMEOUT_SECONDS": "provider_timeout_seconds",
             "MAX_UPLOAD_BYTES": "max_upload_bytes",
             "MAX_POSTS_PER_JOB": "max_posts_per_job",
