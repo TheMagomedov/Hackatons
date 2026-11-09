@@ -7,7 +7,7 @@ import base64
 from datetime import timedelta
 from pathlib import Path
 
-from app.shared.errors import Conflict, Forbidden
+from app.shared.errors import Conflict, DeliveryRejected, Forbidden
 from app.shared.models import (
     BusinessProfile,
     ChannelInfo,
@@ -85,6 +85,8 @@ class DemoPublisher:
         return ChannelInfo(id="-1001234567890", title="Offline demo channel")
 
     async def publish(self, post, image, mime_type) -> PublicationResult:
+        if not post.is_demo:
+            raise DeliveryRejected("DemoPublisher принимает только явно помеченные тестовые публикации.")
         self.sent.append(post)
         return PublicationResult(channel_id=post.channel_id, message_id=100 + len(self.sent))
 
@@ -124,6 +126,7 @@ async def run_demo(data_dir: Path) -> dict:
     settings = Settings(data_dir=data_dir, mode="demo")
     repo = Repository(data_dir / "backend.sqlite3")
     repo.initialize()
+    repo.bind_runtime("demo", settings.owner_id)
     files = FileStore(data_dir / "assets", max_bytes=settings.max_upload_bytes)
     publisher, notifier = DemoPublisher(), DemoNotifier()
     service = BackendService(
