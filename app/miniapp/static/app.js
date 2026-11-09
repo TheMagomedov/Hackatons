@@ -8,6 +8,7 @@ const workspace = $("#workspace");
 const toast = $("#toast");
 const demo = document.body.dataset.mode === "preview";
 const telegram = window.Telegram?.WebApp;
+const insideTelegram = Boolean(!demo && telegram?.initData);
 const labels = {
   review: "На согласовании", approved: "Запланирован", publishing: "Отправляется",
   published: "Опубликован", failed: "Ошибка", editing: "Редактируется",
@@ -52,6 +53,31 @@ let stateRequest = 0;
 let toastTimer;
 let watchedJob = 0;
 const imageUrls = new Map();
+let themeOverride = null;
+
+function useTheme() {
+  const theme = themeOverride || (insideTelegram ? telegram.colorScheme : "dark");
+  document.body.dataset.theme = theme === "light" ? "light" : "dark";
+  const color = getComputedStyle(document.body).getPropertyValue("--app").trim();
+  $('meta[name="theme-color"]').content = color;
+  if (insideTelegram && telegram.isVersionAtLeast("6.9")) {
+    telegram.setHeaderColor(color);
+    telegram.setBackgroundColor(color);
+  }
+  const toggle = $(".theme-button");
+  toggle.innerHTML = icon(theme === "light" ? "theme" : "sun");
+  toggle.setAttribute("aria-pressed", String(theme === "light"));
+}
+
+function syncBackButton() {
+  if (!insideTelegram || !telegram.isVersionAtLeast("6.1")) return;
+  if (dialog.open || view !== "overview") telegram.BackButton.show();
+  else telegram.BackButton.hide();
+}
+
+function selectionFeedback() {
+  if (insideTelegram && telegram.isVersionAtLeast("6.1")) telegram.HapticFeedback.selectionChanged();
+}
 
 function button(label, action, kind = "primary", glyph = "", attrs = "") {
   return '<button type="button" class="button ' + kind + '" data-action="' + action + '" ' + attrs + '>'
@@ -59,7 +85,8 @@ function button(label, action, kind = "primary", glyph = "", attrs = "") {
 }
 function headline(kicker, title, description, action = "") {
   return '<header class="page-head"><div><p class="eyebrow">' + safe(kicker) + '</p><h1>'
-    + safe(title) + '</h1><p>' + safe(description) + '</p></div>' + action + '</header>';
+    + safe(title) + '</h1>' + (description ? '<p>' + safe(description) + '</p>' : '')
+    + '</div>' + action + '</header>';
 }
 function statusLabel(value) {
   return '<span class="status ' + (Object.hasOwn(labels, value) ? value : "editing") + '">'
@@ -220,46 +247,45 @@ async function loadImages(container) {
   }));
 }
 function postCards(posts) {
-  return '<div class="post-grid">' + posts.map((post) => {
-    const [title, ...lines] = post.text.split("\n");
-    const subtitle = lines.join(" ").trim() || "Версия " + post.revision;
+  return '<div class="post-list">' + posts.map((post) => {
+    const title = post.text.split("\n")[0];
     return '<button class="post-card" data-action="open-post" data-id="' + safe(post.id) + '">'
-      + postArt(post) + '<div class="post-body"><div class="post-meta">' + statusLabel(post.status)
+      + postArt(post) + '<div class="post-body"><h3>' + safe(title.slice(0, 85)) + '</h3>'
+      + '<div class="post-meta">' + statusLabel(post.status)
       + '<span class="date">' + safe(formatDate(post.scheduled_at || post.created_at)) + '</span></div>'
-      + '<h3>' + safe(title.slice(0, 70)) + '</h3><p>' + safe(subtitle.slice(0, 100)) + '</p></div></button>';
+      + '</div>' + icon("next") + '</button>';
   }).join("") + '</div>';
 }
-function metric(value, label, color, glyph) {
-  return '<article class="metric"><span class="bubble ' + color + '">' + icon(glyph)
-    + '</span><div><strong>' + value + '</strong><p>' + safe(label) + '</p></div></article>';
+function metric(value, label, status, glyph) {
+  return '<button class="metric" data-action="filter" data-status="' + status + '">' + icon(glyph)
+    + '<span><strong>' + value + '</strong><span class="metric-label">' + safe(label) + '</span></span></button>';
 }
 function overview() {
   const counts = state.counts;
   const review = counts.review || 0;
-  const attention = review ? review + ' в очереди' : "Всё проверено";
-  return headline("Рабочий стол", "Обзор", "Здесь видно, что готовится, что ждёт решения и что уже вышло.",
-    button("Новый пост", "new-post", "primary", "plus"))
-    + '<section class="overview-top"><article class="hero"><img class="hero-art" src="./art.svg" alt="">'
-    + '<div class="hero-copy"><span class="hero-tag">' + icon("spark") + ' КОНТЕНТ-СТУДИЯ</span>'
-    + '<h2>Контент<br>в вашем ритме</h2><p>От идеи до публикации в Telegram. Последнее слово остаётся за вами.</p>'
-    + button("Создать черновик", "new-post", "secondary", "arrow") + '</div></article>'
-    + '<aside class="panel attention"><span class="bubble amber">' + icon("clock") + '</span>'
-    + '<h2>На согласовании</h2><p>' + (review ? safe(attention) + '. Откройте черновик, проверьте текст и время.'
-      : 'Черновики появятся здесь, когда будут готовы к проверке.') + '</p>'
-    + '<button class="text-button" data-action="review-list">К черновикам ' + icon("arrow") + '</button></aside></section>'
-    + '<section class="metrics" aria-label="Сводка по постам">'
-    + metric(counts.total || 0, "Всего постов", "lavender", "posts")
-    + metric(review, "На согласовании", "amber", "clock")
-    + metric(counts.approved || 0, "Запланировано", "blue", "calendar")
-    + metric(counts.published || 0, "Опубликовано", "mint", "check") + '</section>'
-    + '<div class="section-title"><div><h2>Последние посты</h2><p>Откройте карточку для предпросмотра и правок.</p></div>'
-    + '<button class="text-button" data-view="content">Все посты ' + icon("arrow") + '</button></div>'
-    + (state.posts.length ? postCards(state.posts) : '<div class="empty">Постов пока нет. Создайте первый черновик.</div>');
+  const date = new Intl.DateTimeFormat("ru-RU", {
+    weekday: "short", day: "numeric", month: "long", timeZone: state.business.timezone,
+  }).format(new Date());
+  const recent = state.posts.slice().sort((first, second) =>
+    Number(second.status === "review") - Number(first.status === "review")).slice(0, 4);
+  return headline(date, "Ваш контент", "",
+    '<span class="mode-pill"><span></span>' + (demo ? "Демо" : "Telegram") + '</span>')
+    + '<section class="hero"><img class="hero-art" src="./art.svg" alt="">'
+    + '<div class="hero-copy"><span class="hero-tag">' + icon("spark") + ' AI-СТУДИЯ</span>'
+    + '<h2>Что публикуем<br>дальше?</h2><p>Дайте тему. Пульс подготовит черновик для вашего канала.</p>'
+    + button("Создать пост", "new-post", "primary", "plus") + '</div></section>'
+    + '<section class="metrics" aria-label="Фильтры по статусу постов">'
+    + metric(review, "На проверке", "review", "clock")
+    + metric(counts.approved || 0, "В расписании", "approved", "calendar")
+    + metric(counts.published || 0, "Опубликовано", "published", "check") + '</section>'
+    + '<div class="section-title"><h2>Очередь постов</h2>'
+    + '<button class="text-button" data-view="content">Все посты ' + icon("next") + '</button></div>'
+    + (recent.length ? postCards(recent) : '<div class="empty">Первый черновик появится здесь после подготовки.</div>');
 }
 function contentView() {
   const filters = [["", "Все"], ["review", "На согласовании"], ["approved", "Запланированы"], ["published", "Опубликованы"]];
-  return headline("Редакция", "Контент", "Черновики, расписание и опубликованные материалы.",
-    button("Новый пост", "new-post", "primary", "plus"))
+  return headline("Редакция", "Посты", "Выберите черновик или проверьте расписание.",
+    button("Создать", "new-post", "primary", "plus"))
     + '<div class="filters" aria-label="Статус постов">' + filters.map(([value, label]) =>
       '<button class="filter" data-action="filter" data-status="' + value + '" aria-pressed="'
       + (value === statusFilter) + '">' + label + '</button>').join("") + '</div>'
@@ -274,16 +300,16 @@ function reportView() {
     const a = Math.round(134 * day.created / max);
     const b = Math.round(134 * day.sent / max);
     return '<g><title>' + safe(day.label) + ': подготовлено ' + day.created + ', опубликовано ' + day.sent
-      + '</title><rect x="' + x + '" y="' + (162 - a) + '" width="16" height="' + a + '" rx="4" fill="#8263ec"/>'
+      + '</title><rect x="' + x + '" y="' + (162 - a) + '" width="16" height="' + a + '" rx="4" class="created"/>'
       + '<rect x="' + (x + 20) + '" y="' + (162 - b) + '" width="16" height="' + b
-      + '" rx="4" fill="#78bea8"/><text x="' + (x + 18) + '" y="183" text-anchor="middle">'
+      + '" rx="4" class="sent"/><text x="' + (x + 18) + '" y="183" text-anchor="middle">'
       + safe(day.label) + '</text></g>';
   }).join("");
   return headline("Результаты", "Отчёты", "Подготовка и публикации за последние семь дней.")
     + '<section class="panel chart"><h2>Активность по дням</h2><p>'
     + (demo ? "Демонстрационные данные" : "Данные из истории этого бизнеса") + '</p>'
-    + '<svg viewBox="0 0 600 190" role="img" aria-label="График подготовки и публикаций" font-size="12" fill="#676980">'
-    + [28, 73, 118, 162].map((y) => '<path d="M36 ' + y + 'h530" stroke="#ece9f4"/>').join("")
+    + '<svg viewBox="0 0 600 190" role="img" aria-label="График подготовки и публикаций" font-size="15">'
+    + [28, 73, 118, 162].map((y) => '<path d="M36 ' + y + 'h530" class="baseline"/>').join("")
     + bars + '</svg><div class="legend"><span><i></i>Подготовлено</span><span><i></i>Опубликовано</span></div></section>'
     + (report?.detail ? '<details class="panel report-detail"><summary>Полный отчёт</summary><pre>'
       + safe(report.detail) + '</pre></details>' : "");
@@ -320,6 +346,7 @@ function render() {
     else button.removeAttribute("aria-current");
   });
   root.setAttribute("aria-busy", "false");
+  syncBackButton();
   if (!b) {
     root.innerHTML = headline("Первый шаг", "Создайте бизнес", "Добавьте карточку, чтобы начать работу с контентом.")
       + '<div class="empty">Понадобятся описание бизнеса и канал Telegram.<br>'
@@ -358,6 +385,7 @@ async function navigate(next, filter = "") {
   if (!views.has(next)) return;
   view = next;
   statusFilter = filter;
+  selectionFeedback();
   history.replaceState(null, "", "#" + next);
   await loadPage();
   root.focus({preventScroll: true});
@@ -366,6 +394,7 @@ async function navigate(next, filter = "") {
 function showDialog(html) {
   dialogBody.innerHTML = html;
   if (!dialog.open) dialog.showModal();
+  syncBackButton();
   void loadImages(dialogBody);
 }
 function dialogHeading(title, detail = "") {
@@ -434,6 +463,12 @@ document.addEventListener("click", async (event) => {
   }
   const {action, id, revision} = control.dataset;
   if (action === "close") { dialog.close(); return; }
+  if (action === "theme") {
+    themeOverride = document.body.dataset.theme === "light" ? "dark" : "light";
+    useTheme();
+    selectionFeedback();
+    return;
+  }
   control.disabled = true;
   try {
     if (action === "new-post") {
@@ -456,8 +491,8 @@ document.addEventListener("click", async (event) => {
         action === "analyze" ? {} : {revision: state.business.profile_version});
       await refresh();
       notify(action === "analyze" ? "Профиль готов к проверке." : "Профиль подтверждён.");
-    } else if (action === "filter" || action === "review-list") {
-      await navigate("content", action === "review-list" ? "review" : control.dataset.status);
+    } else if (action === "filter") {
+      await navigate("content", control.dataset.status);
     } else if (action === "more") {
       const epoch = pageRequest;
       const next = content.page + 1;
@@ -530,16 +565,22 @@ window.addEventListener("pagehide", () => {
   for (const pending of imageUrls.values()) void pending.then((url) => { if (url) URL.revokeObjectURL(url); });
   imageUrls.clear();
 });
-if (demo) {
-  $("#mode-pill").innerHTML = "<span></span> Демо";
-  $("#mode-pill").title = "Образец: действия остаются в этом браузере";
-} else {
-  $("#mode-pill").innerHTML = "<span></span> Telegram";
-  $("#mode-pill").classList.add("live");
-  telegram?.ready();
-  telegram?.expand();
-  if (telegram?.isVersionAtLeast?.("6.9")) telegram.setHeaderColor("#11152c");
+dialog.addEventListener("close", syncBackButton);
+if (insideTelegram) {
+  telegram.ready();
+  telegram.expand();
+  telegram.onEvent("themeChanged", () => {
+    themeOverride = null;
+    useTheme();
+  });
+  if (telegram.isVersionAtLeast("6.1")) {
+    telegram.BackButton.onClick(() => {
+      if (dialog.open) dialog.close();
+      else void navigate("overview").catch(announceError);
+    });
+  }
 }
+useTheme();
 void refresh().catch((error) => {
   root.setAttribute("aria-busy", "false");
   root.innerHTML = headline("Пульс", "Рабочее пространство", "Telegram Mini App")
