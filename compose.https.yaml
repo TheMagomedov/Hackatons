@@ -1,6 +1,9 @@
 # docker compose -f compose.yaml -f compose.https.yaml up --build -d
 # Set MINI_APP_DOMAIN and MINI_APP_URL=https://that-domain/mini/ in .env.
 services:
+  marketer:
+    environment:
+      MINI_APP_URL: "https://${MINI_APP_DOMAIN:?Set MINI_APP_DOMAIN in .env}/mini/"
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
