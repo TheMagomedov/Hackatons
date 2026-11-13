@@ -4,10 +4,9 @@ from contextlib import suppress
 
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import MenuButtonWebApp, WebAppInfo
 from aiogram.utils.token import TokenValidationError
 
-from app.bot.router import build_router, menu
+from app.bot.router import build_router, install_mini_app_menu, menu
 from app.config import Settings
 from app.core.service import BackendService
 from app.shared.errors import InvalidInput, ProviderUnavailable
@@ -69,14 +68,7 @@ class TelegramBotAdapter:
                 "У этого бота настроен webhook. Для polling нужен отдельный токен или отключение webhook."
             )
         if self.mini_app_url:
-            try:
-                await self.bot.set_chat_menu_button(
-                    chat_id=self.owner_id,
-                    menu_button=MenuButtonWebApp(text="Открыть Тираж", web_app=WebAppInfo(url=self.mini_app_url)),
-                    request_timeout=15,
-                )
-            except TelegramAPIError:
-                log.warning("Telegram не установил меню Mini App. Проверьте HTTPS-адрес и личный чат владельца.")
+            await install_mini_app_menu(self.bot, self.owner_id, self.mini_app_url)
         log.info("Telegram bot @%s connected", me.username)
         polling = asyncio.create_task(
             self.dispatcher.start_polling(

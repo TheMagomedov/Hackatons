@@ -17,11 +17,11 @@ function setup(mode='preview', options={}) {
 function data() {return {workspaces:[{business:{id:'one',name:'Компания',timezone:'Europe/Moscow',profile_version:1,
  profile_confirmed:true,profile:{description:'Описание',tone:'Спокойно',facts:[{text:'Факт'}]},channel_id:'@channel'},
  sources:[{id:'source',name:'Описание',kind:'text'}],posts:[{id:'post',business_id:'one',text:'Текст',status:'review',revision:1,
- profile_version:1,created_at:'2026-11-13T00:00:00Z',channel_id:'@channel',scheduled_at:null}]}],jobs:[],conversations:[],assets:[],selectedBusiness:'one'};}
+ profile_version:1,art:'pattern-2',created_at:'2026-11-13T00:00:00Z',channel_id:'@channel',scheduled_at:null}]}],jobs:[],conversations:[],assets:[],selectedBusiness:'one'};}
 test('roundtrip stores only bounded demo fields, drops credential-like extras',()=>{
  const {store}=setup();const input=data();input.initData='secret';input.workspaces[0].business.token='secret';
  assert.equal(store.write(input),true);const result=store.read();assert.equal(result.issue,null);
- assert.equal(result.data.selectedBusiness,'one');assert.equal(result.data.workspaces[0].posts[0].text,'Текст');
+ assert.equal(result.data.selectedBusiness,'one');assert.equal(result.data.workspaces[0].posts[0].art,'pattern-2');assert.equal(result.data.workspaces[0].posts[0].text,'Текст');
  assert.equal(JSON.stringify(result.data).includes('secret'),false);
 });
 test('connected Mini App never reads, writes or clears local demo storage',()=>{
@@ -30,7 +30,7 @@ test('connected Mini App never reads, writes or clears local demo storage',()=>{
 });
 test('malformed or oversized storage falls back without executing injected content',()=>{
  const {store,values}=setup();for(const value of ['{bad',JSON.stringify({version:99}), 'x'.repeat(4_000_001)]) {
-  values.set('tirazh.preview.v1',value);assert.equal(store.read().data,null);assert.ok(store.read().issue);
+  values.set('salavatsteklo.preview.v1',value);assert.equal(store.read().data,null);assert.ok(store.read().issue);
  }
 });
 test('company ownership and duplicate IDs are validated',()=>{
@@ -47,5 +47,16 @@ test('blocked or full storage is reported; reset removes only demo key',()=>{
  assert.equal(setup('preview',{block:true}).store.read().data,null);
  assert.equal(setup('preview',{full:true}).store.write(data()),false);
  const {store,values}=setup();values.set('unrelated','keep');assert.equal(store.write(data()),true);assert.equal(store.clear(),true);
- assert.equal(values.has('tirazh.preview.v1'),false);assert.equal(values.get('unrelated'),'keep');
+ assert.equal(values.has('salavatsteklo.preview.v1'),false);assert.equal(values.get('unrelated'),'keep');
+});
+
+test('brand demo never imports or clears the earlier Tirazh preview',()=>{
+ const {store,values}=setup();
+ values.set('tirazh.preview.v1',JSON.stringify({version:1,...data()}));
+ assert.equal(store.read().data,null,'Old preview data is not silently migrated into a different brand');
+ assert.equal(store.write(data()),true);
+ assert.equal(values.has('salavatsteklo.preview.v1'),true);
+ assert.equal(store.clear(),true);
+ assert.equal(values.has('salavatsteklo.preview.v1'),false);
+ assert.equal(values.has('tirazh.preview.v1'),true,'Reset preserves unrelated prior workspace');
 });

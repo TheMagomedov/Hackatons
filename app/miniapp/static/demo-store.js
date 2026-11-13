@@ -3,7 +3,7 @@
 // This store is deliberately inaccessible in the connected Mini App. It never receives
 // Telegram initData, tokens, live API responses or files from a live workspace.
 window.TirazhDemoStore = (() => {
-  const KEY = "tirazh.preview.v1";
+  const KEY = "salavatsteklo.preview.v1";
   const MAX_BYTES = 4_000_000;
   const preview = () => document.body.dataset.mode === "preview";
   const object = value => value && typeof value === "object" && !Array.isArray(value);
@@ -38,7 +38,7 @@ window.TirazhDemoStore = (() => {
         return {id: required(post.id, 100), business_id: id, channel_id: string(post.channel_id, 128),
           text: required(post.text, 4000), revision: integer(post.revision, 1), status,
           profile_version: integer(post.profile_version), used_source_ids: texts(post.used_source_ids || [], 40, 100),
-          warnings: texts(post.warnings || []), art: ["coffee", "pastry", "cup"].includes(post.art) ? post.art : "coffee",
+          warnings: texts(post.warnings || []), art: ["pattern-1", "pattern-2", "pattern-3"].includes(post.art) ? post.art : "pattern-1",
           content_origin: post.content_origin === "manual" ? "manual" : "generated",
           image_asset_id: string(post.image_asset_id, 100), created_at: date(post.created_at) || new Date().toISOString(),
           scheduled_at: date(post.scheduled_at), published_at: date(post.published_at), is_demo: true};

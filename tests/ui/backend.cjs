@@ -47,7 +47,7 @@ async function stopFixture(child) {
  browser=await chromium.launch();
  const page=await browser.newPage({viewport:{width:390,height:844},reducedMotion:'reduce'});
  const errors=[];page.on('pageerror',e=>errors.push(e.message));
- await page.addInitScript(()=>localStorage.setItem('tirazh.preview.v1','untouched-live-sentinel'));
+ await page.addInitScript(()=>{localStorage.setItem('tirazh.preview.v1','untouched-legacy-sentinel');localStorage.setItem('salavatsteklo.preview.v1','untouched-live-sentinel');});
  let releaseImages;
  const imageGate = new Promise(resolve=>{releaseImages=resolve;});
  await page.route('**/mini/api/asset/**',async route=>{await imageGate;await route.continue();});
@@ -157,7 +157,8 @@ async function stopFixture(child) {
   assert.equal(control.operations.length,0,'No AI operations recorded for manual company');
   const cal=await(await page.request.get(fixture.url+'api/business/'+manualBusiness+'/calendar?month=2099-12',{headers:{'X-Telegram-Init-Data':initData}})).json();
   assert.equal(cal.items.length,1);assert.equal(cal.items[0].status,'review');
-  assert.equal(await page.evaluate(()=>localStorage.getItem('tirazh.preview.v1')),'untouched-live-sentinel','Live UI never overwrites demo storage');
+  assert.equal(await page.evaluate(()=>localStorage.getItem('salavatsteklo.preview.v1')),'untouched-live-sentinel','Live UI never overwrites demo storage');
+  assert.equal(await page.evaluate(()=>localStorage.getItem('tirazh.preview.v1')),'untouched-legacy-sentinel','Live UI preserves unrelated previous demo');
   let releaseEditRead;
   const editGate=new Promise(resolve=>{releaseEditRead=resolve;});
   const postUrl='**/mini/api/post/'+manualPost.id;

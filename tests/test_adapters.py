@@ -68,7 +68,7 @@ async def test_bot_owner_onboarding_queue_preview_and_stale_approval(tmp_path, m
             await send(text="/start", actor=77)
             assert "владелец" in session.requests[-1].text
             await send(text="/start")
-            assert "AI-маркетолог" in session.requests[-1].text
+            assert "САЛАВАТСТЕКЛО · Контент-студия" in session.requests[-1].text
             await send(button="input:name")
             await send(text="Тестовая кофейня")
             business = service.list_businesses(owner)[0]

@@ -49,6 +49,41 @@ async function paletteContrast(page) {
   });
   assert.deepEqual(ratios.filter(item => item.ratio < 4.5), [], 'Palette text meets 4.5:1 on its base surfaces');
 }
+async function brandPresentation(page, theme, width) {
+  await page.evaluate(() => document.fonts.ready);
+  const observed = await page.evaluate(() => {
+    const logos = [...document.querySelectorAll('.brand-logo')];
+    const visible = logos.filter(image => getComputedStyle(image).display !== 'none');
+    const loaded = [...document.fonts].filter(font => font.status === 'loaded').map(font => font.family.replaceAll('"',''));
+    const result = {
+      logos:logos.map(image => ({name:image.getAttribute('src'),loaded:image.complete && image.naturalWidth === 1182})),
+      visible:visible.map(image => image.getAttribute('src')), loaded,
+      bodyFont:getComputedStyle(document.body).fontFamily,
+      headingFont:getComputedStyle(document.querySelector('.workspace-home h1')).fontFamily,
+      obsoleteArtwork:Boolean(document.querySelector('#art-coffee,#art-pastry,#art-cup')),
+      patterns:[...document.querySelectorAll('img[src*="brand-pattern-"]')].map(image => ({loaded:image.complete && image.naturalWidth > 0})),
+    };
+    if (visible.length === 1) {
+      const image = visible[0].getBoundingClientRect();
+      const window = document.querySelector('.brand-logo-window').getBoundingClientRect();
+      // Original transparent PNG alpha bounds are 178,351–1107,848 in its 1182px canvas.
+      const art = {left:image.left+image.width*178/1182,right:image.left+image.width*1107/1182,
+        top:image.top+image.height*351/1182,bottom:image.top+image.height*848/1182};
+      result.artHeight = art.bottom-art.top;
+      result.clearSpace = [art.left-window.left,window.right-art.right,art.top-window.top,window.bottom-art.bottom];
+    }
+    return result;
+  });
+  assert.equal(observed.logos.length,2,'Both supplied logo variants are present');
+  assert.ok(observed.logos.every(image => image.loaded),'Original logos load without fallback artwork');
+  assert.deepEqual(observed.visible,[theme === 'light' ? './brand-logo.png' : './brand-logo-white.png'],`${theme}/${width}: correct logo contrast`);
+  assert.ok(observed.artHeight >= 35,'Actual logo artwork meets the 35px minimum, excluding transparent canvas');
+  assert.ok(observed.clearSpace.every(value => value >= observed.artHeight/7-1),`${theme}/${width}: preserve the O-height clear space ${JSON.stringify(observed.clearSpace)}`);
+  assert.ok(observed.loaded.includes('Avenir Next Cyr') && observed.loaded.includes('Intro Black'),'Both supplied brand font families actually loaded');
+  assert.match(observed.bodyFont,/Avenir Next Cyr/); assert.match(observed.headingFont,/Intro Black/);
+  assert.equal(observed.obsoleteArtwork,false,'Previous coffee illustration symbols are removed');
+  assert.ok(observed.patterns.length > 0 && observed.patterns.every(image => image.loaded),'Original branded patterns render in the dashboard');
+}
 async function filterKeyboard(page, context) {
   await navigate(page,'content');
   const filters = page.locator('.filter');
@@ -116,6 +151,8 @@ async function keyboardReachability(page, context) {
         if (await page.locator('body').getAttribute('data-theme') !== theme) {
           await page.getByRole('button',{name:'Сменить тему',exact:true}).click();
         }
+        await page.waitForFunction(() => [...document.querySelectorAll('.brand-logo')].every(image => image.complete && image.naturalWidth > 0));
+        await brandPresentation(page,theme,width);
         await paletteContrast(page);
         for (const view of views) {
           await navigate(page,view);
@@ -178,6 +215,6 @@ async function keyboardReachability(page, context) {
     assert.ok(bottom.dockInset >= 34 && bottom.contentBottom <= bottom.dockTop,'Last control stays above the dock and safe area');
     await page.close();
     assert.deepEqual(errors,[],'No browser errors');
-    console.log(`PASS: ${inspected} screen/theme/viewport checks, 44px targets, text palette contrast, keyboard focus, modal scrolling, safe areas and long labels.`);
+    console.log(`PASS: ${inspected} screen/theme/viewport checks, original logos and clear space, loaded brand fonts/patterns, 44px targets, text palette contrast, keyboard focus, modal scrolling, safe areas and long labels.`);
   } finally {await browser.close();}
 })().catch(error => {console.error(error);process.exitCode=1;});

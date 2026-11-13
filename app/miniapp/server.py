@@ -208,6 +208,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         response = web.FileResponse(STATIC / name, headers={"Cache-Control": "no-cache"})
         if name.endswith(".woff2"):
             response.content_type = "font/woff2"
+        elif name.endswith(".ttf"):
+            response.content_type = "font/ttf"
         return response
 
     async def state(request):
@@ -465,7 +467,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     app.add_routes([
         web.get("/mini/", index),
         web.get("/mini/health", health),
-        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|app\.js|demo-store\.js|transport\.js|inter-variable\.woff2|inter-OFL\.txt}", static_file),
+        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|demo-store\.js|transport\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
         web.get("/mini/api/business/{id}/calendar", calendar),

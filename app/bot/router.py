@@ -7,17 +7,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from aiogram import BaseMiddleware, F, Router
-from aiogram.filters import Command
+from aiogram import BaseMiddleware, Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonWebApp,
     Message,
     MessageOriginChannel,
     MessageReactionCountUpdated,
     Update,
+    WebAppInfo,
 )
 
 from app.core.service import BackendService
@@ -25,6 +28,8 @@ from app.shared.errors import AppError, Conflict, InvalidInput
 from app.shared.models import Business, PostStatus, PostView
 
 log = logging.getLogger(__name__)
+STUDIO_TITLE = "САЛАВАТСТЕКЛО · Контент-студия"
+STUDIO_BUTTON = "Открыть студию"
 STATES = {
     PostStatus.REVIEW: "ожидает согласования",
     PostStatus.EDITING: "редактируется",
@@ -62,8 +67,8 @@ INPUTS = {
     "url": "Пришлите конечный публичный адрес страницы.",
     "pdf": "Прикрепите текстовый PDF до 8 МиБ и 24 страниц.",
     "channel": "Добавьте бота администратором канала с правом публиковать и пришлите @имя или ID канала.",
-    "request": "Опишите задачу, например «Подготовь три поста про завтраки».",
-    "auto": "Введите интервал в часах и задачу, например «24 Пост о завтраках».",
+    "request": "Опишите задачу, например «Подготовь три поста о стекле для современной архитектуры».",
+    "auto": "Введите интервал в часах и задачу, например «24 Пост о применении стекла в архитектуре».",
     "text": "Что изменить в тексте?",
     "image": "Что изменить на изображении?",
     "time": "Пришлите дату со смещением, например 2026-12-15 10:30+03:00.",
@@ -72,13 +77,31 @@ INPUTS = {
 }
 
 
-def menu(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+def menu(*rows: list[tuple[str, str]], mini_app_url: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
+        inline_keyboard=([
+            [InlineKeyboardButton(text=STUDIO_BUTTON, web_app=WebAppInfo(url=mini_app_url))]
+        ] if mini_app_url else []) + [
             [InlineKeyboardButton(text=label, callback_data=action) for label, action in row]
             for row in (*rows, [("Главное меню", "home")])
         ]
     )
+
+
+async def install_mini_app_menu(bot: Bot, owner_id: int, mini_app_url: str | None) -> bool:
+    """A new owner's first /start retries setup; inline launch remains available if it fails."""
+    if not mini_app_url:
+        return False
+    try:
+        await bot.set_chat_menu_button(
+            chat_id=owner_id,
+            menu_button=MenuButtonWebApp(text=STUDIO_BUTTON, web_app=WebAppInfo(url=mini_app_url)),
+            request_timeout=15,
+        )
+    except TelegramAPIError:
+        log.warning("Telegram не установил меню Mini App. Кнопка запуска доступна в главном меню бота.")
+        return False
+    return True
 
 
 async def reply(message: Message, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
@@ -229,10 +252,13 @@ def build_router(service: BackendService) -> Router:
         rows = [[(b.name[:50], f"business:{b.id}")] for b in businesses[-15:]]
         await reply(
             message,
-            "Автономный AI-маркетолог. Выберите бизнес или создайте карточку.",
+            STUDIO_TITLE + "\n\nВыберите бизнес или создайте карточку."
+            + (" В студии можно заполнить профиль, написать пост и загрузить своё изображение без нейросети."
+               if service.settings.mini_app_url else ""),
             menu(
                 *rows,
                 [("Создать бизнес", "input:name")],
+                mini_app_url=service.settings.mini_app_url,
             ),
         )
 
@@ -474,8 +500,11 @@ def build_router(service: BackendService) -> Router:
         await reply(message, INPUTS[prompt.kind], menu())
 
     @router.message(Command("start", "menu", "cancel"))
-    async def start(message: Message) -> None:
+    async def start(message: Message, command: CommandObject) -> None:
         await home(message, message.from_user.id)
+        # Reply first: a slow or failed menu update must not delay the launch button.
+        if command.command == "start":
+            await install_mini_app_menu(message.bot, message.from_user.id, service.settings.mini_app_url)
 
     @router.message(Command("help"))
     async def help_message(message: Message) -> None:

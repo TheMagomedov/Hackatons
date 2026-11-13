@@ -23,27 +23,29 @@ const safe = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
 const path = encodeURIComponent;
 const sampleDate = (days, hours) => new Date(Date.now() + (days * 24 + hours) * 3600000).toISOString();
 const businessSeed = {
-  id: "demo", name: "Тёплое зерно", timezone: "Europe/Moscow", channel_title: "Тёплое зерно",
-  channel_id: "@teploe_zerno", profile_confirmed: true, profile_version: 1,
-  profile: {description: "Кофейня с завтраками и фильтр-кофе. Спокойное место для начала дня.",
-    tone: "Тепло, просто, без суеты", facts: [{text: "В меню есть завтраки и фильтр-кофе."}]},
+  id: "demo", name: "САЛАВАТСТЕКЛО", timezone: "Europe/Moscow", channel_title: "Контент-студия · демо",
+  channel_id: "@salavatsteklo_demo", profile_confirmed: true, profile_version: 1,
+  profile: {description: "Демонстрационное пространство САЛАВАТСТЕКЛО. Материалы о стекле, архитектуре и фирменном стиле.",
+    tone: "Профессионально, ясно, с опорой на подтверждённые факты",
+    constraints: ["Не выдумывать цены, характеристики, сроки и сертификаты.", "Название бренда: САЛАВАТСТЕКЛО."],
+    facts: [{text: "Основной фирменный цвет — петроль #196C7F.", source_ids: ["note"]}]},
 };
 let demoWorkspaces = [{
   business: structuredClone(businessSeed),
-  sources: [{id: "note", name: "Описание кофейни", kind: "text"},
-            {id: "menu", name: "Меню завтраков", kind: "pdf"}],
+  sources: [{id: "note", name: "Фирменный стиль · выдержка из брендбука", kind: "text"},
+            {id: "menu", name: "Брендбук от 15.11.2023 · пример источника", kind: "pdf"}],
   posts: [
-    {id: "morning", text: "Утро начинается здесь\nСырники, тосты и чашка любимого кофе.", status: "review", art: "coffee",
+    {id: "morning", text: "Стекло. Свет. Пространство.\nДемонстрационный черновик о роли стекла в современной архитектуре.", status: "review", art: "pattern-1",
       revision: 1, created_at: sampleDate(0, -2), scheduled_at: null},
-    {id: "pastry", text: "Тёплые круассаны\nХрустящая корочка и мягкие слои внутри.", status: "approved", art: "pastry",
+    {id: "pastry", text: "В деталях — характер бренда\nПетроль, чистые линии и округлые формы в фирменном стиле САЛАВАТСТЕКЛО.", status: "approved", art: "pattern-2",
       revision: 2, created_at: sampleDate(-1, -4), scheduled_at: sampleDate(1, 2)},
-    {id: "filter", text: "Время для фильтр-кофе\nНебольшая пауза, которая меняет день.", status: "published", art: "cup",
+    {id: "filter", text: "Один бренд. Единый стиль.\nДемонстрационный пример публикации с фирменным паттерном.", status: "published", art: "pattern-3",
       revision: 3, created_at: sampleDate(-3, 0), published_at: sampleDate(-2, 0), scheduled_at: sampleDate(-2, 0)},
-    {id: "weekend", text: "Завтраки выходного дня\nСуббота за большим столом.", status: "review", art: "pastry",
+    {id: "weekend", text: "От материала к решению\nЧерновик рубрики о применении стекла. Факты и характеристики добавим из подтверждённых источников.", status: "review", art: "pattern-2",
       revision: 1, created_at: sampleDate(-4, 0), scheduled_at: null},
-    {id: "beans", text: "Знакомьтесь, новое зерно\nВ чашке — какао и красные ягоды.", status: "approved", art: "coffee",
+    {id: "beans", text: "Вопросы о стекле\nДемонстрационная рубрика: собираем вопросы аудитории для следующих публикаций.", status: "approved", art: "pattern-1",
       revision: 2, created_at: sampleDate(-5, 0), scheduled_at: sampleDate(3, 0)},
-    {id: "barista", text: "За стойкой с бариста\nКак мы настраиваем первую чашку.", status: "published", art: "cup",
+    {id: "barista", text: "Пространство для идей\nПример материала в фирменной палитре компании. Публикация в демо имитируется.", status: "published", art: "pattern-3",
       revision: 1, created_at: sampleDate(-6, 0), published_at: sampleDate(-5, 0), scheduled_at: sampleDate(-5, 0)},
   ],
 }];
@@ -81,7 +83,7 @@ let dateFormatter;
 let dateTimezone;
 
 function useTheme() {
-  const theme = themeOverride || (insideTelegram ? telegram.colorScheme : "dark");
+  const theme = themeOverride || (insideTelegram ? telegram.colorScheme : "light");
   document.body.dataset.theme = theme === "light" ? "light" : "dark";
   const color = getComputedStyle(document.body).getPropertyValue("--app").trim();
   $('meta[name="theme-color"]').content = color;
@@ -243,7 +245,7 @@ function demoApi(url, method, body) {
       if (!business.profile_confirmed || !business.channel_id) throw new Error("Сначала подтвердите профиль и подключите канал.");
       posts.unshift({id, business_id: business.id, channel_id: business.channel_id, profile_version: business.profile_version,
         used_source_ids: sources.map(s => s.id), warnings: [], text: "Демонстрационный черновик\n" + body.request,
-        status: "review", art: "coffee", revision: 1, created_at: new Date().toISOString()});
+        status: "review", art: "pattern-1", revision: 1, created_at: new Date().toISOString()});
       demoJobs.set(id, {id, business_id: business.id, request: body.request, status: "done", stage: "done",
         processed: 1, total: 1, created_at: new Date().toISOString()});
       return demoJobs.get(id);
@@ -268,7 +270,7 @@ function demoApi(url, method, body) {
       }
       if (parts[2] === "revise-text" || parts[2] === "revise-image") {
         if (parts[2] === "revise-text") post.text += "\nДемо-правка: " + body.feedback;
-        else post.art = post.art === "coffee" ? "pastry" : "coffee";
+        else post.art = post.art === "pattern-1" ? "pattern-2" : "pattern-1";
         post.revision++; post.status = "review";
       }
       if (parts[2] === "refresh-context") {
@@ -304,9 +306,9 @@ async function api(url, body) {
 function postArt(post, additionalClass = "") {
   const localImage = demo && demoAssets.get(post.image_asset_id);
   if (localImage && localImage.business_id === post.business_id) return '<div class="post-art ' + additionalClass + '"><img src="' + safe(localImage.data_url) + '" alt="Изображение к посту"></div>';
-  const art = ["coffee", "pastry", "cup"].includes(post.art) ? post.art : "coffee";
-  if (demo) return '<div class="post-art ' + additionalClass + '"><svg class="sample-art" aria-hidden="true" '
-    + 'viewBox="0 0 320 148" preserveAspectRatio="xMidYMid slice"><use href="#art-' + art + '"></use></svg></div>';
+  const art = ["pattern-1", "pattern-2", "pattern-3"].includes(post.art) ? post.art : "pattern-1";
+  if (demo) return '<div class="post-art brand-post-art ' + additionalClass + '"><img src="./brand-' + art
+    + '.png" alt="Фирменный паттерн САЛАВАТСТЕКЛО"></div>';
   return '<div class="post-art ' + additionalClass + '" data-asset="' + safe(post.image_asset_id) + '">'
     + icon("image") + '</div>';
 }
@@ -352,10 +354,10 @@ function postCards(posts) {
 }
 const editorialSteps = [
   {art: "draft", kicker: "01 / ПОДГОТОВКА", title: "Черновик с AI",
-    text: "Опишите тему и формат. Тираж подготовит текст для вашего канала с учётом профиля бизнеса.",
+    text: "Опишите тему и формат. После подключения AI студия подготовит текст с учётом профиля компании.",
     action: "new-post", label: "Создать черновик", icon: "plus"},
   {art: "calendar", kicker: "02 / РАСПИСАНИЕ", title: "План публикаций",
-    text: "Проверьте черновик, выберите дату и согласуйте версию. Тираж опубликует её в назначенное время.",
+    text: "Проверьте черновик, выберите дату и согласуйте версию. Студия опубликует её в назначенное время.",
     action: "filter", status: "approved", label: "Открыть расписание", icon: "calendar"},
   {art: "send", kicker: "03 / ПУБЛИКАЦИЯ", title: "Посты в Telegram",
     text: "Откройте отправленные посты и проверьте, что уже вышло в вашем канале.",
@@ -368,8 +370,9 @@ const editorialStatuses = [
 ];
 
 function pressArt(kind, className = "") {
-  return '<svg class="press-art ' + className + '" viewBox="0 0 420 390" aria-hidden="true">'
-    + '<use href="#press-' + kind + '"></use></svg>';
+  const number = {draft: 1, calendar: 2, send: 3}[kind] || 1;
+  return '<div class="brand-hero-art ' + className + '" aria-hidden="true"><img src="./brand-pattern-'
+    + number + '.png" alt=""></div>';
 }
 function pressHeading(id, title) {
   return '<h2 class="press-heading" id="' + id + '"><span>' + title + '</span></h2>';
@@ -418,7 +421,7 @@ function setupProgress() {
   ];
   const done = steps.filter(s => s[0]).length;
   return '<section class="setup-panel panel"><div class="section-top"><div><p class="eyebrow">НАСТРОЙКА КОМПАНИИ</p>'
-    + '<h2>' + (done === 3 ? "Всё готово к работе" : "Ещё " + (3 - done) + " шага до первого поста")
+    + '<h2>' + (done === 3 ? "Всё готово к работе" : "Ещё " + (3 - done) + (done === 2 ? " шаг" : " шага") + " до первого поста")
     + '</h2></div><span class="setup-count">' + done + '/3</span></div><div class="setup-steps">'
     + steps.map(([complete, title, action, detail], i) => '<button class="setup-step ' + (complete ? "complete" : "")
       + '" data-action="' + action + '"><span class="setup-number">' + (complete ? icon("check") : i + 1)
@@ -429,8 +432,8 @@ function overview() {
   const b = state.business;
   const upcoming = state.upcoming;
   const ready = b.profile_confirmed && b.channel_id;
-  return '<div class="workspace-home"><section class="workspace-hero"><div><p class="press-kicker">ВАШ AI-МАРКЕТОЛОГ</p>'
-    + '<h1>Идеи — в дело.</h1><p class="hero-description">' + safe(b.name) + ' · '
+  return '<div class="workspace-home"><section class="workspace-hero"><div><p class="press-kicker">КОНТЕНТ-СТУДИЯ</p>'
+    + '<h1>От идеи к публикации.</h1><p class="hero-description">' + safe(b.name) + ' · '
     + (ready ? "Всё для контента в одном пространстве." : "Давайте настроим пространство компании.") + '</p>'
     + '<div class="press-actions">' + button("Создать пост", "manual-post", "primary", "plus")
     + button("Автоподготовка", "automation", "secondary", "spark") + '</div>'
@@ -465,7 +468,7 @@ const stageLabels = {queued: "Ожидает запуска", plan: "Конте�
   saving: "Сохранение", done: "Материалы готовы", failed: "Нужна проверка", cancelled: "Отменено"};
 function conversationView() {
   return conversation.length ? conversation.map(turn => '<div class="chat-message user"><span class="chat-speaker">Вы</span>'
-    + safe(turn.user_text) + '</div><div class="chat-message assistant"><span class="chat-speaker">Тираж AI</span>'
+    + safe(turn.user_text) + '</div><div class="chat-message assistant"><span class="chat-speaker">AI-ассистент</span>'
     + safe(turn.assistant_text || 'Поручение принято.') + '</div>').join('')
     : '<p class="chat-empty">Спросите о компании или поручите подготовить пост. Уточняйте задачу в следующих сообщениях — AI сохранит контекст.</p>';
 }
@@ -908,11 +911,11 @@ document.addEventListener("click", async (event) => {
         await navigate("business"); notify("Подтвердите профиль и подключите канал, чтобы создать первый пост."); return;
       }
       openForm("prepare", "Новый черновик", "Опишите тему, формат и количество постов.",
-        formField("Задание для AI", "request", "textarea", 'maxlength="4000" placeholder="Например: два поста про завтраки на этой неделе"'),
+        formField("Задание для AI", "request", "textarea", 'maxlength="4000" placeholder="Например: два поста о стекле в архитектуре"'),
         "Поставить в очередь");
     } else if (action === "new-business") {
       openForm("business", "Новый бизнес", "Укажите название. Материалы можно добавить после создания.",
-        formField("Название", "name", "text", 'maxlength="150" placeholder="Тёплое зерно"'), "Создать бизнес");
+        formField("Название", "name", "text", 'maxlength="150" placeholder="Название компании"'), "Создать бизнес");
     } else if (action === "add-source") {
       openForm("source", "Добавить источник", "Используйте описание бизнеса или конечный URL публичной страницы.",
         '<label class="form-row"><span>Тип источника</span><select name="kind"><option value="text">Описание</option>'
@@ -1184,6 +1187,6 @@ if (demo) {
 useTheme();
 void refresh().catch((error) => {
   root.setAttribute("aria-busy", "false");
-  root.innerHTML = headline("Тираж", "Рабочее пространство", "Telegram Mini App")
+  root.innerHTML = headline("САЛАВАТСТЕКЛО", "Контент-студия", "Telegram Mini App")
     + '<div class="notice" role="alert">' + safe(error.message) + '</div>';
 });
