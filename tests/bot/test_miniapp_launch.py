@@ -1,10 +1,14 @@
 """A first /start must expose the studio even if Telegram rejected the startup menu."""
 
+import asyncio
+from datetime import timedelta
+from unittest.mock import AsyncMock
+
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import GetMe, SendMessage, SetChatMenuButton
-from aiogram.types import User
+from aiogram.methods import GetMe, GetWebhookInfo, SendMessage, SetChatMenuButton
+from aiogram.types import User, WebhookInfo
 
 from app.ai.provider import UnconfiguredAI
 from app.bot.router import STUDIO_BUTTON, STUDIO_TITLE, build_router, install_mini_app_menu
@@ -23,6 +27,8 @@ class FirstContactSession(RecordingSession):
     async def make_request(self, bot, method, timeout=None):
         if isinstance(method, GetMe):
             return User(id=12345, first_name="Studio", username="studio_bot", is_bot=True)
+        if isinstance(method, GetWebhookInfo):
+            return WebhookInfo(url="", has_custom_certificate=False, pending_update_count=0)
         if isinstance(method, SetChatMenuButton):
             self.requests.append(method)
             if self.failures:
@@ -84,11 +90,59 @@ async def test_inline_launch_remains_when_retry_also_fails(studio):
     assert studio.service.ai_usage(OWNER)["used_today"] == 0
 
 
-async def test_home_always_exposes_launch_without_extra_menu_mutation(studio):
+async def test_home_exposes_current_launch_and_repairs_personal_menu(studio):
+    studio.session.failures = 0
     await studio.dispatcher.feed_update(studio.bot, studio.event(button="home"))
     greeting = next(request for request in studio.session.requests if isinstance(request, SendMessage))
     assert launch_button(greeting)[0].web_app.url == URL
-    assert not any(isinstance(request, SetChatMenuButton) for request in studio.session.requests)
+    updated = next(request for request in studio.session.requests if isinstance(request, SetChatMenuButton))
+    assert updated.chat_id == OWNER and updated.menu_button.web_app.url == URL
+
+
+@pytest.mark.parametrize("command", ["/menu", "/cancel"])
+async def test_menu_commands_update_invited_users_after_url_rotation(studio, command):
+    actor = OWNER + 1
+    service = studio.service
+    invite = service.repo.create_access_invite(
+        OWNER, "reviewer", 1, service.now() + timedelta(days=1), service.now(),
+    )
+    service.claim_invite(actor, invite["token"])
+    rotated = "https://rotated.example.com/mini/"
+    service.settings = service.settings.model_copy(update={"mini_app_url": rotated})
+    studio.session.failures = 0
+    await studio.dispatcher.feed_update(studio.bot, studio.event(text=command, actor=actor))
+    greeting = next(r for r in studio.session.requests if isinstance(r, SendMessage))
+    assert launch_button(greeting)[0].web_app.url == rotated
+    updated = next(r for r in studio.session.requests if isinstance(r, SetChatMenuButton))
+    assert updated.chat_id == actor and updated.menu_button.web_app.url == rotated
+    assert studio.service.ai_usage(actor)["used_today"] == 0
+
+
+async def test_startup_refreshes_all_active_members_before_polling_even_after_one_rejection(studio, monkeypatch):
+    service = studio.service
+    for actor, role in [(1001, "operator"), (1002, "reviewer"), (1003, "operator")]:
+        invite = service.repo.create_access_invite(
+            OWNER, role, 1, service.now() + timedelta(days=1), service.now(),
+        )
+        service.claim_invite(actor, invite["token"])
+    service.repo.revoke_access_member(OWNER, 1003, service.now())
+    adapter = studio.runtime.bot
+    await adapter.bot.session.close()
+    adapter.bot = studio.bot
+    adapter.mini_app_url = "https://new-host.example.com/mini/"
+    stop = asyncio.Event()
+
+    async def poll(*args, **kwargs):
+        requests = [r for r in studio.session.requests if isinstance(r, SetChatMenuButton)]
+        assert {r.chat_id for r in requests} == {OWNER, 1001, 1002}
+        assert all(r.menu_button.web_app.url == adapter.mini_app_url for r in requests)
+        assert not any(isinstance(r, SendMessage) for r in studio.session.requests)
+        stop.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(adapter.dispatcher, "start_polling", poll)
+    monkeypatch.setattr(adapter.dispatcher, "stop_polling", AsyncMock())
+    await asyncio.wait_for(adapter.run(stop), timeout=2)
 
 
 async def test_unconfigured_url_omits_launch_and_menu_api(studio):

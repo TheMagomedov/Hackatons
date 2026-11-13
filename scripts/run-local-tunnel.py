@@ -35,7 +35,7 @@ def tunnel_url(line: str) -> str | None:
     host = data.get("address")
     if not isinstance(host, str) or event.get("subject") != host:
         return None
-    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:lhr\.life|localhost\.run)", host):
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:app\.lhr\.life|lhr\.life|localhost\.run)", host):
         return None
     return "https://" + host + "/mini/"
 
