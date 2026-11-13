@@ -2,7 +2,7 @@
   "name": "tirazh-ui-checks",
   "private": true,
   "scripts": {
-    "test:ui:unit": "node tests/ui/transport.cjs && node --test tests/ui/demo-store.test.cjs tests/ui/access.test.cjs tests/ui/navigation.test.cjs",
+    "test:ui:unit": "node tests/ui/transport.cjs && node --test tests/ui/demo-store.test.cjs tests/ui/access.test.cjs tests/ui/navigation.test.cjs tests/ui/session.test.cjs",
     "test:ui": "node tests/ui/smoke.cjs",
     "test:ui:a11y": "node tests/ui/a11y.cjs",
     "test:ui:content": "node tests/ui/content.cjs",

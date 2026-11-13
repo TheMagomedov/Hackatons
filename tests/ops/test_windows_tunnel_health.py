@@ -45,6 +45,25 @@ def test_health_is_bounded_get_no_auth_no_redirect_and_local_proxy_bypass(monkey
     assert handlers[1].proxies == {}
 
 
+@pytest.mark.parametrize("url,bypass", [
+    ("https://studio.tail-example.ts.net:8443/mini/health", True),
+    ("https://STUDIO.TAIL-EXAMPLE.TS.NET/mini/health", True),
+    ("https://studio.lhr.life/mini/health", False),
+    ("https://studio.ts.net.example.com/mini/health", False),
+    ("http://studio.tail-example.ts.net/mini/health", False),
+])
+def test_tailscale_https_health_uses_host_route_without_changing_other_public_probes(monkeypatch, url, bypass):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:10809")
+    build, _, _ = mock_opener(monkeypatch)
+    assert launcher.healthy_endpoint(url)
+    handlers = build.call_args.args
+    assert isinstance(handlers[0], launcher.NoRedirect)
+    proxies = [handler for handler in handlers if isinstance(handler, launcher.urllib.request.ProxyHandler)]
+    assert len(proxies) == int(bypass)
+    if bypass:
+        assert proxies[0].proxies == {}
+
+
 @pytest.mark.parametrize("body,status,mime", [
     (GOOD, 302, "application/json"), (GOOD, 502, "application/json"), (GOOD, 200, "text/html"),
     (b"x" * 4097, 200, "application/json"), (b"broken", 200, "application/json"),

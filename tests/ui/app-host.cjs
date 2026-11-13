@@ -55,16 +55,21 @@ async function application(access = {role:'reviewer',can_write:false}, preview =
     TirazhDemoStore:{read:() => ({data:null}),write:() => true},
     TirazhHTTP:{request:async (url,requestOptions) => { requests.push({url,options:requestOptions}); return responder(url,requestOptions); }},
   };
-  const location = {hash:''};
+  if (options.sdk === false) delete window.Telegram;
+  if (options.nativeBridge) window.TelegramWebviewProxy = options.nativeBridge;
+  const location = {hash:options.hash || '',reload() {}};
+  const timers=new Map(); let timerId=0;
   const context = vm.createContext({window,document,location,history:{replaceState(_state,_unused,hash) { location.hash=hash; }},
     structuredClone,URLSearchParams,URL,crypto:{randomUUID:() => 'test-id'},Option:function(text,value) { return {text,value}; },
     getComputedStyle:() => ({getPropertyValue:() => '#ffffff'}),matchMedia:() => ({matches:true}),
-    setTimeout:() => 1,clearTimeout() {},
+    setTimeout:handler => { const id=++timerId; timers.set(id,handler); return id; },clearTimeout:id => timers.delete(id),
   });
+  vm.runInContext(fs.readFileSync(path.join(staticDir,'session.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(staticDir,'access.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(staticDir,'app.js'),'utf8'),context);
   await tick();
   return {context,nodes,listeners,requests,data,nav,defaultResponder,
-    setResponder:next => { responder=next; },run:code => vm.runInContext(code,context)};
+    setResponder:next => { responder=next; },run:code => vm.runInContext(code,context),
+    fireTimers:() => { const pending=[...timers.values()]; timers.clear(); pending.forEach(handler => handler()); }};
 }
 module.exports = {application,jsonReply,deferred,tick};

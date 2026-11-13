@@ -6,6 +6,7 @@ takeover. Existing listeners must prove their protocol identity before reuse.
 
 import argparse
 import hmac
+import http.client
 import json
 import os
 import shutil
@@ -34,17 +35,21 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
 
-def request_json(url, key=None):
+def request_json(url, key=None, *, payload=None):
     headers = {"Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, allow_nan=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
     if key:
         headers["Authorization"] = "Bearer " + key
     try:
-        with HTTP.open(urllib.request.Request(url, headers=headers), timeout=5) as response:
+        with HTTP.open(urllib.request.Request(url, data=body, headers=headers), timeout=5) as response:
             content = response.read(1_048_577)
             return response.status, json.loads(content) if len(content) <= 1_048_576 else None
     except urllib.error.HTTPError as error:
         return error.code, None
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException, RecursionError):
         return None, None
 
 
@@ -82,6 +87,79 @@ def gateway_ready(base, key):
     return status == 200 and isinstance(models, dict) and isinstance(models.get("data"), list) and any(
         isinstance(item, dict) and item.get("id") == "flux1-dev" for item in models["data"]
     )
+
+
+def local_text_configuration(values, root):
+    if values.get("AI_PROVIDER_FACTORY") != "app.ai.local:build_provider":
+        return None
+    from app.ai.local import LocalAISettings
+    from app.shared.errors import InvalidInput
+
+    try:
+        settings = LocalAISettings.from_env(values)
+    except InvalidInput:
+        raise BootstrapError("Проверьте LOCAL_TEXT_*: разрешён только локальный Ollama на 127.0.0.1.") from None
+    return {
+        "settings": settings, "port": urlsplit(settings.base_url).port,
+        "executable": (root / values["OLLAMA_EXE_PATH"]).resolve() if values.get("OLLAMA_EXE_PATH") else None,
+        "models": (root / values["OLLAMA_MODELS_PATH"]).resolve() if values.get("OLLAMA_MODELS_PATH") else None,
+    }
+
+
+def ollama_server_ready(settings):
+    status, version = request_json(settings.base_url + "/api/version")
+    if status != 200 or not isinstance(version, dict) or not isinstance(version.get("version"), str):
+        return False
+    if not version["version"].strip():
+        return False
+    status, info = request_json(settings.base_url + "/api/status")
+    return (
+        status == 200 and isinstance(info, dict) and isinstance(info.get("cloud"), dict)
+        and info["cloud"].get("disabled") is True
+    )
+
+
+def ollama_model_ready(settings):
+    status, model = request_json(settings.base_url + "/api/show", payload={"model": settings.model, "verbose": False})
+    return (
+        status == 200 and isinstance(model, dict) and not model.get("error")
+        and not model.get("remote_host") and not model.get("remote_model")
+        and isinstance(model.get("details"), dict) and model["details"].get("format") in ("gguf", "safetensors")
+        and isinstance(model.get("model_info"), dict) and bool(model["model_info"])
+    )
+
+
+def ensure_local_text(config, root, *, check=False):
+    local = config.get("local_text")
+    if local is None:
+        return
+    settings = local["settings"]
+    if not ollama_server_ready(settings):
+        if listening(local["port"]):
+            raise BootstrapError(
+                "Порт Ollama занят, но локальный сервер с cloud.disabled=true не подтверждён. "
+                "Чужой или облачный сервер не будет использован или перезапущен."
+            )
+        if check:
+            raise BootstrapError("Локальный Ollama не готов. --check ничего не запускает и не скачивает.")
+        executable, models = local["executable"], local["models"]
+        if executable is None or not executable.is_file() or executable.name.lower() != "ollama.exe":
+            raise BootstrapError("Укажите OLLAMA_EXE_PATH к заранее установленному ollama.exe.")
+        if models is None or not models.is_dir():
+            raise BootstrapError("Укажите OLLAMA_MODELS_PATH к существующему каталогу локальных весов.")
+        environment = {
+            "OLLAMA_HOST": f"127.0.0.1:{local['port']}", "OLLAMA_MODELS": str(models),
+            "OLLAMA_NO_CLOUD": "1", "OLLAMA_NUM_PARALLEL": "1", "OLLAMA_MAX_LOADED_MODELS": "1",
+            "OLLAMA_DEBUG": "0",
+        }
+        child = start_hidden([str(executable), "serve"], root, "ollama", environment)
+        wait_ready(lambda: ollama_server_ready(settings), child, 30, "Локальный Ollama")
+    if not ollama_model_ready(settings):
+        raise BootstrapError(
+            "Выбранная LOCAL_TEXT_MODEL не подтверждена как установленная локальная модель. "
+            "Подготовьте веса заранее: bootstrap не скачивает модели и не использует облако."
+        )
+    print("Ollama подтвердил отключение облака и наличие выбранной локальной модели.", flush=True)
 
 
 def configuration(root):
@@ -127,7 +205,10 @@ def configuration(root):
         elif candidate.suffix.lower() == ".cmd":
             candidate = candidate.parent / "Flux_4070Ti_Starter" / "start_flux.py"
         starter = candidate
-    return {"port": int(port), "app_port": int(app_port), "base": image_base, "key": key,
+    local_text = local_text_configuration(values, root)
+    if local_text and local_text["port"] in {8188, 8190, 8192, 8193, int(port), int(app_port)}:
+        raise BootstrapError("Ollama нужен отдельный локальный порт, по умолчанию 11434.")
+    return {"port": int(port), "app_port": int(app_port), "base": image_base, "key": key, "local_text": local_text,
             "starter": starter, "gateway_env": gateway_env, "app_env": values}
 
 
@@ -181,6 +262,7 @@ def bootstrap(root, *, check=False, dependencies_only=False, foreground=False):
     config = configuration(root)
     app_env = None if dependencies_only else application_environment(config, root)
     with InstanceLock(root / "var/windows-run/bootstrap.lock"):
+        ensure_local_text(config, root, check=check)
         ready = {port: core_ready(port) for port in (8188, 8190, 8192)}
         for port, valid in ready.items():
             if not valid and listening(port):
