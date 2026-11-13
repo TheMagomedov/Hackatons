@@ -153,6 +153,7 @@ async function stopFixture(child) {
   const manualCalls=[];
   page.on('request',request=>{if(request.method()==='POST') manualCalls.push(new URL(request.url()).pathname);});
   await page.locator('.dock [data-view="business"]').click();
+  await page.getByRole('heading',{name:'Реальный API · тестовая компания',exact:true}).waitFor();
   const previousBusiness=await page.locator('#workspace').inputValue();
   const previousProfile=(await backendAPI('get','/state?business='+previousBusiness)).business;
   await page.getByRole('button',{name:'Новый бизнес',exact:true}).click();
@@ -170,9 +171,19 @@ async function stopFixture(child) {
   const createdBusiness=page.waitForResponse(response=>response.url().endsWith('/api/business') && response.request().method()==='POST');
   await page.locator('#dialog').getByRole('button',{name:'Создать бизнес',exact:true}).click();
   const newBusiness=await(await createdBusiness).json();
-  await capturedNewState;
+  const manualBusiness=newBusiness.id;
+  let createdStateTimer;
+  await Promise.race([capturedNewState,new Promise((_,reject)=>{
+   createdStateTimer=setTimeout(()=>reject(new Error('Created business state was not requested within 30 seconds')),30000);
+  })]).finally(()=>clearTimeout(createdStateTimer));
+  assert.notEqual(manualBusiness,previousBusiness);
+  assert.equal(await page.locator('#dialog').evaluate(dialog=>dialog.open),true,'Creation keeps the dialog open until the new business is rendered');
+  assert.equal(await page.locator('#workspace').inputValue(),previousBusiness,'The delayed state leaves the previous business selected in the rendered workspace');
   assert.equal(await page.locator('#main').getAttribute('aria-busy'),'true','New company state replaces old actions while loading');
   assert.equal(await page.locator('#main [data-action]').count(),0,'Old company actions cannot be used during creation refresh');
+  await page.keyboard.press('Escape');
+  await page.locator('#dialog').waitFor({state:'hidden'});
+  assert.equal(await page.getByRole('button',{name:'Заполнить вручную',exact:true}).count(),0,'Dismissing creation does not expose stale profile actions');
   releaseNewState();
   await page.getByRole('button',{name:'Повторить загрузку',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Заполнить вручную',exact:true}).count(),0,'Failed refresh does not restore old-company edits');
@@ -190,10 +201,13 @@ async function stopFixture(child) {
   assert.equal((await profileResponse.json()).id,newBusiness.id);
   assert.deepEqual((await backendAPI('get','/state?business='+previousBusiness)).business,previousProfile,'Creating and filling a new company does not modify the original profile');
   await page.getByRole('button',{name:'Подтвердить',exact:true}).click();
+  const unchangedProfile=(await backendAPI('get','/state?business='+previousBusiness)).business;
+  assert.deepEqual(unchangedProfile.profile,previousProfile.profile,'Creating and editing a new business leaves the previous profile unchanged');
+  assert.equal(unchangedProfile.profile_version,previousProfile.profile_version);
   await page.getByRole('button',{name:'Подключить канал',exact:true}).click();
   await page.locator('input[name="value"]').fill('@manual_test_channel');
   await page.getByRole('button',{name:'Проверить канал',exact:true}).click();
-  const manualBusiness=await page.locator('#workspace').inputValue();
+  assert.equal(await page.locator('#workspace').inputValue(),manualBusiness);
   await page.locator('.dock [data-view="content"]').click();
   await page.getByRole('button',{name:'Создать',exact:true}).click();
   await page.locator('textarea[name="text"]').fill('Ручной пост с настоящим сохранением изображения');
@@ -334,6 +348,66 @@ async function stopFixture(child) {
   await page.locator('.post-card[data-id="'+manualPost.id+'"]').waitFor();
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness);
   await page.unroute(postsPattern);await page.unroute(statePattern);
+  // Startup can select a business before its first content request fails. Explicit GET retry must still work.
+  const retryPage=await browser.newPage({viewport:{width:390,height:844},reducedMotion:'reduce'});
+  try {
+   retryPage.on('pageerror',error=>errors.push(error.message));
+   await retryPage.route('https://telegram.org/js/telegram-web-app.js',route=>route.fulfill({contentType:'application/javascript',body:`window.Telegram={WebApp:{initData:${JSON.stringify(initData)},colorScheme:'dark',isVersionAtLeast:()=>false,ready:()=>{},expand:()=>{},onEvent:()=>{}}};`}));
+   const retryStates=[];
+   let retryPosts=0;
+   await retryPage.route('**/mini/api/state**',async route=>{
+    const response=await route.fetch();
+    assert.equal(response.status(),200);
+    const state=await response.json();assert.ok(state.business?.id);retryStates.push(state.business.id);
+    await route.fulfill({response});
+   });
+   await retryPage.route('**/mini/api/business/*/posts?*',async route=>{
+    if(++retryPosts===1) await route.fulfill({status:503,contentType:'application/json',body:'{"error":"Temporary content failure after state loaded"}'});
+    else await route.continue();
+   });
+   await retryPage.goto(fixture.url+'#content');
+   await retryPage.getByRole('button',{name:'Повторить загрузку',exact:true}).waitFor();
+   assert.equal(retryStates.length,1,'Initial state succeeded before the content error');
+   assert.equal(retryPosts,1,'Failed content GET is not retried automatically');
+   assert.equal(await retryPage.locator('#main').getAttribute('data-business')||'','','No business content has rendered yet');
+   await retryPage.getByRole('button',{name:'Повторить загрузку',exact:true}).click();
+   await retryPage.getByRole('heading',{name:'Посты',exact:true}).waitFor();
+   assert.equal(retryStates.length,2,'Explicit retry refreshes the selected business');
+   assert.equal(retryPosts,2,'Explicit retry reloads the failed content exactly once');
+   assert.equal(retryStates[1],retryStates[0]);
+   assert.equal(await retryPage.locator('#main').getAttribute('data-business'),retryStates[0]);
+   assert.equal(await retryPage.locator('#workspace').inputValue(),retryStates[0]);
+  } finally {await retryPage.close();}
+  // A saved company whose state failed to load is reused when the creation form is submitted again.
+  const creationRetryPage=await browser.newPage({viewport:{width:390,height:844},reducedMotion:'reduce'});
+  try {
+   creationRetryPage.on('pageerror',error=>errors.push(error.message));
+   await creationRetryPage.route('https://telegram.org/js/telegram-web-app.js',route=>route.fulfill({contentType:'application/javascript',body:`window.Telegram={WebApp:{initData:${JSON.stringify(initData)},colorScheme:'dark',isVersionAtLeast:()=>false,ready:()=>{},expand:()=>{},onEvent:()=>{}}};`}));
+   await creationRetryPage.goto(fixture.url+'#business');
+   await creationRetryPage.getByRole('button',{name:'Новый бизнес',exact:true}).click();
+   await creationRetryPage.locator('input[name="name"]').fill('Повтор сохранённой компании');
+   let creationPosts=0,creationStateAttempts=0;
+   creationRetryPage.on('request',request=>{
+    if(request.method()==='POST' && request.url().endsWith('/api/business')) creationPosts++;
+   });
+   await creationRetryPage.route('**/mini/api/state?business=*',async route=>{
+    if(++creationStateAttempts===1) await route.fulfill({status:503,contentType:'application/json',body:'{"error":"Состояние новой компании недоступно"}'});
+    else await route.continue();
+   });
+   const createButton=creationRetryPage.locator('#dialog').getByRole('button',{name:'Создать бизнес',exact:true});
+   await createButton.click();
+   await creationRetryPage.locator('#form-error').getByText('Состояние новой компании недоступно',{exact:true}).waitFor();
+   assert.equal(await creationRetryPage.locator('#dialog').evaluate(dialog=>dialog.open),true,'Failed state loading preserves the submitted creation form');
+   const savedBusiness=await creationRetryPage.locator('form[data-form="business"]').getAttribute('data-created-business');
+   assert.ok(savedBusiness,'The completed create response is retained for an explicit retry');
+   assert.equal(creationPosts,1);assert.equal(creationStateAttempts,1);
+   await createButton.click();
+   await creationRetryPage.locator('#dialog').waitFor({state:'hidden'});
+   await creationRetryPage.getByRole('heading',{name:'Повтор сохранённой компании',exact:true}).waitFor();
+   assert.equal(await creationRetryPage.locator('#workspace').inputValue(),savedBusiness);
+   assert.equal(creationPosts,1,'Retrying a saved company refreshes its state without creating a duplicate');
+   assert.equal(creationStateAttempts,2,'Only the explicit retry requests the company state again');
+  } finally {await creationRetryPage.close();}
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}

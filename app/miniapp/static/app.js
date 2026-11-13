@@ -690,6 +690,7 @@ function render() {
   });
   root.setAttribute("aria-busy", "false");
   delete root.dataset.loadingBusiness;
+  root.dataset.business = b?.id || "";
   const nextScreen = b ? view : "empty";
   const screenChanged = root.dataset.screen !== nextScreen;
   root.dataset.screen = nextScreen;
@@ -901,6 +902,8 @@ document.addEventListener("click", async (event) => {
     selectionFeedback();
     return;
   }
+  // Keep read-only recovery available; other actions must target the rendered business.
+  if (action !== "refresh" && (root.dataset.business || "") !== businessId) { notify("Дождитесь загрузки выбранного бизнеса."); return; }
   control.disabled = true;
   try {
     if (action === "content-layout") {
@@ -1070,7 +1073,7 @@ dialog.addEventListener("submit", async (event) => {
   const fieldStates = [...form.elements].filter(field => field !== submit).map(field => [field, field.disabled]);
   for (const [field] of fieldStates) field.disabled = true;
   const {form: action, id, revision} = form.dataset;
-  const submittingBusiness = businessId;
+  let submittingBusiness = businessId;
   const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
     if (action === "manual-profile") {
@@ -1112,11 +1115,13 @@ dialog.addEventListener("submit", async (event) => {
       }
       if (currentForm()) dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
     } else if (action === "business") {
-      const business = await api("/business", values);
+      const business = form.dataset.createdBusiness ? {id: form.dataset.createdBusiness} : await api("/business", values);
+      form.dataset.createdBusiness = business.id;
       if (currentForm()) {
-        dialog.close(); businessId = business.id; view = "business";
+        businessId = business.id; submittingBusiness = business.id; view = "business";
       }
       await refresh();
+      if (currentForm() && businessId === business.id) dialog.close();
       notify("Бизнес создан.");
     } else if (action === "edit") {
       const edit = {revision: Number(revision), text: values.text};
@@ -1149,6 +1154,7 @@ root.addEventListener("submit", async (event) => {
   }
   if (!form.matches("[data-chat]")) return;
   event.preventDefault();
+  if ((root.dataset.business || "") !== businessId) { notify("Дождитесь загрузки выбранного бизнеса."); return; }
   if (!canWrite()) { announceError(new Error(accessRules.reason)); return; }
   const submit = form.querySelector("button");
   if (submit.disabled) return;
