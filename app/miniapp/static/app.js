@@ -314,33 +314,44 @@ function postArt(post, additionalClass = "") {
 }
 async function loadImages(container) {
   if (demo || !telegram?.initData) return;
-  await Promise.all([...container.querySelectorAll("[data-asset]")].map(async (node) => {
-    const id = node.dataset.asset;
-    if (!id) return;
-    try {
-      if (!imageUrls.has(id)) {
-        imageUrls.set(id, window.TirazhHTTP.request("./api/asset/" + path(id), {
-          headers: {"X-Telegram-Init-Data": telegram.initData}, cache: "no-store",
-        }).then(async (response) => {
-          if (!response.ok) throw new Error("Нет изображения");
-          return URL.createObjectURL(await response.blob());
-        }).catch(() => { imageUrls.delete(id); return null; }));
-      }
-      const url = await imageUrls.get(id);
-      if (url && node.isConnected) {
-        const img = new Image();
-        img.decoding = "async";
-        img.src = url;
-        img.alt = "Изображение к посту";
-        node.replaceChildren(img);
-        await img.decode().catch(() => {});
-        if (node.closest("#dialog-body") && img.naturalWidth > 0) {
-          dialogBody.querySelector("[data-requires-image]")?.removeAttribute("disabled");
-        }
-      }
-      if (!url && node.isConnected) node.innerHTML = '<span class="image-error">Не удалось загрузить изображение. Откройте пост заново перед согласованием.</span>';
-    } catch { if (node.isConnected) node.innerHTML = '<span class="image-error">Изображение недоступно. Обновите предпросмотр.</span>'; }
-  }));
+  await Promise.all([...container.querySelectorAll("[data-asset]")].map(loadImage));
+}
+async function loadImage(node) {
+  const id = node?.dataset.asset;
+  if (!id || demo || !telegram?.initData) return;
+  node.setAttribute("aria-busy", "true");
+  node.innerHTML = icon("image");
+  if (!imageUrls.has(id)) {
+    const pending = window.TirazhHTTP.request("./api/asset/" + path(id), {
+      headers: {"X-Telegram-Init-Data": telegram.initData}, cache: "no-store", timeoutMs: 60000,
+    }).then(async (response) => {
+      if (!response.ok) throw new Error("Нет изображения");
+      const url = URL.createObjectURL(await response.blob());
+      const check = new Image(); check.src = url;
+      try {
+        await check.decode();
+        if (!check.naturalWidth || !check.naturalHeight) throw new Error("Неверное изображение");
+      } catch (error) { URL.revokeObjectURL(url); throw error; }
+      return url;
+    }).catch(() => null); // Keep failures cached until an explicit image retry.
+    imageUrls.set(id, pending);
+  }
+  try {
+    const url = await imageUrls.get(id);
+    if (!url) throw new Error("Изображение недоступно");
+    const img = new Image(); img.decoding = "async"; img.src = url; img.alt = "Изображение к посту";
+    await img.decode();
+    if (!node.isConnected || node.dataset.asset !== id) return;
+    node.replaceChildren(img);
+    if (node.closest("#dialog-body") && img.naturalWidth > 0 && img.naturalHeight > 0) {
+      dialogBody.querySelector("[data-requires-image]")?.removeAttribute("disabled");
+    }
+  } catch {
+    if (node.isConnected) {
+      node.innerHTML = '<span class="image-error"><span>Не удалось загрузить изображение.</span>'
+        + (node.closest("button") ? '' : button("Загрузить изображение", "retry-image", "secondary", "image")) + '</span>';
+    }
+  } finally { if (node.isConnected) node.setAttribute("aria-busy", "false"); }
 }
 function postCards(posts) {
   return '<div class="post-list">' + posts.map((post) => {
@@ -669,45 +680,55 @@ function postQuery(page) {
 async function loadPage() {
   const epoch = ++pageRequest;
   const id = businessId;
-  if (!id) { render(); return; }
-  if (view === "content") {
-    if (contentLayout === "calendar") {
-      if (!calendarMonth) calendarMonth = dayKey(new Date()).slice(0, 7);
-      if (!selectedDay || !selectedDay.startsWith(calendarMonth)) selectedDay = calendarMonth + "-01";
-      const result = await api("/business/" + path(id) + "/calendar?month=" + path(calendarMonth));
-      if (epoch !== pageRequest) return;
-      calendarData = result;
-    } else {
-      const result = await api("/business/" + path(id) + "/posts?" + postQuery(0));
-      if (epoch !== pageRequest) return;
-      content = {...result, page: 0};
+  const screen = view;
+  const current = () => epoch === pageRequest && id === businessId && screen === view;
+  if (!id) { render(); return true; }
+  try {
+    if (screen === "content") {
+      if (contentLayout === "calendar") {
+        if (!calendarMonth) calendarMonth = dayKey(new Date()).slice(0, 7);
+        if (!selectedDay || !selectedDay.startsWith(calendarMonth)) selectedDay = calendarMonth + "-01";
+        const result = await api("/business/" + path(id) + "/calendar?month=" + path(calendarMonth));
+        if (!current()) return false;
+        calendarData = result;
+      } else {
+        const result = await api("/business/" + path(id) + "/posts?" + postQuery(0));
+        if (!current()) return false;
+        content = {...result, page: 0};
+      }
     }
-  }
-  if (view === "work") {
-    const [result, history] = await Promise.all([api("/business/" + path(id) + "/control"), api("/business/" + path(id) + "/history")]);
-    if (epoch !== pageRequest) return;
-    controls = result;
-    conversation = history.items;
-  }
-  if (view === "reports") {
-    const result = await api("/business/" + path(id) + "/report");
-    if (epoch !== pageRequest) return;
-    report = result;
-  }
-  if (epoch === pageRequest) render();
+    if (screen === "work") {
+      const [result, history] = await Promise.all([api("/business/" + path(id) + "/control"), api("/business/" + path(id) + "/history")]);
+      if (!current()) return false;
+      controls = result;
+      conversation = history.items;
+    }
+    if (screen === "reports") {
+      const result = await api("/business/" + path(id) + "/report");
+      if (!current()) return false;
+      report = result;
+    }
+    if (!current()) return false;
+    render();
+    return true;
+  } catch (error) { if (!current()) return false; throw error; }
 }
 async function refresh() {
   const epoch = ++stateRequest;
-  const result = await api("/state" + (businessId ? "?business=" + path(businessId) : ""));
-  if (epoch !== stateRequest) return;
-  state = result;
-  if (!demo && state.runtime_mode === "demo") {
-    const banner = $("#mode-banner"); banner.hidden = false;
-    banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовый backend. AI и публикации имитируются; данные сохраняются.</span>';
-  }
-  businessId = state.business?.id || "";
-  persistDemo();
-  await loadPage();
+  // Invalidate page responses immediately, including while the new state is in flight.
+  ++pageRequest;
+  try {
+    const result = await api("/state" + (businessId ? "?business=" + path(businessId) : ""));
+    if (epoch !== stateRequest) return false;
+    state = result;
+    if (!demo && state.runtime_mode === "demo") {
+      const banner = $("#mode-banner"); banner.hidden = false;
+      banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовый backend. AI и публикации имитируются; данные сохраняются.</span>';
+    }
+    businessId = state.business?.id || "";
+    persistDemo();
+    return await loadPage();
+  } catch (error) { if (epoch !== stateRequest) return false; throw error; }
 }
 async function navigate(next, filter = "") {
   if (!views.has(next)) return;
@@ -715,7 +736,7 @@ async function navigate(next, filter = "") {
   statusFilter = filter;
   selectionFeedback();
   history.replaceState(null, "", "#" + next);
-  await loadPage();
+  if (!await refresh()) return;
   root.focus({preventScroll: true});
   window.scrollTo({top: 0, behavior: "instant"});
 }
@@ -768,7 +789,7 @@ function showPost(post) {
     + statusLabel(post.status) + '<span class="date">Версия ' + post.revision + ' · Профиль v' + (post.profile_version ?? '—')
     + '</span>' + (post.content_origin === 'manual' ? '<span class="date">Создан вручную</span>' : '') + '</div><p class="post-text">' + safe(post.text) + '</p>'
     + (staleProfile ? '<div class="notice approval-warning">Профиль бизнеса изменился. Проверьте факты и обновите контекст перед согласованием.</div>' : '')
-    + (staleChannel ? '<div class="notice approval-warning">Подключён другой канал. Проверьте назначение поста в Telegram-боте.</div>' : '')
+    + (staleChannel ? '<div class="notice approval-warning">Канал изменился. Создайте новый черновик для текущего канала.</div>' : '')
     + ((post.warnings || []).length ? '<div class="notice approval-warning"><strong>Перед публикацией</strong><ul>'
       + post.warnings.map(w => '<li>' + safe(w) + '</li>').join('') + '</ul></div>' : '')
     + '<details class="post-sources"><summary>Источники фактов · ' + (post.used_source_ids || []).length + '</summary><ul>'
@@ -876,7 +897,11 @@ document.addEventListener("click", async (event) => {
         + '<label class="form-row"><span>Дата и время (необязательно)</span><input name="scheduled_at" type="datetime-local"></label>'
         + '<p class="manual-hint">Ввод в часовом поясе устройства. Календарь покажет время в ' + safe(state.business.timezone) + '.</p>', "Сохранить черновик");
     } else if (action === "refresh") {
-      await refresh(); notify("Данные обновлены.");
+      if (await refresh()) notify("Данные обновлены.");
+    } else if (action === "retry-image") {
+      const node = control.closest("[data-asset]");
+      imageUrls.delete(node.dataset.asset);
+      await loadImage(node);
     } else if (action === "automation") {
       const b = state.business;
       openForm("automation", "Автоподготовка", "AI готовит материалы по расписанию. Каждый готовый пост ждёт отдельного согласования.",
@@ -1137,6 +1162,19 @@ dialog.addEventListener("change", async event => {
 });
 root.addEventListener("focusin", event => {
   if (event.target.matches('.filters .filter:focus-visible')) event.target.scrollIntoView({block:"nearest", inline:"center", behavior:"instant"});
+  const target = event.target;
+  if (!target.matches("input,textarea,select,button,a,summary") || !target.matches(":focus-visible")) return;
+  const reveal = () => {
+    if (!target.isConnected || document.activeElement !== target) return;
+    const rect = target.getBoundingClientRect();
+    const top = Math.max(0, $(".topbar").getBoundingClientRect().bottom) + 8;
+    const dock = $(".dock").getBoundingClientRect();
+    const bottom = (dock.height ? Math.min(innerHeight, dock.top) : innerHeight) - 8;
+    if (rect.bottom > bottom) window.scrollBy({top: Math.min(rect.bottom - bottom, rect.top - top), behavior: "instant"});
+    else if (rect.top < top) window.scrollBy({top: rect.top - top, behavior: "instant"});
+  };
+  reveal();
+  requestAnimationFrame(reveal);
 });
 root.addEventListener("keydown", async event => {
   const day = event.target.closest('[data-action="calendar-day"]');
@@ -1188,5 +1226,6 @@ useTheme();
 void refresh().catch((error) => {
   root.setAttribute("aria-busy", "false");
   root.innerHTML = headline("САЛАВАТСТЕКЛО", "Контент-студия", "Telegram Mini App")
-    + '<div class="notice" role="alert">' + safe(error.message) + '</div>';
+    + '<div class="notice" role="alert">' + safe(error.message) + '</div>'
+    + button("Повторить загрузку", "refresh", "primary");
 });

@@ -64,7 +64,7 @@ body:not([data-theme="light"]) .primary:hover {background:#FFFFFF;color:var(--br
 .secondary {background:var(--surface);border-color:var(--line)}
 .secondary:hover {background:var(--raised);filter:none}
 .text-button {font-size:12px;font-weight:600}
-.mode-banner {background:var(--raised);font-size:12px;padding:8px 24px;gap:10px;border-bottom:0}
+.mode-banner {display:grid;grid-template-columns:max-content minmax(0,750px) max-content;align-items:center;justify-content:center;background:var(--raised);font-size:12px;padding:8px 24px;gap:10px;border-bottom:0}
 .demo-pill {border-color:var(--subtle);color:var(--ink);border-radius:3px;font-weight:600;letter-spacing:.08em}
 .demo-reset {border-radius:4px;font-size:11px;font-weight:500;min-height:44px}
 #main {width:min(100%,980px);padding:32px 28px calc(110px + var(--safe-bottom))}
@@ -135,7 +135,12 @@ body:not([data-theme="light"]) .primary:hover {background:#FFFFFF;color:var(--br
 .business-panel h2,.chat-panel h2,.chart h2 {font-size:23px;letter-spacing:0;line-height:1.25}
 .business-panel,.chat-panel {padding:22px}
 .business-panel p,.business-panel ul,.chat-panel>p {font-size:14px;line-height:1.65}
+.business-panel p+p {margin-top:10px}
 .business-panel .button {margin-top:14px}
+.empty {border-radius:8px;line-height:1.6;padding:20px}
+.chart .created {fill:var(--mint)}
+.chart .sent {fill:transparent;stroke:var(--blue);stroke-width:2;vector-effect:non-scaling-stroke}
+.chart .legend span+span i {background:transparent;border:2px solid var(--blue)}
 .setup-step,.task-card,.chat-message,.chat-form textarea,.publication-target {border-radius:6px}
 .setup-step {padding:14px}
 .setup-step strong {font-size:13px}
@@ -168,13 +173,15 @@ body:not([data-theme="light"]) .primary:hover {background:#FFFFFF;color:var(--br
 dialog {border-radius:12px;box-shadow:0 20px 75px #28505540}
 dialog::backdrop {background:#285055b8}
 .dialog-inner {padding:26px}
-.dialog-inner h2 {font-family:"Intro Black","Avenir Next Cyr",sans-serif;font-size:25px;letter-spacing:0;line-height:1.18;font-weight:900}
+.dialog-inner h2 {font-family:"Intro Black","Avenir Next Cyr",sans-serif;font-size:25px;letter-spacing:0;line-height:1.18;font-weight:900;min-height:44px}
 .dialog-inner h2+p,.dialog-desc {font-size:14px;line-height:1.6;margin-top:11px}
 .form-row {font-size:14px;font-weight:600;gap:8px}
 .form-row input,.form-row select,.form-row textarea {border-radius:6px;background:var(--surface);padding:11px 12px;font-weight:400}
 .form-row textarea {min-height:110px}
 .manual-image-preview,.manual-image-preview img,.preview-art {border-radius:6px}
 .post-text {font-size:15px;line-height:1.65;margin-top:16px}
+.preview-art .image-error {display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;width:100%;min-height:180px;padding:24px;color:var(--muted);background:var(--raised);font-size:14px;line-height:1.6}
+.preview-art .image-error .button {font-size:13px;min-height:44px}
 .post-details {gap:9px}
 .post-sources {font-size:13px}
 .publication-target strong {font-size:14px}
@@ -268,6 +275,9 @@ dialog::backdrop {background:#285055b8}
   .page-head {gap:14px;margin-bottom:20px}
   .page-head h1 {font-size:32px}
   .page-head p:not(.eyebrow) {font-size:13px}
+  #main[data-screen="business"] .page-head>div {flex-basis:100%}
+  #main[data-screen="business"] .page-head h1 {font-size:clamp(24px,6.5vw,32px)}
+  #main[data-screen="business"] .page-head>.button {margin-left:auto}
   .content-create-actions .button {font-size:13px;min-height:46px;padding-inline:14px}
   .content-toolbar {margin-top:18px;gap:10px}
   .content-search input {font-size:16px;min-height:46px}
@@ -281,6 +291,7 @@ dialog::backdrop {background:#285055b8}
   .business-panel,.chat-panel {padding:18px}
   .business-panel h2,.chat-panel h2,.chart h2 {font-size:21px}
   .business-panel p,.business-panel ul,.chat-panel>p {font-size:13px}
+  .chart svg text {font-size:20px}
   .cal-panel {padding:17px 11px}
   .cal-header h2 {font-size:20px}.cal-header p {font-size:11px}
   .cal-controls {gap:5px}.cal-controls>.button {font-size:11px;padding-inline:9px}
