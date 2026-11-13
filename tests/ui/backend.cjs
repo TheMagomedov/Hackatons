@@ -336,6 +336,36 @@ async function stopFixture(child) {
   await page.locator('.post-card[data-id="'+manualPost.id+'"]').waitFor();
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness);
   await page.unroute(postsPattern);await page.unroute(statePattern);
+  // Startup can select a business before its first content request fails. Explicit GET retry must still work.
+  const retryPage=await browser.newPage({viewport:{width:390,height:844},reducedMotion:'reduce'});
+  try {
+   retryPage.on('pageerror',error=>errors.push(error.message));
+   await retryPage.route('https://telegram.org/js/telegram-web-app.js',route=>route.fulfill({contentType:'application/javascript',body:`window.Telegram={WebApp:{initData:${JSON.stringify(initData)},colorScheme:'dark',isVersionAtLeast:()=>false,ready:()=>{},expand:()=>{},onEvent:()=>{}}};`}));
+   const retryStates=[];
+   let retryPosts=0;
+   await retryPage.route('**/mini/api/state**',async route=>{
+    const response=await route.fetch();
+    assert.equal(response.status(),200);
+    const state=await response.json();assert.ok(state.business?.id);retryStates.push(state.business.id);
+    await route.fulfill({response});
+   });
+   await retryPage.route('**/mini/api/business/*/posts?*',async route=>{
+    if(++retryPosts===1) await route.fulfill({status:503,contentType:'application/json',body:'{"error":"Temporary content failure after state loaded"}'});
+    else await route.continue();
+   });
+   await retryPage.goto(fixture.url+'#content');
+   await retryPage.getByRole('button',{name:'Повторить загрузку',exact:true}).waitFor();
+   assert.equal(retryStates.length,1,'Initial state succeeded before the content error');
+   assert.equal(retryPosts,1,'Failed content GET is not retried automatically');
+   assert.equal(await retryPage.locator('#main').getAttribute('data-business')||'','','No business content has rendered yet');
+   await retryPage.getByRole('button',{name:'Повторить загрузку',exact:true}).click();
+   await retryPage.getByRole('heading',{name:'Посты',exact:true}).waitFor();
+   assert.equal(retryStates.length,2,'Explicit retry refreshes the selected business');
+   assert.equal(retryPosts,2,'Explicit retry reloads the failed content exactly once');
+   assert.equal(retryStates[1],retryStates[0]);
+   assert.equal(await retryPage.locator('#main').getAttribute('data-business'),retryStates[0]);
+   assert.equal(await retryPage.locator('#workspace').inputValue(),retryStates[0]);
+  } finally {await retryPage.close();}
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}

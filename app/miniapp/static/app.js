@@ -884,8 +884,8 @@ document.addEventListener("click", async (event) => {
     selectionFeedback();
     return;
   }
-  // A dismissed dialog must not expose actions from the previous business while its replacement loads.
-  if ((root.dataset.business || "") !== businessId) { notify("Дождитесь загрузки выбранного бизнеса."); return; }
+  // Keep read-only recovery available; other actions must target the rendered business.
+  if (action !== "refresh" && (root.dataset.business || "") !== businessId) { notify("Дождитесь загрузки выбранного бизнеса."); return; }
   control.disabled = true;
   try {
     if (action === "content-layout") {
