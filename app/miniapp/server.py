@@ -1,8 +1,9 @@
 import asyncio
 import json
 import logging
+import re
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -45,6 +46,23 @@ class RevisionInput(Contract):
 class PostEdit(RevisionInput):
     scheduled_at: AwareDatetime | None = None
     text: str | None = Field(default=None, min_length=1, max_length=900)
+    image_asset_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class ManualProfileInput(RevisionInput):
+    description: str = Field(min_length=1, max_length=2000)
+    products: list[str] = Field(default_factory=list, max_length=19)
+    audience: str = Field(default="", max_length=1000)
+    tone: str = Field(default="Дружелюбный, конкретный", min_length=1, max_length=400)
+    constraints: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ManualDraftInput(Contract):
+    text: str = Field(min_length=1, max_length=900)
+    image_asset_id: str = Field(min_length=1, max_length=100)
+    request_id: str = Field(min_length=1, max_length=100)
+    scheduled_at: AwareDatetime | None = None
+    source_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
 class NewJob(Contract):
@@ -90,6 +108,28 @@ async def json_body(request):
         if len(content) > JSON_LIMIT:
             raise web.HTTPRequestEntityTooLarge(max_size=JSON_LIMIT, actual_size=len(content))
     return json.loads(content)
+
+
+async def file_body(request, maximum: int) -> tuple[str, bytes]:
+    if request.content_length is not None and request.content_length > maximum + JSON_LIMIT:
+        raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=request.content_length)
+    if request.content_type != "multipart/form-data":
+        raise InvalidInput("Загрузите файл через форму.")
+    reader = await request.multipart()
+    part = await reader.next()
+    if not isinstance(part, BodyPartReader) or part.name != "file" or not part.filename:
+        raise InvalidInput("Выберите один файл.")
+    if part.headers.get("Content-Encoding") or part.headers.get("Content-Transfer-Encoding"):
+        raise InvalidInput("Сжатые или перекодированные загрузки не поддерживаются.")
+    filename = part.filename.replace("\\", "/").rsplit("/", 1)[-1]
+    content = bytearray()
+    while chunk := await part.read_chunk(64 * 1024):
+        content.extend(chunk)
+        if len(content) > maximum:
+            raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=len(content))
+    if await reader.next() is not None:
+        raise InvalidInput("Загружайте по одному файлу.")
+    return filename, bytes(content)
 
 
 @web.middleware
@@ -178,7 +218,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         if selected is None:
             return web.json_response({"businesses": [], "business": None, "posts": [], "counts": {},
                                       "sources": [], "jobs": [], "usage": svc.ai_usage(actor),
-                                      "runtime_mode": svc.settings.mode})
+                                      "runtime_mode": svc.settings.mode, "capabilities": svc.capabilities(actor)})
         posts = svc.list_posts(actor, selected.id)
         counts = Counter(p.status for p in posts)
         sources = svc.list_sources(actor, selected.id)
@@ -194,6 +234,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             "jobs": [j.model_dump(mode="json") for j in svc.list_jobs(actor, selected.id)[-6:][::-1]],
             "usage": svc.ai_usage(actor),
             "runtime_mode": svc.settings.mode,
+            "capabilities": svc.capabilities(actor),
         })
 
     async def posts(request):
@@ -204,6 +245,10 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         entries = svc.list_posts(actor, request.match_info["id"])[::-1]
         if status := request.query.get("status"):
             entries = [p for p in entries if p.status == PostStatus(status)]
+        if search := request.query.get("search", "").strip():
+            if len(search) > 200:
+                raise InvalidInput("Поисковый запрос должен быть до 200 символов.")
+            entries = [p for p in entries if search.casefold() in p.text.casefold()]
         start = page * PAGE_SIZE
         return web.json_response({
             "items": [p.model_dump(mode="json") for p in entries[start:start + PAGE_SIZE]],
@@ -229,28 +274,51 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         svc, actor = context(request)
         business_id = request.match_info["id"]
         svc.get_business(actor, business_id)
-        maximum = svc.settings.max_upload_bytes
-        if request.content_length is not None and request.content_length > maximum + JSON_LIMIT:
-            raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=request.content_length)
-        if request.content_type != "multipart/form-data":
-            raise InvalidInput("Загрузите PDF как файл.")
-        reader = await request.multipart()
-        part = await reader.next()
-        if not isinstance(part, BodyPartReader) or part.name != "file" or not part.filename:
-            raise InvalidInput("Выберите один PDF-файл.")
-        if part.headers.get("Content-Encoding") or part.headers.get("Content-Transfer-Encoding"):
-            raise InvalidInput("Сжатые или перекодированные загрузки не поддерживаются.")
-        filename = part.filename.replace("\\", "/").rsplit("/", 1)[-1]
+        filename, content = await file_body(request, svc.settings.max_upload_bytes)
         if not filename.lower().endswith(".pdf"):
             raise InvalidInput("Выберите PDF-файл.")
-        content = bytearray()
-        while chunk := await part.read_chunk(64 * 1024):
-            content.extend(chunk)
-            if len(content) > maximum:
-                raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=len(content))
-        if await reader.next() is not None:
-            raise InvalidInput("Загружайте по одному PDF-файлу.")
-        return show(svc.add_pdf_source(actor, business_id, filename, bytes(content)))
+        return show(svc.add_pdf_source(actor, business_id, filename, content))
+
+    async def upload_image(request):
+        svc, actor = context(request)
+        business_id = request.match_info["id"]
+        svc.get_business(actor, business_id)
+        filename, content = await file_body(request, min(svc.settings.max_upload_bytes, 10_000_000))
+        return show(svc.upload_post_image(actor, business_id, filename, content))
+
+    async def manual_profile(request):
+        svc, actor = context(request)
+        body = ManualProfileInput.model_validate(await json_body(request))
+        return web.json_response(business_view(svc.save_manual_profile(
+            actor, request.match_info["id"], body.revision, description=body.description, products=body.products,
+            audience=body.audience, tone=body.tone, constraints=body.constraints,
+        )))
+
+    async def manual_draft(request):
+        svc, actor = context(request)
+        body = ManualDraftInput.model_validate(await json_body(request))
+        return show(svc.create_manual_draft(
+            actor, request.match_info["id"], body.text, body.image_asset_id, body.request_id,
+            scheduled_at=body.scheduled_at, source_ids=body.source_ids,
+        ))
+
+    async def calendar(request):
+        svc, actor = context(request)
+        business_id = request.match_info["id"]
+        business = svc.get_business(actor, business_id)
+        timezone = ZoneInfo(business.timezone)
+        month = request.query.get("month") or svc.now().astimezone(timezone).strftime("%Y-%m")
+        if re.fullmatch(r"\d{4}-\d{2}", month) is None:
+            raise InvalidInput("Укажите месяц в формате ГГГГ-ММ.")
+        first = datetime.strptime(month, "%Y-%m").replace(tzinfo=timezone)
+        entries = svc.list_posts(actor, business_id)
+        selected = [p for p in entries if p.scheduled_at
+                    and p.scheduled_at.astimezone(timezone).year == first.year
+                    and p.scheduled_at.astimezone(timezone).month == first.month]
+        selected.sort(key=lambda p: (p.scheduled_at, p.id))
+        return web.json_response({"month": month, "timezone": business.timezone,
+                                  "items": [p.model_dump(mode="json") for p in selected],
+                                  "unscheduled_count": sum(p.scheduled_at is None for p in entries)})
 
     async def profile(request):
         svc, actor = context(request)
@@ -351,7 +419,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         if action == "edit":
             edit = PostEdit.model_validate(payload)
             return show(svc.edit_post(actor, post_id, edit.revision, text=edit.text,
-                                      scheduled_at=edit.scheduled_at))
+                                      scheduled_at=edit.scheduled_at, image_asset_id=edit.image_asset_id))
         body = RevisionInput.model_validate(payload)
         change = svc.approve_post if action == "approve" else svc.reject_post
         return show(change(actor, post_id, body.revision))
@@ -397,12 +465,16 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     app.add_routes([
         web.get("/mini/", index),
         web.get("/mini/health", health),
-        web.get(r"/mini/{name:styles\.css|overview\.css|app\.js|inter-variable\.woff2|inter-OFL\.txt}", static_file),
+        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|app\.js|demo-store\.js|transport\.js|inter-variable\.woff2|inter-OFL\.txt}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
+        web.get("/mini/api/business/{id}/calendar", calendar),
         web.post("/mini/api/business", create_business),
         web.post("/mini/api/business/{id}/source", add_source),
         web.post("/mini/api/business/{id}/pdf", upload_pdf),
+        web.post("/mini/api/business/{id}/image", upload_image),
+        web.post("/mini/api/business/{id}/profile/manual", manual_profile),
+        web.post("/mini/api/business/{id}/draft", manual_draft),
         web.post("/mini/api/business/{id}/profile/{action:analyze|confirm}", profile),
         web.post("/mini/api/business/{id}/channel", connect),
         web.post("/mini/api/business/{id}/prepare", prepare),

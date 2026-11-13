@@ -582,6 +582,31 @@ class Repository:
             self._audit(conn, "business", business_id, "profile_confirmed", now, version=expected_version)
             return new
 
+    def set_manual_profile(
+        self, business_id: str, expected_version: int, profile: BusinessProfile,
+        source: Source, actor_id: int, now: datetime,
+    ) -> Business:
+        """The owner's source and unconfirmed profile are one revision and one transaction."""
+        with self._transaction() as conn:
+            old = self._business(conn, business_id)
+            if old.owner_id != actor_id:
+                raise Forbidden("Нет доступа к этому бизнесу")
+            if old.profile_version != expected_version:
+                raise Conflict("Версия профиля изменилась. Откройте актуальный профиль.")
+            if source.business_id != business_id or source.kind != "text" or source.asset_id is not None:
+                raise InvalidInput("Некорректный источник ручного профиля")
+            if any(fact.source_ids != [source.id] for fact in profile.facts):
+                raise InvalidInput("Ручной профиль должен ссылаться на сведения владельца")
+            conn.execute("INSERT INTO sources(id,business_id,asset_id,data) VALUES (?,?,NULL,?)",
+                         (source.id, business_id, _dump(source)))
+            new = old.model_copy(update={"profile": profile, "profile_version": expected_version + 1,
+                                         "profile_confirmed": False})
+            self._save_business(conn, new)
+            self._audit(conn, "source", source.id, "created", now, business_id=business_id, actor_id=actor_id)
+            self._audit(conn, "business", business_id, "manual_profile_saved", now,
+                        version=new.profile_version, source_id=source.id, actor_id=actor_id)
+            return new
+
     def set_automation(
         self,
         business_id: str,
@@ -798,12 +823,27 @@ class Repository:
         expected_profile_version: int | None = None,
         expected_channel_id: str | None = None,
         notification: Notification | None = None,
+        manual_request_id: str | None = None,
+        manual_payload_hash: str | None = None,
+        manual_actor_id: int | None = None,
     ) -> list[PostView]:
         now = _utc(now)
         if not 1 <= len(items) <= 5:
             raise InvalidInput("Создавайте от 1 до 5 публикаций за один раз")
         with self._transaction() as conn:
             business = self._business(conn, business_id)
+            manual = any(value is not None for value in (manual_request_id, manual_payload_hash, manual_actor_id))
+            if manual:
+                if (job_id is not None or len(items) != 1 or manual_actor_id != business.owner_id
+                        or not isinstance(manual_request_id, str) or not 1 <= len(manual_request_id) <= 100
+                        or not isinstance(manual_payload_hash, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", manual_payload_hash) is None):
+                    raise InvalidInput("Некорректный запрос ручного черновика")
+                duplicate = self._manual_post(conn, business_id, manual_request_id, manual_payload_hash)
+                if duplicate:
+                    return [duplicate]
+                if not business.profile_confirmed or business.profile is None or not business.channel_id:
+                    raise Conflict("Подтвердите профиль и подключите канал перед созданием поста.")
             if expected_profile_version is not None and business.profile_version != expected_profile_version:
                 raise Conflict("Профиль изменился во время генерации; результат не сохранён")
             if expected_channel_id is not None and business.channel_id != expected_channel_id:
@@ -824,6 +864,8 @@ class Repository:
                     created_at=now,
                     updated_at=now,
                     job_id=job_id,
+                    content_origin="manual" if manual else ("generated" if job_id else "legacy"),
+                    created_by=manual_actor_id if manual else None,
                     **values,
                 )
                 conn.execute(
@@ -863,8 +905,36 @@ class Repository:
                 if changed.rowcount != 1:
                     raise Conflict("Задание уже завершено")
                 self._audit(conn, "job", job.id, "done", now, post_ids=[p.id for p in posts])
-            self._outbox(conn, notification, business_id=business_id, job_id=job_id)
+            if manual:
+                self._audit(conn, "manual_draft", f"{business_id}:{manual_request_id}", "created", now,
+                            post_id=posts[0].id, payload_hash=manual_payload_hash, actor_id=manual_actor_id)
+                if notification is not None:
+                    notification = notification.model_copy(update={"post_id": posts[0].id})
+                self._outbox(conn, notification, business_id=business_id, post_id=posts[0].id)
+            else:
+                self._outbox(conn, notification, business_id=business_id, job_id=job_id)
             return posts
+
+    @staticmethod
+    def _manual_post(conn, business_id: str, request_id: str, payload_hash: str) -> PostView | None:
+        row = conn.execute(
+            "SELECT details FROM audit WHERE entity_type='manual_draft' AND entity_id=? ORDER BY id LIMIT 1",
+            (f"{business_id}:{request_id}",),
+        ).fetchone()
+        if row is None:
+            return None
+        data = json.loads(row["details"])
+        if data["payload_hash"] != payload_hash:
+            raise Conflict("Ключ черновика уже использован для другого материала.")
+        post = Repository._post(conn, data["post_id"])
+        if post.business_id != business_id:
+            raise Forbidden("Черновик относится к другому бизнесу.")
+        return post
+
+    def find_manual_post(self, business_id: str, request_id: str, payload_hash: str) -> PostView | None:
+        with self._reader() as conn:
+            self._business(conn, business_id)
+            return self._manual_post(conn, business_id, request_id, payload_hash)
 
     def get_post(self, post_id: str) -> PostView:
         with self._reader() as conn:

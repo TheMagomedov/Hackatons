@@ -336,3 +336,59 @@ dialog::backdrop {background:#05080ba8;animation:fade-in .2s ease both}
 .page-head {flex-wrap:wrap}
 .page-head>div {min-width:0;flex:1 1 210px}
 .page-head h1 {overflow-wrap:anywhere}
+
+/* Keep controls usable with touch, keyboard navigation and narrow WebViews. */
+html {scroll-padding-top:calc(88px + var(--safe-top));scroll-padding-bottom:calc(96px + var(--safe-bottom))}
+html:has(dialog[open]) {overflow:hidden}
+:where(p,h1,h2,h3,li,summary) {overflow-wrap:anywhere}
+:where(button,a,input,select,textarea,summary) {scroll-margin-block:12px}
+input::placeholder,textarea::placeholder {color:var(--subtle);opacity:1}
+.brand {min-height:44px}
+.icon-button {width:44px;height:44px}
+.workspace {height:46px;min-height:46px}
+.workspace select {min-height:44px}
+.workspace:focus-within {outline:2px solid var(--mint);outline-offset:3px}
+.workspace select:focus-visible {outline:none}
+.desktop-nav button,.text-button,.filter {min-height:44px}
+.button {max-width:100%;min-width:0;white-space:normal;text-align:center;line-height:1.35}
+.filters {padding:6px;margin-inline:-6px;scroll-padding-inline:6px;overscroll-behavior-x:contain}
+.post-card:focus-visible {outline-offset:-4px}
+.report-detail summary,.post-sources summary {min-height:44px;padding-block:12px}
+.report-detail {padding-block:6px}
+.form-row input,.form-row select,.form-row textarea {min-height:44px}
+.checkbox-row {min-height:44px}
+.checkbox-row input {flex:none;margin:0}
+.publication-target>div,.section-top>div,.metric-heading {min-width:0}
+.metric-heading {overflow-wrap:anywhere}
+.publication-target span,.date,.form-error {overflow-wrap:anywhere}
+.chat-form textarea {font-size:16px}
+.conversation {overscroll-behavior-y:contain;scroll-padding-block:12px}
+dialog {
+  max-height:calc(min(100dvh,var(--tg-viewport-height,100dvh)) - var(--safe-top) - 24px);
+  inset-block-end:max(0px,calc(100dvh - var(--tg-viewport-height,100dvh)));
+  overflow:auto;overscroll-behavior:contain;scroll-padding-block:70px 20px;
+}
+.dialog-inner h2 {padding-right:54px}
+.close {
+  position:sticky;top:12px;right:auto;z-index:3;margin:0 0 -44px auto;
+  background:var(--surface);box-shadow:0 0 0 4px var(--surface);
+}
+.dialog-actions>.button {min-height:44px;padding-block:10px}
+@media(max-width:760px) {
+  .workspace-hero .button {min-height:44px}
+}
+@media(max-width:550px) {
+  .theme-button {width:44px;height:44px}
+  .workspace {height:46px}
+  .page-head>.button {min-height:44px}
+  .dialog-inner {padding-top:26px}
+  .close {top:12px;right:auto}
+  .section-top {flex-wrap:wrap}
+  .section-top>.text-button {flex-shrink:0}
+}
+@media(forced-colors:active) {
+  .button,.icon-button,.filter,.post-card,.editorial-card,.metric-card,.dock button {border:1px solid ButtonText}
+  .dock button[aria-current],.filter[aria-pressed=true] {outline:2px solid Highlight;outline-offset:-4px}
+  button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,
+  summary:focus-visible,.workspace:focus-within {outline:2px solid Highlight}
+}

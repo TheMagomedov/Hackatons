@@ -28,7 +28,7 @@ const businessSeed = {
   profile: {description: "Кофейня с завтраками и фильтр-кофе. Спокойное место для начала дня.",
     tone: "Тепло, просто, без суеты", facts: [{text: "В меню есть завтраки и фильтр-кофе."}]},
 };
-const demoWorkspaces = [{
+let demoWorkspaces = [{
   business: structuredClone(businessSeed),
   sources: [{id: "note", name: "Описание кофейни", kind: "text"},
             {id: "menu", name: "Меню завтраков", kind: "pdf"}],
@@ -51,17 +51,26 @@ for (const entry of demoWorkspaces) for (const post of entry.posts) Object.assig
   business_id: entry.business.id, channel_id: entry.business.channel_id, profile_version: 1,
   used_source_ids: ["note"], warnings: [],
 });
-const demoJobs = new Map();
+const restoredDemo = demo ? window.TirazhDemoStore.read() : {data: null, issue: null};
+if (restoredDemo.data) demoWorkspaces = restoredDemo.data.workspaces;
+const demoJobs = new Map((restoredDemo.data?.jobs || []).map(job => [job.id, job]));
+const demoAssets = new Map((restoredDemo.data?.assets || []).map(asset => [asset.id, asset]));
 let state = {businesses: [], business: null, sources: [], posts: [], counts: {}};
 let view = views.has(location.hash.slice(1)) ? location.hash.slice(1) : "overview";
-let businessId = "";
+let businessId = restoredDemo.data?.selectedBusiness || "";
 let statusFilter = "";
 let content = {items: [], more: false, page: 0};
+let contentLayout = "list";
+let searchQuery = "";
+let calendarMonth = "";
+let selectedDay = "";
+let calendarData = {items: [], unscheduled_count: 0};
+let manualPreviewUrl = null;
 let report = null;
 let controls = {jobs: [], operations: [], usage: {}};
 let postRequest = 0;
 let conversation = [];
-const demoConversations = new Map();
+const demoConversations = new Map(restoredDemo.data?.conversations || []);
 let pageRequest = 0;
 let stateRequest = 0;
 let toastTimer;
@@ -128,6 +137,13 @@ function announceError(error) {
   if (dialog.open && $("#form-error")) $("#form-error").textContent = error.message;
   else notify(error.message);
 }
+function persistDemo() {
+  if (!demo) return;
+  const saved = window.TirazhDemoStore.write({workspaces: demoWorkspaces, jobs: [...demoJobs.values()],
+    conversations: [...demoConversations], assets: [...demoAssets.values()], selectedBusiness: businessId});
+  const note = $("#demo-storage-note");
+  if (note) note.textContent = saved ? "Изменения сохраняются в этом браузере." : "Хранилище недоступно или заполнено. Изменения сохраняются только в этой вкладке.";
+}
 function demoApi(url, method, body) {
   const [pathname, query] = url.split("?");
   const params = new URLSearchParams(query);
@@ -141,7 +157,7 @@ function demoApi(url, method, body) {
       return result;
     }, {total: posts.length});
     return {businesses: demoWorkspaces.map(({business: b}) => ({id: b.id, name: b.name})),
-      business, sources, counts, posts: posts.slice(0, 6), upcoming: posts.find((p) => p.status === "approved")};
+      business, sources, counts, posts: posts.slice(0, 6), upcoming: posts.filter(p => p.status === "approved" && p.scheduled_at).sort((a,b) => Date.parse(a.scheduled_at) - Date.parse(b.scheduled_at))[0]};
   }
   if (pathname === "/business" && method === "POST") {
     const business = {id: crypto.randomUUID(), name: body.name, timezone: "Europe/Moscow", profile_version: 0};
@@ -168,10 +184,24 @@ function demoApi(url, method, body) {
         automation_request: body.request, next_generation_at: body.enabled ? body.first_run_at || sampleDate(1, 0) : null});
       return business;
     }
+    if (parts[2] === "calendar") return {month: params.get("month"), timezone: business.timezone,
+      items: posts.filter(post => post.scheduled_at && dayKey(post.scheduled_at, business.timezone).startsWith(params.get("month"))),
+      unscheduled_count: posts.filter(post => !post.scheduled_at).length};
+    if (parts[2] === "draft") {
+      if (!business.profile_confirmed || !business.channel_id) throw new Error("Подтвердите профиль и подключите канал.");
+      const asset = demoAssets.get(body.image_asset_id);
+      if (!asset || asset.business_id !== business.id) throw new Error("Добавьте изображение этой компании.");
+      const post = {id: crypto.randomUUID(), business_id: business.id, channel_id: business.channel_id,
+        profile_version: business.profile_version, used_source_ids: body.source_ids || [], warnings: ["Создано вручную: проверьте факты перед публикацией."],
+        text: body.text, image_asset_id: body.image_asset_id, revision: 1, status: "review", is_demo: true,
+        created_at: new Date().toISOString(), scheduled_at: body.scheduled_at || null, content_origin: "manual"};
+      posts.unshift(post); return post;
+    }
     if (parts[2] === "posts") {
-      const filtered = params.get("status") ? posts.filter((p) => p.status === params.get("status")) : posts;
+      let filtered = params.get("status") ? posts.filter((p) => p.status === params.get("status")) : posts;
+      if (params.get("search")) filtered = filtered.filter(post => post.text.toLocaleLowerCase("ru").includes(params.get("search").toLocaleLowerCase("ru")));
       const start = Number(params.get("page") || 0) * 12;
-      return {items: filtered.slice(start, start + 12), more: filtered.length > start + 12};
+      return {items: filtered.slice(start, start + 12), more: filtered.length > start + 12, total: filtered.length};
     }
     if (parts[2] === "source") {
       sources.push({id: crypto.randomUUID(), name: body.kind === "url" ? body.value : "Описание бизнеса",
@@ -185,7 +215,13 @@ function demoApi(url, method, body) {
       return business;
     }
     if (parts[2] === "profile") {
-      if (parts[3] === "analyze") {
+      if (parts[3] === "manual") {
+        if (body.revision !== business.profile_version) throw new Error("Обновите профиль и попробуйте ещё раз.");
+        business.profile = {description: body.description, tone: body.tone || "Понятно и по делу", products: body.products || [],
+          audience: body.audience || "", constraints: body.constraints || [], facts: [{text: body.description}]};
+        business.profile_version++; business.profile_confirmed = false;
+        sources.push({id: crypto.randomUUID(), name: "Сведения владельца", kind: "text"});
+      } else if (parts[3] === "analyze") {
         if (!sources.length) throw new Error("Добавьте источник.");
         business.profile = {description: "Демонстрационный профиль", tone: "Дружелюбно", facts: []};
         business.profile_version++;
@@ -251,19 +287,14 @@ function demoApi(url, method, body) {
 }
 async function api(url, body) {
   const method = body ? "POST" : "GET";
-  if (demo) return demoApi(url, method, body);
+  if (demo) { const result = demoApi(url, method, body); if (method === "POST") persistDemo(); return result; }
   if (!telegram?.initData) throw new Error("Откройте мини-приложение из меню Telegram-бота.");
-  let response;
-  try {
-    response = await fetch("./api" + url, {
+  const response = await window.TirazhHTTP.request("./api" + url, {
       method, headers: {"X-Telegram-Init-Data": telegram.initData,
         ...(body ? {"Content-Type": "application/json"} : {})},
       body: body ? JSON.stringify(body) : undefined,
       cache: "no-store",
     });
-  } catch {
-    throw new Error("Нет соединения. Проверьте сеть и повторите.");
-  }
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     throw new Error(error.error || "Сервис временно недоступен.");
@@ -271,6 +302,8 @@ async function api(url, body) {
   return response.json();
 }
 function postArt(post, additionalClass = "") {
+  const localImage = demo && demoAssets.get(post.image_asset_id);
+  if (localImage && localImage.business_id === post.business_id) return '<div class="post-art ' + additionalClass + '"><img src="' + safe(localImage.data_url) + '" alt="Изображение к посту"></div>';
   const art = ["coffee", "pastry", "cup"].includes(post.art) ? post.art : "coffee";
   if (demo) return '<div class="post-art ' + additionalClass + '"><svg class="sample-art" aria-hidden="true" '
     + 'viewBox="0 0 320 148" preserveAspectRatio="xMidYMid slice"><use href="#art-' + art + '"></use></svg></div>';
@@ -284,7 +317,7 @@ async function loadImages(container) {
     if (!id) return;
     try {
       if (!imageUrls.has(id)) {
-        imageUrls.set(id, fetch("./api/asset/" + path(id), {
+        imageUrls.set(id, window.TirazhHTTP.request("./api/asset/" + path(id), {
           headers: {"X-Telegram-Init-Data": telegram.initData}, cache: "no-store",
         }).then(async (response) => {
           if (!response.ok) throw new Error("Нет изображения");
@@ -380,7 +413,7 @@ function setupProgress() {
   const b = state.business;
   const steps = [
     [state.sources.length > 0, "Материалы", "add-source", "Добавьте описание, сайт или PDF"],
-    [Boolean(b.profile_confirmed), "Профиль", b.profile ? "confirm-profile" : "analyze", "Проверьте знания AI о компании"],
+    [Boolean(b.profile_confirmed), "Профиль", b.profile ? "confirm-profile" : "manual-profile", "Проверьте сведения о компании"],
     [Boolean(b.channel_id), "Канал", "channel", "Подключите тестовый Telegram-канал"],
   ];
   const done = steps.filter(s => s[0]).length;
@@ -398,8 +431,8 @@ function overview() {
   const ready = b.profile_confirmed && b.channel_id;
   return '<div class="workspace-home"><section class="workspace-hero"><div><p class="press-kicker">ВАШ AI-МАРКЕТОЛОГ</p>'
     + '<h1>Идеи — в дело.</h1><p class="hero-description">' + safe(b.name) + ' · '
-    + (ready ? "Всё для контента в одном пространстве." : "Давайте познакомим AI с вашим бизнесом.") + '</p>'
-    + '<div class="press-actions">' + button("Создать пост", "new-post", "primary", "plus")
+    + (ready ? "Всё для контента в одном пространстве." : "Давайте настроим пространство компании.") + '</p>'
+    + '<div class="press-actions">' + button("Создать пост", "manual-post", "primary", "plus")
     + button("Автоподготовка", "automation", "secondary", "spark") + '</div>'
     + '<p class="approval-note">' + icon("check") + 'Каждый пост выходит только после вашего согласования.</p></div>'
     + pressArt("draft", "workspace-illustration") + '</section>'
@@ -477,15 +510,83 @@ function workView() {
     + ((controls.failed_notifications || []).length ? '<div class="notice">Есть недоставленные уведомления: '
       + controls.failed_notifications.length + '. Откройте раздел уведомлений в Telegram-боте для повтора.</div>' : '');
 }
+function dayKey(value, timezone = state.business?.timezone || "Europe/Moscow") {
+  const fields = new Intl.DateTimeFormat("en", {timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit"})
+    .formatToParts(new Date(value));
+  const part = type => fields.find(field => field.type === type).value;
+  return part("year") + "-" + part("month") + "-" + part("day");
+}
+function calendarItems() {
+  return (calendarData.items || []).filter(post => (!statusFilter || post.status === statusFilter)
+    && (!searchQuery || post.text.toLocaleLowerCase("ru").includes(searchQuery.toLocaleLowerCase("ru"))));
+}
+function calendarView() {
+  const timezone = calendarData.timezone || state.business.timezone;
+  const [year, month] = calendarMonth.split("-").map(Number);
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const offset = (first.getUTCDay() + 6) % 7;
+  const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const today = dayKey(new Date(), timezone);
+  const grouped = new Map();
+  for (const post of calendarItems()) {
+    const key = dayKey(post.scheduled_at, timezone);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(post);
+  }
+  const cellCount = Math.ceil((offset + days) / 7) * 7;
+  const cells = Array.from({length: cellCount}, (_, index) => {
+    const day = index - offset + 1;
+    if (day < 1 || day > days) return '<span class="cal-blank" aria-hidden="true"></span>';
+    const key = calendarMonth + "-" + String(day).padStart(2, "0");
+    const posts = grouped.get(key) || [];
+    const dayLabel = new Intl.DateTimeFormat("ru-RU", {day: "numeric", month: "long", year: "numeric", timeZone: "UTC"})
+      .format(new Date(Date.UTC(year, month - 1, day)));
+    return '<button class="cal-day' + (key === today ? ' is-today' : '') + '" data-action="calendar-day" data-date="' + key
+      + '" aria-label="' + dayLabel + ', публикаций: ' + posts.length + '" aria-pressed="' + (key === selectedDay) + '"'
+      + (key === today ? ' aria-current="date"' : '') + '><span class="cal-number">' + day + '</span>'
+      + (posts.length ? '<span class="cal-count">' + posts.length + '</span><span class="cal-dots" aria-hidden="true">'
+        + [...new Set(posts.map(post => post.status))].slice(0, 3).map(status => '<i class="' + status + '"></i>').join('') + '</span>' : '') + '</button>';
+  }).join('');
+  const selectedPosts = (grouped.get(selectedDay) || []).sort((a, b) => Date.parse(a.scheduled_at) - Date.parse(b.scheduled_at));
+  const selectedLabel = new Intl.DateTimeFormat("ru-RU", {day: "numeric", month: "long", timeZone: "UTC"})
+    .format(new Date(selectedDay + "T12:00:00Z"));
+  const monthLabel = new Intl.DateTimeFormat("ru-RU", {month: "long", year: "numeric", timeZone: "UTC"}).format(first);
+  return '<section class="cal-panel panel" aria-label="Календарь публикаций"><div class="cal-header">'
+    + '<div><h2 aria-live="polite">' + safe(monthLabel) + '</h2><p>' + safe(timezone) + '</p></div><div class="cal-controls">'
+    + button("Сегодня", "calendar-today", "secondary")
+    + '<button class="icon-button" data-action="calendar-prev" aria-label="Предыдущий месяц">' + icon("prev") + '</button>'
+    + '<button class="icon-button" data-action="calendar-next" aria-label="Следующий месяц">' + icon("next") + '</button></div></div>'
+    + '<div class="cal-weekdays" aria-hidden="true">' + ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].map(day => '<span>' + day + '</span>').join('') + '</div>'
+    + '<div class="cal-grid" role="group" aria-label="Дни месяца">' + cells + '</div>'
+    + '<div class="cal-legend"><span><i class="approved"></i>Согласовано</span><span><i class="review"></i>На проверке</span><span><i class="published"></i>Опубликовано</span></div>'
+    + '<p class="cal-footnote">Без даты: ' + (calendarData.unscheduled_count || 0) + '. Такие посты доступны в списке. Время показано в часовом поясе компании.</p></section>'
+    + '<section class="cal-agenda" aria-live="polite"><div class="section-top"><div><p class="eyebrow">ВЫБРАННЫЙ ДЕНЬ</p><h2>' + safe(selectedLabel) + '</h2></div>'
+    + button("Добавить пост", "manual-post", "secondary", "plus") + '</div>'
+    + (selectedPosts.length ? postCards(selectedPosts) : '<div class="cal-empty panel">' + icon("calendar")
+      + '<strong>' + (searchQuery || statusFilter ? 'Нет постов с такими условиями' : 'Этот день свободен') + '</strong><p>'
+      + (searchQuery || statusFilter ? 'Измените запрос или сбросьте фильтры.' : 'Создайте пост и укажите время, чтобы он появился в календаре.') + '</p>'
+      + (searchQuery || statusFilter ? button("Сбросить фильтры", "clear-search", "secondary") : '') + '</div>') + '</section>';
+}
 function contentView() {
   const filters = [["", "Все"], ["review", "На согласовании"], ["approved", "Запланированы"], ["published", "Опубликованы"], ["failed", "Ошибки"], ["rejected", "Отклонены"], ["delivery_unknown", "Проверить доставку"]];
-  return headline("Редакция", "Посты", "Выберите черновик или проверьте расписание.",
-    button("Создать", "new-post", "primary", "plus"))
+  return headline("Редакция", "Посты", "Ваши материалы и календарь публикаций.",
+    '<div class="content-create-actions">' + button("Создать", "manual-post", "primary", "plus") + button("С AI", "new-post", "secondary", "spark") + '</div>')
+    + '<div class="content-toolbar"><form class="content-search" data-search><input name="search" type="search" maxlength="200" value="' + safe(searchQuery)
+    + '" aria-label="Поиск по тексту постов" placeholder="Найти пост по тексту…"><button type="submit" class="button secondary">Найти</button></form>'
+    + '<div class="content-layout" aria-label="Отображение постов">'
+    + ['list', 'calendar'].map(layout => '<button class="button ' + (contentLayout === layout ? 'primary' : 'secondary') + '" data-action="content-layout" data-layout="' + layout
+      + '" aria-pressed="' + (contentLayout === layout) + '">' + icon(layout === 'list' ? 'posts' : 'calendar') + (layout === 'list' ? 'Список' : 'Календарь') + '</button>').join('') + '</div></div>'
     + '<div class="filters" aria-label="Статус постов">' + filters.map(([value, label]) =>
       '<button class="filter" data-action="filter" data-status="' + value + '" aria-pressed="'
       + (value === statusFilter) + '">' + label + '</button>').join("") + '</div>'
-    + (content.items.length ? postCards(content.items) : '<div class="empty">Постов с таким статусом пока нет.</div>')
-    + (content.more ? '<div class="pager">' + button("Показать ещё", "more", "secondary") + '</div>' : "");
+    + (contentLayout === "calendar" ? calendarView() : '<p class="content-result" aria-live="polite">'
+      + (typeof content.total === 'number' ? 'Найдено: ' + content.total : 'Показано: ' + content.items.length)
+      + (searchQuery ? ' · «' + safe(searchQuery) + '»' : '') + '</p>'
+      + (content.items.length ? postCards(content.items) : '<div class="cal-empty panel">' + icon("posts") + '<strong>'
+        + (searchQuery || statusFilter ? 'Посты не найдены' : 'Начните с первого поста') + '</strong><p>'
+        + (searchQuery || statusFilter ? 'Попробуйте другой текст или сбросьте фильтры.' : 'Напишите текст и загрузите изображение — AI для этого не нужен.') + '</p>'
+        + button(searchQuery || statusFilter ? "Сбросить фильтры" : "Создать пост", searchQuery || statusFilter ? "clear-search" : "manual-post", "secondary", "plus") + '</div>')
+      + (content.more ? '<div class="pager">' + button("Показать ещё", "more", "secondary") + '</div>' : ""));
 }
 function reportView() {
   const series = report?.series || [];
@@ -519,7 +620,8 @@ function businessView() {
     + (profile ? '<p><strong>Стиль:</strong> ' + safe(profile.tone) + '</p><p>'
       + (b.profile_confirmed ? 'Профиль подтверждён.' : 'Профиль ждёт подтверждения.') + '</p><ul>'
       + (profile.facts || []).map((fact) => '<li>' + safe(fact.text) + '</li>').join("") + '</ul>' : "")
-    + button("Собрать профиль", "analyze", "secondary", "spark")
+    + button("Заполнить вручную", "manual-profile", "secondary", "posts")
+    + button("Собрать с AI", "analyze", "secondary", "spark")
     + (profile && !b.profile_confirmed ? button("Подтвердить", "confirm-profile", "primary", "check") : "")
     + '</section><div><section class="panel business-panel"><h2>Источники</h2><p>Описание, публичная страница сайта или PDF с текстовым слоем.</p><ul>'
     + state.sources.map((s) => '<li>' + safe(s.name) + '</li>').join("") + '</ul>'
@@ -558,15 +660,25 @@ function render() {
   }
   void loadImages(root);
 }
+function postQuery(page) {
+  return new URLSearchParams({page: String(page), ...(statusFilter ? {status: statusFilter} : {}), ...(searchQuery ? {search: searchQuery} : {})});
+}
 async function loadPage() {
   const epoch = ++pageRequest;
   const id = businessId;
   if (!id) { render(); return; }
   if (view === "content") {
-    const filter = statusFilter ? "&status=" + path(statusFilter) : "";
-    const result = await api("/business/" + path(id) + "/posts?page=0" + filter);
-    if (epoch !== pageRequest) return;
-    content = {...result, page: 0};
+    if (contentLayout === "calendar") {
+      if (!calendarMonth) calendarMonth = dayKey(new Date()).slice(0, 7);
+      if (!selectedDay || !selectedDay.startsWith(calendarMonth)) selectedDay = calendarMonth + "-01";
+      const result = await api("/business/" + path(id) + "/calendar?month=" + path(calendarMonth));
+      if (epoch !== pageRequest) return;
+      calendarData = result;
+    } else {
+      const result = await api("/business/" + path(id) + "/posts?" + postQuery(0));
+      if (epoch !== pageRequest) return;
+      content = {...result, page: 0};
+    }
   }
   if (view === "work") {
     const [result, history] = await Promise.all([api("/business/" + path(id) + "/control"), api("/business/" + path(id) + "/history")]);
@@ -591,6 +703,7 @@ async function refresh() {
     banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовый backend. AI и публикации имитируются; данные сохраняются.</span>';
   }
   businessId = state.business?.id || "";
+  persistDemo();
   await loadPage();
 }
 async function navigate(next, filter = "") {
@@ -636,7 +749,8 @@ function showPost(post) {
     if (canApprove) actions += button("Согласовать версию " + post.revision, "approve", "primary", "check", attrs + (demo ? "" : ' disabled data-requires-image'));
     actions += button("Текст и время", "edit-post", "secondary", "calendar", attrs);
     actions += button("Правка текста AI", "revise-text", "secondary", "spark", attrs);
-    actions += button("Правка изображения", "revise-image", "secondary", "image", attrs);
+    actions += button("Заменить изображение", "replace-image", "secondary", "image", attrs);
+    actions += button("Правка изображения AI", "revise-image", "secondary", "spark", attrs);
     if (staleProfile) actions += button("Проверил по новому профилю", "refresh-context", "secondary", "check", attrs);
     if (["review", "approved"].includes(post.status)) actions += button("Отклонить", "reject", "secondary danger", "", attrs);
   }
@@ -649,7 +763,7 @@ function showPost(post) {
     + safe(post.channel_id || 'Канал не выбран') + '</strong><span>' + safe(formatDate(post.scheduled_at)) + ' · '
     + safe(state.business.timezone) + '</span></div></div>' + postArt(post, "preview-art") + '<div class="post-details">'
     + statusLabel(post.status) + '<span class="date">Версия ' + post.revision + ' · Профиль v' + (post.profile_version ?? '—')
-    + '</span></div><p class="post-text">' + safe(post.text) + '</p>'
+    + '</span>' + (post.content_origin === 'manual' ? '<span class="date">Создан вручную</span>' : '') + '</div><p class="post-text">' + safe(post.text) + '</p>'
     + (staleProfile ? '<div class="notice approval-warning">Профиль бизнеса изменился. Проверьте факты и обновите контекст перед согласованием.</div>' : '')
     + (staleChannel ? '<div class="notice approval-warning">Подключён другой канал. Проверьте назначение поста в Telegram-боте.</div>' : '')
     + ((post.warnings || []).length ? '<div class="notice approval-warning"><strong>Перед публикацией</strong><ul>'
@@ -710,7 +824,55 @@ document.addEventListener("click", async (event) => {
   }
   control.disabled = true;
   try {
-    if (action === "refresh") {
+    if (action === "content-layout") {
+      contentLayout = control.dataset.layout;
+      if (contentLayout === "calendar" && !calendarMonth) { selectedDay = dayKey(new Date()); calendarMonth = selectedDay.slice(0, 7); }
+      await loadPage();
+    } else if (action === "calendar-day") {
+      selectedDay = control.dataset.date; render();
+      root.querySelector('[data-date="' + selectedDay + '"]')?.focus({preventScroll:true});
+    } else if (["calendar-prev", "calendar-next", "calendar-today"].includes(action)) {
+      if (action === "calendar-today") { selectedDay = dayKey(new Date()); calendarMonth = selectedDay.slice(0, 7); }
+      else {
+        const [year, month] = calendarMonth.split("-").map(Number);
+        const next = new Date(Date.UTC(year, month - 1 + (action === "calendar-next" ? 1 : -1), 1));
+        calendarMonth = next.toISOString().slice(0, 7); selectedDay = calendarMonth + "-01";
+      }
+      await loadPage();
+    } else if (action === "clear-search") {
+      searchQuery = ""; statusFilter = ""; await loadPage();
+    } else if (action === "reset-demo") {
+      showDialog(dialogHeading("Сбросить демо?", "Созданные в этом браузере тестовые компании, посты, изображения и диалоги будут удалены. Откроются исходные примеры.")
+        + '<div class="dialog-actions">' + button("Сбросить тестовые данные", "confirm-reset-demo", "primary") + button("Отмена", "close", "secondary") + '</div>');
+    } else if (action === "confirm-reset-demo" && demo) {
+      if (!window.TirazhDemoStore.clear()) throw new Error("Браузер не разрешает очистить локальное хранилище.");
+      location.reload();
+    } else if (action === "manual-profile") {
+      const b = state.business, profile = b.profile || {};
+      openForm("manual-profile", "Профиль без AI", "Заполните сведения о компании. После сохранения проверьте и подтвердите профиль.",
+        '<label class="form-row"><span>Что делает компания</span><textarea name="description" required maxlength="2000">' + safe(profile.description || '') + '</textarea></label>'
+        + '<label class="form-row"><span>Продукты и услуги — по одному на строку</span><textarea name="products" maxlength="3000">' + safe((profile.products || []).join("\n")) + '</textarea></label>'
+        + '<label class="form-row"><span>Для кого</span><input name="audience" maxlength="1000" value="' + safe(profile.audience || '') + '"></label>'
+        + '<label class="form-row"><span>Тон общения</span><input name="tone" required maxlength="400" value="' + safe(profile.tone || 'Понятно и по делу') + '"></label>'
+        + '<label class="form-row"><span>Правила бренда — до 20, по одному на строку</span><textarea name="constraints" maxlength="10000">' + safe((profile.constraints || []).join("\n")) + '</textarea></label>',
+        "Сохранить профиль", b.id, b.profile_version);
+    } else if (action === "replace-image") {
+      openForm("replace-image", "Заменить изображение", "Выберите своё изображение. Будет создана новая версия поста, требующая согласования.",
+        formField("Изображение PNG или JPEG", "image", "file", 'accept="image/png,image/jpeg"')
+        + '<div class="manual-image-preview" hidden></div><p class="manual-hint">' + imageUploadHint() + '</p>',
+        "Сохранить новую версию", id, Number(revision));
+    } else if (action === "manual-post") {
+      if (!state.business.profile_confirmed || !state.business.channel_id) {
+        await navigate("business"); notify("Заполните и подтвердите профиль, затем подключите канал. Это можно сделать без AI."); return;
+      }
+      openForm("manual-post", "Новый пост", "Добавьте свой текст и изображение. Пост сохранится черновиком; публикация требует отдельного согласования.",
+        formField("Текст публикации", "text", "textarea", 'maxlength="900" placeholder="О чём расскажем аудитории?"')
+        + '<span class="manual-text-count" aria-live="polite">0 / 900</span>'
+        + formField("Изображение PNG или JPEG", "image", "file", 'accept="image/png,image/jpeg"')
+        + '<div class="manual-image-preview" hidden></div><p class="manual-hint">' + imageUploadHint() + '</p>'
+        + '<label class="form-row"><span>Дата и время (необязательно)</span><input name="scheduled_at" type="datetime-local"></label>'
+        + '<p class="manual-hint">Ввод в часовом поясе устройства. Календарь покажет время в ' + safe(state.business.timezone) + '.</p>', "Сохранить черновик");
+    } else if (action === "refresh") {
       await refresh(); notify("Данные обновлены.");
     } else if (action === "automation") {
       const b = state.business;
@@ -738,6 +900,10 @@ document.addEventListener("click", async (event) => {
       showPost(await api("/post/" + path(id) + "/refresh-context", {revision: Number(revision)}));
       await refresh();
     } else if (action === "new-post") {
+      if (state.capabilities?.text_generation === "unconfigured" || state.capabilities?.image_generation === "unconfigured") {
+        showDialog(dialogHeading("AI пока не подключён", "Модель можно подключить позже. Уже сейчас доступны ручные тексты, загрузка изображений, согласование и календарь.")
+          + '<div class="dialog-actions">' + button("Создать вручную", "manual-post", "primary", "plus") + button("Закрыть", "close", "secondary") + '</div>'); return;
+      }
       if (!state.business.profile_confirmed || !state.business.channel_id) {
         await navigate("business"); notify("Подтвердите профиль и подключите канал, чтобы создать первый пост."); return;
       }
@@ -756,6 +922,10 @@ document.addEventListener("click", async (event) => {
       openForm("channel", "Подключить канал", "Добавьте бота администратором канала с правом публикации.",
         formField("Канал", "value", "text", 'maxlength="128" placeholder="@channel или -100…"'), "Проверить канал");
     } else if (action === "analyze" || action === "confirm-profile") {
+      if (action === "analyze" && state.capabilities?.text_generation === "unconfigured") {
+        showDialog(dialogHeading("AI пока не подключён", "Заполните профиль вручную — это откроет работу с черновиками без обращения к модели.")
+          + '<div class="dialog-actions">' + button("Заполнить профиль", "manual-profile", "primary") + button("Закрыть", "close", "secondary") + '</div>'); return;
+      }
       if (action === "analyze") notify("AI изучает материалы. Это может занять до двух минут.");
       await api("/business/" + path(businessId) + "/profile/" + (action === "analyze" ? "analyze" : "confirm"),
         action === "analyze" ? {request_id: crypto.randomUUID()} : {revision: state.business.profile_version});
@@ -766,22 +936,25 @@ document.addEventListener("click", async (event) => {
     } else if (action === "more") {
       const epoch = pageRequest;
       const next = content.page + 1;
-      const filter = statusFilter ? "&status=" + path(statusFilter) : "";
-      const result = await api("/business/" + path(businessId) + "/posts?page=" + next + filter);
+      const result = await api("/business/" + path(businessId) + "/posts?" + postQuery(next));
       if (epoch !== pageRequest) return;
-      content = {items: content.items.concat(result.items), more: result.more, page: next};
+      content = {...result, items: content.items.concat(result.items), page: next};
       render();
     } else if (action === "open-post") {
       const epoch = ++postRequest;
       const post = await api("/post/" + path(id));
       if (epoch === postRequest && post.business_id === businessId) showPost(post);
     } else if (action === "edit-post") {
+      const epoch = ++postRequest;
+      const editingBusiness = businessId;
       const post = await api("/post/" + path(id));
+      if (epoch !== postRequest || businessId !== editingBusiness || post.business_id !== editingBusiness) return;
       openForm("edit", "Текст и время", "Время указывается в часовом поясе вашего устройства. Правка создаёт новую версию.",
         '<label class="form-row"><span>Текст</span><textarea name="text" required maxlength="900">'
         + safe(post.text) + '</textarea></label>'
-        + formField("Дата и время", "scheduled_at", "datetime-local",
-          'value="' + editableDate(post.scheduled_at) + '"'),
+        + '<label class="form-row"><span>' + (post.scheduled_at ? 'Дата и время' : 'Дата и время (необязательно)')
+        + '</span><input name="scheduled_at" type="datetime-local" ' + (post.scheduled_at ? 'required ' : '')
+        + 'value="' + editableDate(post.scheduled_at) + '"></label>',
         "Сохранить версию", id, post.revision);
     } else if (action === "approve" || action === "reject") {
       const post = await api("/post/" + path(id) + "/" + action, {revision: Number(revision)});
@@ -801,58 +974,86 @@ dialog.addEventListener("submit", async (event) => {
   const submitLabel = submit.textContent;
   submit.textContent = "Выполняется…";
   const values = Object.fromEntries(new FormData(form));
+  const fieldStates = [...form.elements].filter(field => field !== submit).map(field => [field, field.disabled]);
+  for (const [field] of fieldStates) field.disabled = true;
   const {form: action, id, revision} = form.dataset;
+  const submittingBusiness = businessId;
+  const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
-    if (action === "automation") {
+    if (action === "manual-profile") {
+      await api("/business/" + path(id) + "/profile/manual", {revision: Number(revision), description: values.description,
+        products: profileLines(values.products, 19, "продуктов"), audience: values.audience, tone: values.tone,
+        constraints: profileLines(values.constraints, 20, "правил бренда")});
+      if (currentForm()) dialog.close(); await refresh(); notify("Профиль сохранён. Проверьте сведения и подтвердите его.");
+    } else if (action === "manual-post") {
+      const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
+      const assetId = await uploadManualImage(values.image, id, form);
+      const payload = {text: values.text, image_asset_id: assetId, request_id: requestId};
+      if (values.scheduled_at) payload.scheduled_at = new Date(values.scheduled_at).toISOString();
+      const post = await api("/business/" + path(id) + "/draft", payload);
+      if (currentForm()) showPost(post); await refresh(); notify("Черновик сохранён. Он не согласован к публикации.");
+    } else if (action === "replace-image") {
+      const post = await api("/post/" + path(id));
+      const assetId = await uploadManualImage(values.image, post.business_id, form);
+      const updated = await api("/post/" + path(id) + "/edit", {revision: Number(revision), image_asset_id: assetId});
+      if (currentForm()) showPost(updated); await refresh(); notify("Изображение обновлено. Требуется новое согласование.");
+    } else if (action === "automation") {
       const payload = {enabled: values.enabled === "on", interval_hours: Number(values.interval_hours), request: values.request};
       if (values.first_run_at) payload.first_run_at = new Date(values.first_run_at).toISOString();
-      await api("/business/" + path(id) + "/automation", payload); dialog.close(); await refresh(); notify("Расписание сохранено.");
+      await api("/business/" + path(id) + "/automation", payload); if (currentForm()) dialog.close(); await refresh(); notify("Расписание сохранено.");
     } else if (action === "revise-text" || action === "revise-image") {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
       const post = await api("/post/" + path(id) + "/" + action, {revision: Number(revision), feedback: values.feedback, request_id: requestId});
-      showPost(post); await refresh(); notify("Новая версия готова. Проверьте и согласуйте её отдельно.");
+      if (currentForm()) showPost(post); await refresh(); notify("Новая версия готова. Проверьте и согласуйте её отдельно.");
     } else if (action === "pdf") {
       const file = values.file;
       if (!file?.size || file.size > 10000000) throw new Error("Выберите PDF размером до 10 МБ.");
       if (demo) {
         demoWorkspaces.find(w => w.business.id === id).sources.push({id: crypto.randomUUID(), name: file.name, kind: "pdf"});
         demoWorkspaces.find(w => w.business.id === id).business.profile_confirmed = false;
+        persistDemo();
       } else {
         const data = new FormData(); data.append("file", file);
-        const response = await fetch("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
+        const response = await window.TirazhHTTP.request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось загрузить документ.");
       }
-      dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
+      if (currentForm()) dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
     } else if (action === "business") {
       const business = await api("/business", values);
-      businessId = business.id;
-      view = "business";
-      dialog.close();
+      if (currentForm()) {
+        dialog.close(); businessId = business.id; view = "business";
+      }
       await refresh();
       notify("Бизнес создан.");
     } else if (action === "edit") {
-      const post = await api("/post/" + path(id) + "/edit", {revision: Number(revision), text: values.text,
-        scheduled_at: new Date(values.scheduled_at).toISOString()});
-      showPost(post);
+      const edit = {revision: Number(revision), text: values.text};
+      if (values.scheduled_at) edit.scheduled_at = new Date(values.scheduled_at).toISOString();
+      const post = await api("/post/" + path(id) + "/edit", edit);
+      if (currentForm()) showPost(post);
       await refresh();
       notify("Новая версия сохранена.");
     } else if (action === "prepare") {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
       const job = await api("/business/" + path(id) + "/prepare", {...values, request_id: requestId});
-      dialog.close();
+      if (currentForm()) dialog.close();
       notify(demo ? "Демонстрационный черновик создан." : "Задание в очереди.");
       void watchJob(job, id);
     } else {
       await api("/business/" + path(id) + "/" + action, values);
-      dialog.close();
+      if (currentForm()) dialog.close();
       await refresh();
       notify(action === "channel" ? "Канал подключён." : "Источник добавлен.");
     }
-  } catch (error) { announceError(error); }
-  finally { submit.disabled = false; submit.textContent = submitLabel; }
+  } catch (error) { if (currentForm()) announceError(error); else notify(error.message); }
+  finally { for (const [field, disabled] of fieldStates) field.disabled = disabled; submit.disabled = false; submit.textContent = submitLabel; }
 });
 root.addEventListener("submit", async (event) => {
   const form = event.target;
+  if (form.matches("[data-search]")) {
+    event.preventDefault(); searchQuery = form.elements.search.value.trim();
+    try { await loadPage(); } catch (error) { announceError(error); }
+    return;
+  }
   if (!form.matches("[data-chat]")) return;
   event.preventDefault();
   const submit = form.querySelector("button");
@@ -877,21 +1078,90 @@ root.addEventListener("submit", async (event) => {
   } catch (error) { if (errorNode.isConnected) errorNode.textContent = error.message; else announceError(error); }
   finally { submit.disabled = false; form.elements.text.disabled = false; }
 });
+async function uploadManualImage(file, business, form) {
+  await validateManualImage(file);
+  if (form.dataset.assetId) return form.dataset.assetId;
+  let assetId;
+  if (demo) {
+    assetId = crypto.randomUUID(); demoAssets.set(assetId, {id: assetId, business_id: business, data_url: await fileData(file)});
+  } else {
+    const data = new FormData(); data.append("file", file);
+    const response = await window.TirazhHTTP.request("./api/business/" + path(business) + "/image", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось сохранить изображение.");
+    assetId = (await response.json()).id;
+  }
+  form.dataset.assetId = assetId;
+  return assetId;
+}
+function fileData(file) {
+  return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("Не удалось прочитать изображение.")); reader.readAsDataURL(file); });
+}
+function profileLines(text, maximum, label) {
+  const lines = String(text || "").split("\n").map(value => value.trim()).filter(Boolean);
+  if (lines.length > maximum || lines.some(value => value.length > 500)) throw new Error("Допускается до " + maximum + " " + label + ", каждый пункт — до 500 символов.");
+  return lines;
+}
+function imageUploadLimit() {
+  const configured = state.capabilities?.image_upload?.max_bytes;
+  return demo ? 1_000_000 : Number.isSafeInteger(configured) && configured > 0 ? Math.min(configured, 10_000_000) : 10_000_000;
+}
+function imageUploadHint() {
+  const size = (imageUploadLimit() / 1_000_000).toLocaleString("ru-RU", {maximumFractionDigits: 2});
+  return (demo ? "Для локального демо — до " : "До ") + size + " МБ. PNG или JPEG, до 4096 × 4096 пикселей.";
+}
+async function validateManualImage(file) {
+  if (!file || !file.size || !["image/png", "image/jpeg"].includes(file.type)) throw new Error("Выберите изображение PNG или JPEG.");
+  if (file.size > imageUploadLimit()) throw new Error(imageUploadHint());
+  const url = URL.createObjectURL(file);
+  try { const image = new Image(); image.src = url; await image.decode(); if (!image.naturalWidth || image.naturalWidth > 4096 || image.naturalHeight > 4096) throw new Error(); }
+  catch { throw new Error("Нужен исправный PNG или JPEG размером до 4096 × 4096 пикселей."); } finally { URL.revokeObjectURL(url); }
+}
+dialog.addEventListener("change", async event => {
+  if (event.target.name !== "image") return;
+  const form = event.target.form; delete form.dataset.assetId;
+  const preview = form.querySelector('.manual-image-preview');
+  if (manualPreviewUrl) URL.revokeObjectURL(manualPreviewUrl);
+  preview.hidden = true; preview.replaceChildren();
+  const file = event.target.files[0];
+  try {
+    await validateManualImage(file);
+    if (!preview.isConnected || event.target.files[0] !== file) return;
+    manualPreviewUrl = URL.createObjectURL(file);
+    const image = new Image(); image.src = manualPreviewUrl; image.alt = "Предпросмотр выбранного изображения";
+    preview.append(image); preview.hidden = false; $("#form-error").textContent = "";
+  } catch (error) { if (preview.isConnected && event.target.files[0] === file) announceError(error); }
+});
+root.addEventListener("focusin", event => {
+  if (event.target.matches('.filters .filter:focus-visible')) event.target.scrollIntoView({block:"nearest", inline:"center", behavior:"instant"});
+});
+root.addEventListener("keydown", async event => {
+  const day = event.target.closest('[data-action="calendar-day"]');
+  const shifts = {ArrowLeft:-1, ArrowRight:1, ArrowUp:-7, ArrowDown:7};
+  if (!day || !(event.key in shifts)) return;
+  event.preventDefault();
+  const next = new Date(day.dataset.date + 'T12:00:00Z'); next.setUTCDate(next.getUTCDate() + shifts[event.key]);
+  selectedDay = next.toISOString().slice(0,10);
+  if (!selectedDay.startsWith(calendarMonth)) { calendarMonth = selectedDay.slice(0,7); await loadPage(); } else render();
+  root.querySelector('[data-date="' + selectedDay + '"]')?.focus({preventScroll:true});
+});
 document.addEventListener("input", event => {
   const form = event.target.closest("form");
+  if (event.target.name === "text" && form?.dataset.form === "manual-post") form.querySelector('.manual-text-count').textContent = event.target.value.length + " / 900";
   if (form && !form.querySelector('button[type="submit"]')?.disabled) delete form.dataset.requestId;
 });
 workspace.addEventListener("change", async () => {
   ++postRequest;
   dialog.close();
   businessId = workspace.value;
+  searchQuery = ""; calendarMonth = ""; selectedDay = ""; persistDemo();
   try { await refresh(); } catch (error) { announceError(error); }
 });
 window.addEventListener("pagehide", () => {
   for (const pending of imageUrls.values()) void pending.then((url) => { if (url) URL.revokeObjectURL(url); });
   imageUrls.clear();
 });
-dialog.addEventListener("close", syncBackButton);
+dialog.addEventListener("close", () => { ++postRequest; syncBackButton(); if (manualPreviewUrl) { URL.revokeObjectURL(manualPreviewUrl); manualPreviewUrl = null; } });
 if (insideTelegram) {
   telegram.ready();
   telegram.expand();
@@ -908,7 +1178,8 @@ if (insideTelegram) {
 }
 if (demo) {
   const banner = $("#mode-banner"); banner.hidden = false;
-  banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовые данные. AI, отправка постов и расписание здесь имитируются.</span>';
+  banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>AI, отправка и расписание имитируются. <span id="demo-storage-note">Изменения сохраняются в этом браузере.</span></span>' + button("Сбросить", "reset-demo", "demo-reset");
+  if (restoredDemo.issue) notify(restoredDemo.issue);
 }
 useTheme();
 void refresh().catch((error) => {

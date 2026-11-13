@@ -143,6 +143,9 @@ class PostView(Contract):
     profile_version: int | None = Field(default=None, ge=0)
     used_source_ids: list[str] = Field(default_factory=list, max_length=100)
     warnings: list[str] = Field(default_factory=list, max_length=50)
+    # How the initial draft was authored; later edits keep this provenance.
+    content_origin: Literal["manual", "generated", "legacy"] = "legacy"
+    created_by: int | None = Field(default=None, strict=True, gt=0)
 
 
 class ChannelInfo(Contract):

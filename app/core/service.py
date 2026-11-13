@@ -2,15 +2,18 @@
 
 import asyncio
 import hashlib
+import io
 import ipaddress
 import json
 import logging
+import warnings
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from app.config import Settings
@@ -29,6 +32,7 @@ from app.shared.models import (
     BusinessProfile,
     ChannelInfo,
     ContentPlan,
+    Fact,
     Job,
     MetricSnapshot,
     Notification,
@@ -239,6 +243,27 @@ class BackendService:
         self._owner(actor_id)
         return [b for b in self.repo.list_businesses() if b.owner_id == actor_id]
 
+    def capabilities(self, actor_id: int) -> dict:
+        """Loaded configuration only; credentials, balance and provider access are never probed."""
+        self._owner(actor_id)
+        from app.ai.provider import UnconfiguredAI
+        from app.media.runtime import UnconfiguredImages
+
+        def state(provider, unconfigured):
+            if provider is None or isinstance(provider, unconfigured):
+                return "unconfigured"
+            return "demo" if getattr(provider, "is_demo", False) else "configured_unverified"
+
+        return {
+            "manual_profile": True, "manual_drafts": True,
+            "text_generation": state(self.ai, UnconfiguredAI),
+            "image_generation": state(self.images, UnconfiguredImages),
+            "external_access_checked": False,
+            "image_upload": {"formats": ["image/png", "image/jpeg"],
+                             "max_bytes": min(self.settings.max_upload_bytes, 10_000_000),
+                             "max_dimension": 4096, "max_pixels": 16_777_216},
+        }
+
     def accept_telegram_update(self, actor_id: int, event_key: str, digest: str) -> bool:
         """Persist a receipt before routing, including for non-AI user actions.
 
@@ -408,6 +433,48 @@ class BackendService:
     def confirm_profile(self, actor_id: int, business_id: str, expected_version: int) -> Business:
         self._business(actor_id, business_id)
         return self.repo.confirm_profile(business_id, expected_version, self.now())
+
+    def save_manual_profile(
+        self, actor_id: int, business_id: str, expected_version: int, *, description: str,
+        products: list[str] | None = None, audience: str = "", tone: str = "Дружелюбный, конкретный",
+        constraints: list[str] | None = None,
+    ) -> Business:
+        business = self._business(actor_id, business_id)
+        if type(expected_version) is not int or expected_version < 0:
+            raise InvalidInput("Укажите актуальную версию профиля.")
+        if business.profile_version != expected_version:
+            raise Conflict("Версия профиля изменилась. Откройте актуальный профиль.")
+        description = self._plain_text(description, 2000, "Опишите бизнес: от 1 до 2000 символов.").strip()
+        products = [] if products is None else products
+        constraints = [] if constraints is None else constraints
+        for items, maximum in ((products, 19), (constraints, 20)):
+            if not isinstance(items, list) or len(items) > maximum:
+                raise InvalidInput("Допускается до 19 продуктов и до 20 правил бренда.")
+            for value in items:
+                self._plain_text(value, 500, "Каждый пункт должен содержать от 1 до 500 символов.")
+        if not isinstance(audience, str) or len(audience) > 1000:
+            raise InvalidInput("Описание аудитории должно быть до 1000 символов.")
+        self._plain_text(tone, 400, "Опишите стиль: от 1 до 400 символов.")
+        payload = {"description": description, "products": products, "audience": audience,
+                   "tone": tone, "constraints": constraints}
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        try:
+            size = len(encoded.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise InvalidInput("Проверьте текст профиля.") from None
+        if size > self.settings.max_upload_bytes:
+            raise InvalidInput("Профиль превышает допустимый размер источника.")
+        self._check_source_limits(business.id, extra_bytes=size)
+        now = self.now()
+        source = Source(id=str(uuid4()), business_id=business.id, kind="text",
+                        name=f"Сведения владельца · профиль {expected_version + 1}", text=encoded, created_at=now)
+        profile = BusinessProfile(
+            name=business.name, description=description, products=products, audience=audience, tone=tone,
+            constraints=constraints,
+            facts=[Fact(text=description, source_ids=[source.id]),
+                   *[Fact(text=item, source_ids=[source.id]) for item in products]],
+        )
+        return self.repo.set_manual_profile(business.id, expected_version, profile, source, actor_id, now)
 
     def _ready(self, business: Business) -> None:
         if not business.profile or not business.profile_confirmed:
@@ -606,6 +673,71 @@ class BackendService:
         self._business(actor_id, asset.business_id)
         return asset, self.files.read(asset)
 
+    def upload_post_image(self, actor_id: int, business_id: str, filename: str, content: bytes) -> Asset:
+        self._business(actor_id, business_id)
+        maximum = min(self.settings.max_upload_bytes, 10_000_000)
+        if not isinstance(content, bytes) or not 1 <= len(content) <= maximum:
+            raise InvalidInput("Изображение пустое или превышает лимит загрузки.")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(content), formats=["PNG", "JPEG"]) as picture:
+                    width, height = picture.size
+                    image_format = picture.format
+                    if (image_format not in {"PNG", "JPEG"} or not 1 <= width <= 4096 or not 1 <= height <= 4096
+                            or width * height > 16_777_216 or max(width, height) > 20 * min(width, height)
+                            or getattr(picture, "n_frames", 1) != 1):
+                        raise InvalidInput("Нужно статичное изображение до 4096×4096 с отношением сторон не более 20:1.")
+                    picture.verify()
+                with Image.open(io.BytesIO(content), formats=["PNG", "JPEG"]) as picture:
+                    picture.load()
+        except (UnidentifiedImageError, OSError, ValueError, SyntaxError,
+                Image.DecompressionBombError, Image.DecompressionBombWarning):
+            raise InvalidInput("Файл должен быть исправным PNG или JPEG.") from None
+        mime_type = "image/png" if image_format == "PNG" else "image/jpeg"
+        asset = self.files.write(business_id, filename, content, mime_type, self.now(),
+                                 is_demo=self.settings.mode == "demo")
+        self.repo.add_asset(asset)
+        return asset
+
+    def create_manual_draft(
+        self, actor_id: int, business_id: str, text: str, image_asset_id: str, request_id: str,
+        *, scheduled_at: datetime | None = None, source_ids: list[str] | None = None,
+    ) -> PostView:
+        business = self._business(actor_id, business_id)
+        text = self._validate_caption(text)
+        self._plain_text(request_id, 100, "Укажите идентификатор черновика до 100 символов.")
+        self._plain_text(image_asset_id, 100, "Загрузите изображение для поста.")
+        source_ids = [] if source_ids is None else source_ids
+        if (not isinstance(source_ids, list) or len(source_ids) > 100
+                or any(not isinstance(item, str) or not item or len(item) > 200 for item in source_ids)):
+            raise InvalidInput("Проверьте выбранные источники поста.")
+        scheduled_at = as_utc(scheduled_at) if scheduled_at is not None else None
+        payload = {"text": text, "image_asset_id": image_asset_id, "source_ids": sorted(set(source_ids)),
+                   "scheduled_at": scheduled_at.isoformat() if scheduled_at else None}
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        existing = self.repo.find_manual_post(business_id, request_id, digest)
+        if existing is not None:
+            return existing
+        self._ready(business)
+        if scheduled_at is not None and scheduled_at <= self.now():
+            raise InvalidInput("Выберите время публикации в будущем.")
+        asset = self.repo.get_asset(image_asset_id)
+        if asset.business_id != business_id or asset.mime_type not in {"image/png", "image/jpeg"}:
+            raise InvalidInput("Изображение должно принадлежать этому бизнесу.")
+        if self.settings.mode == "live" and asset.is_demo:
+            raise InvalidInput("Демонстрационное изображение нельзя использовать в live-режиме.")
+        self.files.read(asset)
+        return self.repo.create_posts(
+            business_id, [{"text": text, "image_asset_id": asset.id, "channel_id": business.channel_id,
+                           "scheduled_at": scheduled_at, "profile_version": business.profile_version,
+                           "is_demo": self.settings.mode == "demo", "used_source_ids": source_ids,
+                           "warnings": ["Создано вручную: AI не проверял текст и изображение."]}], self.now(),
+            expected_profile_version=business.profile_version, expected_channel_id=business.channel_id,
+            manual_request_id=request_id, manual_payload_hash=digest, manual_actor_id=actor_id,
+            notification=self._notification(business, "draft_ready", "Ручной пост сохранён и ожидает согласования."),
+        )[0]
+
     def _store_image(self, business_id: str, image) -> Asset:
         from app.shared.models import GeneratedImage
 
@@ -662,6 +794,8 @@ class BackendService:
             asset = self.repo.get_asset(image_asset_id)
             if asset.business_id != post.business_id or asset.mime_type not in {"image/png", "image/jpeg"}:
                 raise InvalidInput("Изображение должно принадлежать этому бизнесу.")
+            if self.settings.mode == "live" and asset.is_demo:
+                raise InvalidInput("Демонстрационное изображение нельзя использовать в live-режиме.")
             self.files.read(asset)
             changes["image_asset_id"] = asset.id
             changes["is_demo"] = post.is_demo or asset.is_demo or self.settings.mode == "demo"
