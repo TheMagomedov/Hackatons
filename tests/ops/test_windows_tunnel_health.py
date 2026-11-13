@@ -104,6 +104,8 @@ async def test_supervisor_reconnects_only_owned_tunnel_after_three_failures(tmp_
     monkeypatch.setattr(launcher, "STATE", tmp_path)
     monkeypatch.setattr(launcher.shutil, "which", lambda _name: "fake-ssh")
     monkeypatch.setattr(launcher, "socket", SimpleNamespace(socket=MagicMock()))
+    # This is a mocked Windows supervisor, also exercised by Linux CI.
+    monkeypatch.setattr(launcher, "subprocess", SimpleNamespace(CREATE_NO_WINDOW=0))
     monkeypatch.setattr(launcher.signal, "signal", lambda *_args: None)
     monkeypatch.setattr(launcher, "save_state", lambda url, status: states.append((url, status)))
     def health(url, *, local=False):
