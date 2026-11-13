@@ -37,7 +37,7 @@ async function application(access = {role:'reviewer',can_write:false}, preview =
     querySelector:node,querySelectorAll:selector => selector==='nav [data-view]' ? nav : [],
     addEventListener:(kind,handler) => listeners.set('document:'+kind,handler),
   };
-  const data = {access,businesses:[{id:'one',name:'Компания'}],business:{id:'one',name:'Компания',
+  const data = {access,runtime_mode:'live',businesses:[{id:'one',name:'Компания'}],business:{id:'one',name:'Компания',
     timezone:'Europe/Moscow',profile_version:1,profile_confirmed:true,channel_id:'@example'},
     counts:{},sources:[],posts:[]};
   options.configure?.(data);
@@ -66,6 +66,7 @@ async function application(access = {role:'reviewer',can_write:false}, preview =
   });
   vm.runInContext(fs.readFileSync(path.join(staticDir,'session.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(staticDir,'access.js'),'utf8'),context);
+  if (preview) vm.runInContext(fs.readFileSync(path.join(staticDir,'preview-runtime.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(staticDir,'app.js'),'utf8'),context);
   await tick();
   return {context,nodes,listeners,requests,data,nav,defaultResponder,

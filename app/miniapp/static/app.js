@@ -6,7 +6,8 @@ const dialog = $("#dialog");
 const dialogBody = $("#dialog-body");
 const workspace = $("#workspace");
 const toast = $("#toast");
-const demo = document.body.dataset.mode === "preview";
+const preview = document.body.dataset.mode === "preview" ? window.TirazhPreview : null;
+const demo = Boolean(preview);
 const accessRules = window.TirazhAccess;
 const session = window.TirazhSession;
 let telegram = session.sdk();
@@ -24,45 +25,9 @@ const safe = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 })[char]);
 const path = encodeURIComponent;
-const sampleDate = (days, hours) => new Date(Date.now() + (days * 24 + hours) * 3600000).toISOString();
-const businessSeed = {
-  id: "demo", name: "САЛАВАТСТЕКЛО", timezone: "Europe/Moscow", channel_title: "Контент-студия · демо",
-  channel_id: "@salavatsteklo_demo", profile_confirmed: true, profile_version: 1,
-  profile: {description: "Демонстрационное пространство САЛАВАТСТЕКЛО. Материалы о стекле, архитектуре и фирменном стиле.",
-    tone: "Профессионально, ясно, с опорой на подтверждённые факты",
-    constraints: ["Не выдумывать цены, характеристики, сроки и сертификаты.", "Название бренда: САЛАВАТСТЕКЛО."],
-    facts: [{text: "Основной фирменный цвет — петроль #196C7F.", source_ids: ["note"]}]},
-};
-let demoWorkspaces = [{
-  business: structuredClone(businessSeed),
-  sources: [{id: "note", name: "Фирменный стиль · выдержка из брендбука", kind: "text"},
-            {id: "menu", name: "Брендбук от 15.11.2023 · пример источника", kind: "pdf"}],
-  posts: [
-    {id: "morning", text: "Стекло. Свет. Пространство.\nДемонстрационный черновик о роли стекла в современной архитектуре.", status: "review", art: "pattern-1",
-      revision: 1, created_at: sampleDate(0, -2), scheduled_at: null},
-    {id: "pastry", text: "В деталях — характер бренда\nПетроль, чистые линии и округлые формы в фирменном стиле САЛАВАТСТЕКЛО.", status: "approved", art: "pattern-2",
-      revision: 2, created_at: sampleDate(-1, -4), scheduled_at: sampleDate(1, 2)},
-    {id: "filter", text: "Один бренд. Единый стиль.\nДемонстрационный пример публикации с фирменным паттерном.", status: "published", art: "pattern-3",
-      revision: 3, created_at: sampleDate(-3, 0), published_at: sampleDate(-2, 0), scheduled_at: sampleDate(-2, 0)},
-    {id: "weekend", text: "От материала к решению\nЧерновик рубрики о применении стекла. Факты и характеристики добавим из подтверждённых источников.", status: "review", art: "pattern-2",
-      revision: 1, created_at: sampleDate(-4, 0), scheduled_at: null},
-    {id: "beans", text: "Вопросы о стекле\nДемонстрационная рубрика: собираем вопросы аудитории для следующих публикаций.", status: "approved", art: "pattern-1",
-      revision: 2, created_at: sampleDate(-5, 0), scheduled_at: sampleDate(3, 0)},
-    {id: "barista", text: "Пространство для идей\nПример материала в фирменной палитре компании. Публикация в демо имитируется.", status: "published", art: "pattern-3",
-      revision: 1, created_at: sampleDate(-6, 0), published_at: sampleDate(-5, 0), scheduled_at: sampleDate(-5, 0)},
-  ],
-}];
-for (const entry of demoWorkspaces) for (const post of entry.posts) Object.assign(post, {
-  business_id: entry.business.id, channel_id: entry.business.channel_id, profile_version: 1,
-  used_source_ids: ["note"], warnings: [],
-});
-const restoredDemo = demo ? window.TirazhDemoStore.read() : {data: null, issue: null};
-if (restoredDemo.data) demoWorkspaces = restoredDemo.data.workspaces;
-const demoJobs = new Map((restoredDemo.data?.jobs || []).map(job => [job.id, job]));
-const demoAssets = new Map((restoredDemo.data?.assets || []).map(asset => [asset.id, asset]));
 let state = {businesses: [], business: null, sources: [], posts: [], counts: {}};
 let view = views.has(location.hash.slice(1)) ? location.hash.slice(1) : "overview";
-let businessId = restoredDemo.data?.selectedBusiness || "";
+let businessId = preview?.selectedBusiness || "";
 let statusFilter = "";
 let content = {items: [], more: false, page: 0};
 let contentLayout = "list";
@@ -75,7 +40,6 @@ let report = null;
 let controls = {jobs: [], operations: [], usage: {}};
 let postRequest = 0;
 let conversation = [];
-const demoConversations = new Map(restoredDemo.data?.conversations || []);
 let pageRequest = 0;
 let stateRequest = 0;
 let toastTimer;
@@ -124,7 +88,7 @@ function applyAccess() {
   document.body.dataset.access = access.can_write ? "write" : "read";
   const banner = $("#access-banner");
   banner.hidden = access.can_write;
-  $("#access-label").textContent = access.role === "reviewer" ? "Просмотр для жюри" : "Только просмотр";
+  $("#access-label").textContent = access.role === "reviewer" ? "Наблюдатель" : "Только просмотр";
   accessRules.apply(root, access);
   accessRules.apply(dialogBody, access);
 }
@@ -163,152 +127,9 @@ function announceError(error) {
 }
 function persistDemo() {
   if (!demo) return;
-  const saved = window.TirazhDemoStore.write({workspaces: demoWorkspaces, jobs: [...demoJobs.values()],
-    conversations: [...demoConversations], assets: [...demoAssets.values()], selectedBusiness: businessId});
+  const saved = preview.persist(businessId);
   const note = $("#demo-storage-note");
   if (note) note.textContent = saved ? "Изменения сохраняются в этом браузере." : "Хранилище недоступно или заполнено. Изменения сохраняются только в этой вкладке.";
-}
-function demoApi(url, method, body) {
-  const [pathname, query] = url.split("?");
-  const params = new URLSearchParams(query);
-  const parts = pathname.split("/").filter(Boolean);
-  const selected = demoWorkspaces.find((w) => w.business.id === (params.get("business") || parts[1]))
-    || demoWorkspaces[0];
-  if (pathname === "/state") {
-    const {business, sources, posts} = selected;
-    const counts = posts.reduce((result, post) => {
-      result[post.status] = (result[post.status] || 0) + 1;
-      return result;
-    }, {total: posts.length});
-    return {access: {role: "owner", can_write: true}, businesses: demoWorkspaces.map(({business: b}) => ({id: b.id, name: b.name})),
-      business, sources, counts, posts: posts.slice(0, 6), upcoming: posts.filter(p => p.status === "approved" && p.scheduled_at).sort((a,b) => Date.parse(a.scheduled_at) - Date.parse(b.scheduled_at))[0]};
-  }
-  if (pathname === "/business" && method === "POST") {
-    const business = {id: crypto.randomUUID(), name: body.name, timezone: "Europe/Moscow", profile_version: 0};
-    demoWorkspaces.push({business, sources: [], posts: []});
-    return business;
-  }
-  if (parts[0] === "business") {
-    const {business, sources, posts} = selected;
-    if (parts[2] === "history") return {items: demoConversations.get(business.id) || []};
-    if (parts[2] === "chat") {
-      const history = demoConversations.get(business.id) || [];
-      const answer = "Это демонстрационный ответ. В рабочем режиме AI использует профиль «" + business.name
-        + "», факты из материалов и историю этой компании. Для подготовки тестового черновика нажмите «Новое задание».";
-      history.push({user_text: body.text, assistant_text: answer, created_at: new Date().toISOString()});
-      demoConversations.set(business.id, history);
-      return {intent: {action: "answer", answer}};
-    }
-    if (parts[2] === "control") return {business, jobs: [...demoJobs.values()].filter(j => j.business_id === business.id),
-      operations: [], usage: {used_today: [...demoJobs.values()].length, daily_limit: 100, running: 0}, failed_notifications: []};
-    if (parts[2] === "knowledge" && parts[3] === "search") return {items: [], preview: true};
-    if (parts[2] === "jobs") return {items: [...demoJobs.values()].filter(j => j.business_id === business.id)};
-    if (parts[2] === "pause") { business.publications_paused = body.paused; return business; }
-    if (parts[2] === "automation") {
-      Object.assign(business, {automation_enabled: body.enabled, interval_hours: body.interval_hours,
-        automation_request: body.request, next_generation_at: body.enabled ? body.first_run_at || sampleDate(1, 0) : null});
-      return business;
-    }
-    if (parts[2] === "calendar") return {month: params.get("month"), timezone: business.timezone,
-      items: posts.filter(post => post.scheduled_at && dayKey(post.scheduled_at, business.timezone).startsWith(params.get("month"))),
-      unscheduled_count: posts.filter(post => !post.scheduled_at).length};
-    if (parts[2] === "draft") {
-      if (!business.profile_confirmed || !business.channel_id) throw new Error("Подтвердите профиль и подключите канал.");
-      const asset = demoAssets.get(body.image_asset_id);
-      if (!asset || asset.business_id !== business.id) throw new Error("Добавьте изображение этой компании.");
-      const post = {id: crypto.randomUUID(), business_id: business.id, channel_id: business.channel_id,
-        profile_version: business.profile_version, used_source_ids: body.source_ids || [], warnings: ["Создано вручную: проверьте факты перед публикацией."],
-        text: body.text, image_asset_id: body.image_asset_id, revision: 1, status: "review", is_demo: true,
-        created_at: new Date().toISOString(), scheduled_at: body.scheduled_at || null, content_origin: "manual"};
-      posts.unshift(post); return post;
-    }
-    if (parts[2] === "posts") {
-      let filtered = params.get("status") ? posts.filter((p) => p.status === params.get("status")) : posts;
-      if (params.get("search")) filtered = filtered.filter(post => post.text.toLocaleLowerCase("ru").includes(params.get("search").toLocaleLowerCase("ru")));
-      const start = Number(params.get("page") || 0) * 12;
-      return {items: filtered.slice(start, start + 12), more: filtered.length > start + 12, total: filtered.length};
-    }
-    if (parts[2] === "source") {
-      sources.push({id: crypto.randomUUID(), name: body.kind === "url" ? body.value : "Описание бизнеса",
-        kind: body.kind});
-      if (business.profile) business.profile_confirmed = false;
-      return {};
-    }
-    if (parts[2] === "channel") {
-      business.channel_id = body.value;
-      business.channel_title = body.value;
-      return business;
-    }
-    if (parts[2] === "profile") {
-      if (parts[3] === "manual") {
-        if (body.revision !== business.profile_version) throw new Error("Обновите профиль и попробуйте ещё раз.");
-        business.profile = {description: body.description, tone: body.tone || "Понятно и по делу", products: body.products || [],
-          audience: body.audience || "", constraints: body.constraints || [], facts: [{text: body.description}]};
-        business.profile_version++; business.profile_confirmed = false;
-        sources.push({id: crypto.randomUUID(), name: "Сведения владельца", kind: "text"});
-      } else if (parts[3] === "analyze") {
-        if (!sources.length) throw new Error("Добавьте источник.");
-        business.profile = {description: "Демонстрационный профиль", tone: "Дружелюбно", facts: []};
-        business.profile_version++;
-        business.profile_confirmed = false;
-      } else business.profile_confirmed = true;
-      return business;
-    }
-    if (parts[2] === "report") {
-      const series = [0, 1, 1, 2, 0, 1, 2].map((created, index) => ({
-        label: new Intl.DateTimeFormat("ru-RU", {day: "2-digit", month: "2-digit"}).format(
-          new Date(Date.now() - (6 - index) * 86400000)),
-        created: business.id === "demo" ? created : 0,
-        sent: business.id === "demo" && index === 4 ? 1 : 0,
-      }));
-      return {series, detail: "Демонстрационные показатели. Данные Telegram не запрашиваются."};
-    }
-    if (parts[2] === "prepare") {
-      const id = crypto.randomUUID();
-      if (!business.profile_confirmed || !business.channel_id) throw new Error("Сначала подтвердите профиль и подключите канал.");
-      posts.unshift({id, business_id: business.id, channel_id: business.channel_id, profile_version: business.profile_version,
-        used_source_ids: sources.map(s => s.id), warnings: [], text: "Демонстрационный черновик\n" + body.request,
-        status: "review", art: "pattern-1", revision: 1, created_at: new Date().toISOString()});
-      demoJobs.set(id, {id, business_id: business.id, request: body.request, status: "done", stage: "done",
-        processed: 1, total: 1, created_at: new Date().toISOString()});
-      return demoJobs.get(id);
-    }
-  }
-  if (parts[0] === "job") {
-    const job = demoJobs.get(parts[1]);
-    if (!job) throw new Error("Задание не найдено.");
-    if (parts[2] === "cancel") { job.status = "cancelled"; job.stage = "cancelled"; }
-    return job;
-  }
-  if (parts[0] === "post") {
-    const post = demoWorkspaces.flatMap((w) => w.posts).find((p) => p.id === parts[1]);
-    if (!post) throw new Error("Пост не найден.");
-    if (method === "POST") {
-      if (body.revision !== post.revision) throw new Error("Откройте актуальную версию.");
-      if (parts[2] === "edit") {
-        if (body.scheduled_at && new Date(body.scheduled_at) <= new Date()) {
-          throw new Error("Выберите время в будущем.");
-        }
-        Object.assign(post, body, {revision: post.revision + 1, status: "review"});
-      }
-      if (parts[2] === "revise-text" || parts[2] === "revise-image") {
-        if (parts[2] === "revise-text") post.text += "\nДемо-правка: " + body.feedback;
-        else post.art = post.art === "pattern-1" ? "pattern-2" : "pattern-1";
-        post.revision++; post.status = "review";
-      }
-      if (parts[2] === "refresh-context") {
-        post.profile_version = demoWorkspaces.find(w => w.business.id === post.business_id).business.profile_version;
-        post.revision++; post.status = "review";
-      }
-      if (parts[2] === "approve") {
-        if (!post.scheduled_at) throw new Error("Сначала укажите время.");
-        post.status = "approved";
-      }
-      if (parts[2] === "reject") post.status = "rejected";
-    }
-    return post;
-  }
-  throw new Error("Действие недоступно.");
 }
 function apiTimeout(url, method) {
   // Only synchronous inference needs the backend's 300s budget plus transport margin.
@@ -319,7 +140,7 @@ function apiTimeout(url, method) {
 async function api(url, body) {
   const method = body ? "POST" : "GET";
   accessRules.assertRequest(currentAccess(), method);
-  if (demo) { const result = demoApi(url, method, body); if (method === "POST") persistDemo(); return result; }
+  if (demo) { const result = preview.api(url, method, body, dayKey); if (method === "POST") persistDemo(); return result; }
   const initData = session.initData();
   if (!initData) throw new Error("Не получены данные входа Telegram. Закройте студию и откройте её заново из меню бота.");
   const response = await request("./api" + url, {
@@ -336,7 +157,7 @@ async function api(url, body) {
   return response.json().catch(() => { throw new Error("Приложение вернуло неожиданный ответ. Возможно, ссылка на студию устарела."); });
 }
 function postArt(post, additionalClass = "") {
-  const localImage = demo && demoAssets.get(post.image_asset_id);
+  const localImage = demo && preview.asset(post.image_asset_id);
   if (localImage && localImage.business_id === post.business_id) return '<div class="post-art ' + additionalClass + '"><img src="' + safe(localImage.data_url) + '" alt="Изображение к посту"></div>';
   const art = ["pattern-1", "pattern-2", "pattern-3"].includes(post.art) ? post.art : "pattern-1";
   if (demo) return '<div class="post-art brand-post-art ' + additionalClass + '"><img src="./brand-' + art
@@ -465,11 +286,11 @@ function setupProgress() {
   const steps = [
     [state.sources.length > 0, "Материалы", "add-source", "Добавьте описание, сайт или PDF"],
     [Boolean(b.profile_confirmed), "Профиль", b.profile ? "confirm-profile" : "manual-profile", "Проверьте сведения о компании"],
-    [Boolean(b.channel_id), "Канал", "channel", "Подключите тестовый Telegram-канал"],
+    [Boolean(b.channel_id), "Канал", "channel", "Подключите Telegram-канал"],
   ];
   const done = steps.filter(s => s[0]).length;
   const next = steps.find(step => !step[0]);
-  const nextDetail = next?.[1] === "Канал" ? "Подключите тестовый Telegram-канал, чтобы создавать посты. В AI-диалоге уже можно задавать вопросы о компании."
+  const nextDetail = next?.[1] === "Канал" ? "Подключите Telegram-канал, чтобы создавать посты. В AI-диалоге уже можно задавать вопросы о компании."
     : next?.[1] === "Профиль" ? "Проверьте сведения о компании и подтвердите профиль перед подготовкой постов."
       : "Добавьте описание, страницу сайта или PDF. На их основе AI подготовит профиль компании.";
   return '<section class="setup-panel panel"><div class="section-top"><div><p class="eyebrow">НАСТРОЙКА КОМПАНИИ</p>'
@@ -821,12 +642,9 @@ async function refresh({transition = false} = {}) {
     const result = await api("/state" + (businessId ? "?business=" + path(businessId) : ""));
     if (epoch !== stateRequest) return false;
     if (!Array.isArray(result?.businesses)) throw new Error("Не удалось прочитать данные приложения. Откройте студию по новой кнопке в меню бота.");
+    if (!demo && result.runtime_mode !== "live") throw new Error("Рабочий сервер не подтвердил режим live. Обратитесь к администратору.");
     state = result;
     applyAccess();
-    if (!demo && state.runtime_mode === "demo") {
-      const banner = $("#mode-banner"); banner.hidden = false;
-      banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовый backend. AI и публикации имитируются; данные сохраняются.</span>';
-    }
     businessId = state.business?.id || "";
     persistDemo();
     return await loadPage();
@@ -987,7 +805,7 @@ document.addEventListener("click", async (event) => {
       showDialog(dialogHeading("Сбросить демо?", "Созданные в этом браузере тестовые компании, посты, изображения и диалоги будут удалены. Откроются исходные примеры.")
         + '<div class="dialog-actions">' + button("Сбросить тестовые данные", "confirm-reset-demo", "primary") + button("Отмена", "close", "secondary") + '</div>');
     } else if (action === "confirm-reset-demo" && demo) {
-      if (!window.TirazhDemoStore.clear()) throw new Error("Браузер не разрешает очистить локальное хранилище.");
+      if (!preview.clear()) throw new Error("Браузер не разрешает очистить локальное хранилище.");
       location.reload();
     } else if (action === "manual-profile") {
       const b = state.business, profile = b.profile || {};
@@ -1037,7 +855,7 @@ document.addEventListener("click", async (event) => {
         + safe(b.automation_request || 'Подготовь один полезный пост о бизнесе') + '</textarea></label>'
         + formField("Интервал, часов", "interval_hours", "number", 'min="1" max="720" value="' + (b.interval_hours || 24) + '"')
         + '<label class="form-row"><span>Первый запуск (часовой пояс устройства)</span><input name="first_run_at" type="datetime-local" value="'
-        + editableDate(b.next_generation_at && new Date(b.next_generation_at) > new Date() ? b.next_generation_at : sampleDate(0, 1)) + '"></label>', "Сохранить расписание");
+        + editableDate(b.next_generation_at && new Date(b.next_generation_at) > new Date() ? b.next_generation_at : new Date(Date.now() + 3600000).toISOString()) + '"></label>', "Сохранить расписание");
     } else if (action === "toggle-pause") {
       await api("/business/" + path(businessId) + "/pause", {paused: !state.business.publications_paused});
       await refresh(); notify(state.business.publications_paused ? "Отправка публикаций приостановлена." : "Публикации возобновлены.");
@@ -1056,7 +874,7 @@ document.addEventListener("click", async (event) => {
       await refresh();
     } else if (action === "new-post") {
       if (state.capabilities?.text_generation === "unconfigured" || state.capabilities?.image_generation === "unconfigured") {
-        showDialog(dialogHeading("AI пока не подключён", "Модель можно подключить позже. Уже сейчас доступны ручные тексты, загрузка изображений, согласование и календарь.")
+        showDialog(dialogHeading("AI пока не подключён", "Администратору нужно проверить подключение модели. Можно сохранить материал вручную.")
           + '<div class="dialog-actions">' + button("Создать вручную", "manual-post", "primary", "plus") + button("Закрыть", "close", "secondary") + '</div>'); return;
       }
       if (!state.business.profile_confirmed || !state.business.channel_id) {
@@ -1180,8 +998,7 @@ dialog.addEventListener("submit", async (event) => {
       const file = values.file;
       if (!file?.size || file.size > 10000000) throw new Error("Выберите PDF размером до 10 МБ.");
       if (demo) {
-        demoWorkspaces.find(w => w.business.id === id).sources.push({id: crypto.randomUUID(), name: file.name, kind: "pdf"});
-        demoWorkspaces.find(w => w.business.id === id).business.profile_confirmed = false;
+        preview.addPdf(id, file.name);
         persistDemo();
       } else {
         const data = new FormData(); data.append("file", file);
@@ -1259,7 +1076,7 @@ async function uploadManualImage(file, business, form) {
   if (form.dataset.assetId) return form.dataset.assetId;
   let assetId;
   if (demo) {
-    assetId = crypto.randomUUID(); demoAssets.set(assetId, {id: assetId, business_id: business, data_url: await fileData(file)});
+    assetId = crypto.randomUUID(); preview.addAsset({id: assetId, business_id: business, data_url: await fileData(file)});
   } else {
     const data = new FormData(); data.append("file", file);
     const response = await request("./api/business/" + path(business) + "/image", {method: "POST", headers: {"X-Telegram-Init-Data": session.initData()}, body: data});
@@ -1379,7 +1196,7 @@ session.onBridge(attachTelegramBridge);
 if (demo) {
   const banner = $("#mode-banner"); banner.hidden = false;
   banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>AI, отправка и расписание имитируются. <span id="demo-storage-note">Изменения сохраняются в этом браузере.</span></span>' + button("Сбросить", "reset-demo", "demo-reset");
-  if (restoredDemo.issue) notify(restoredDemo.issue);
+  if (preview.storageIssue) notify(preview.storageIssue);
 }
 useTheme();
 session.ready();

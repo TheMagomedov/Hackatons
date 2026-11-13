@@ -81,7 +81,7 @@ test('DOM pass hides dynamic mutations and form fields while preserving read con
 test('actual app renders reviewer badge/read navigation and rejects crafted mutation events before transport', async () => {
   const app = await application();
   assert.equal(app.nodes.get('#access-banner').hidden,false);
-  assert.equal(app.nodes.get('#access-label').textContent,'Просмотр для жюри');
+  assert.equal(app.nodes.get('#access-label').textContent,'Наблюдатель');
   assert.match(app.nodes.get('#main').innerHTML,/data-action="filter"/);
   assert.doesNotMatch(app.nodes.get('#main').innerHTML,/data-action="(?:manual-post|automation)"/);
   assert.throws(() => app.run('openForm("business","Создать","","","Создать")'), /Доступ для просмотра/);

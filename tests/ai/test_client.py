@@ -14,6 +14,8 @@ def isolate_provider_environment(monkeypatch):
     for name in (
         "TEXT_API_KEY", "TEXT_MODEL", "TEXT_API_BASE", "TEXT_TIMEOUT_SECONDS", "TEXT_MAX_RETRIES",
         "AI_API_KEY", "AI_MODEL", "AI_BASE_URL", "AI_TIMEOUT_SECONDS", "AI_MAX_RETRIES",
+        "TEXT_REASONING_EFFORT", "AI_REASONING_EFFORT",
+        "TEXT_WIRE_API", "AI_WIRE_API",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -49,6 +51,105 @@ async def test_real_wire_shape_and_secret_only_in_header():
     finally:
         await instance.close()
     assert instance._http.is_closed
+
+
+async def test_selected_reasoning_effort_reaches_provider_without_changing_model(monkeypatch):
+    for key, value in {
+        "TEXT_API_KEY": "private-test-key", "TEXT_MODEL": "gpt-6.1-sol",
+        "TEXT_API_BASE": "https://agentrouter.org/v1", "TEXT_REASONING_EFFORT": "low",
+        "AI_REASONING_EFFORT": "high",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    def handler(request):
+        payload = json.loads(request.content)
+        assert request.url == "https://agentrouter.org/v1/chat/completions"
+        assert payload["model"] == "gpt-6.1-sol"
+        assert payload["reasoning_effort"] == "low"
+        return response('{"action":"report"}')
+
+    instance = ChatJSONClient(AISettings.from_env(), transport=httpx.MockTransport(handler))
+    try:
+        assert (await instance.complete(TaskIntent, "Intent", {})).action == "report"
+    finally:
+        await instance.close()
+
+
+async def test_external_access_denial_is_not_retried_or_replaced():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(401, json={"type": "unauthorized_client_error"})
+
+    instance = client(handler, reasoning_effort="low")
+    try:
+        with pytest.raises(ProviderUnavailable, match="отклонил доступ"):
+            await instance.complete(TaskIntent, "Intent", {})
+    finally:
+        await instance.close()
+    assert len(calls) == 1
+
+
+def responses_body(text='{"action":"report"}', **updates):
+    return {"status": "completed", "output": [
+        {"type": "reasoning", "summary": []},
+        {"type": "message", "role": "assistant", "status": "completed",
+         "content": [{"type": "output_text", "text": text}]},
+    ], **updates}
+
+
+async def test_responses_wire_uses_low_effort_redacts_input_and_disables_storage():
+    def handler(request):
+        payload = json.loads(request.content)
+        assert request.url.path == "/v1/responses"
+        assert payload["reasoning"] == {"effort": "low"}
+        assert payload["store"] is False
+        assert payload["text"] == {"format": {"type": "json_object"}}
+        assert "private@example.com" not in request.content.decode()
+        assert "[EMAIL]" in request.content.decode()
+        assert "JSON" in payload["instructions"]
+        assert "messages" not in payload and "tools" not in payload
+        return httpx.Response(200, json=responses_body())
+
+    instance = client(handler, wire_api="responses", reasoning_effort="low")
+    try:
+        assert (await instance.complete(TaskIntent, "Intent", {"email": "private@example.com"})).action == "report"
+    finally:
+        await instance.close()
+
+
+@pytest.mark.parametrize("body", [
+    responses_body(status="incomplete"), responses_body(error={"message": "private error"}),
+    responses_body(output=[]), responses_body(output=[{"type": "function_call", "name": "publish"}]),
+    responses_body(output=[{"type": "message", "role": "assistant", "status": "in_progress", "content": []}]),
+    responses_body(output=[None]), None,
+])
+async def test_responses_rejects_incomplete_empty_or_tool_output(body):
+    instance = client(lambda _: httpx.Response(200, json=body), wire_api="responses", max_retries=0)
+    try:
+        with pytest.raises(ProviderUnavailable):
+            await instance.complete(TaskIntent, "Intent", {})
+    finally:
+        await instance.close()
+
+
+async def test_responses_refusal_has_no_repair_retry():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        body = responses_body()
+        body["output"][1]["content"] = [{"type": "refusal", "refusal": "No"}]
+        return httpx.Response(200, json=body)
+
+    instance = client(handler, wire_api="responses")
+    try:
+        with pytest.raises(ProviderUnavailable, match="отказался"):
+            await instance.complete(TaskIntent, "Intent", {})
+    finally:
+        await instance.close()
+    assert len(requests) == 1
 
 
 async def test_invalid_output_repaired_once_without_reflecting_raw_output():
@@ -224,6 +325,7 @@ def test_partial_families_never_supply_each_others_model_or_url(monkeypatch, val
 @pytest.mark.parametrize("key,value", [
     ("TEXT_API_BASE", "http://insecure.example/v1"), ("TEXT_TIMEOUT_SECONDS", "bad"),
     ("TEXT_MAX_RETRIES", "99"), ("AI_BASE_URL", "http://insecure.example/v1"),
+    ("TEXT_REASONING_EFFORT", "unsupported"),
 ])
 def test_invalid_optional_configuration_fails_even_when_unconfigured(monkeypatch, key, value):
     monkeypatch.setenv(key, value)

@@ -34,6 +34,33 @@ class Client:
         self.closed = True
 
 
+async def test_external_cache_keeps_provider_effort_and_company_separate(tmp_path):
+    from app.ai.client import AISettings
+    from app.ai.resilience import InferenceRouter
+
+    client = Client()
+    client.settings = AISettings(api_key="private-test-key", model="gpt-6.1-sol",
+                                 base_url="https://agentrouter.org/v1", reasoning_effort="low")
+    store = InferenceStore(tmp_path / "cache.sqlite3")
+    router = InferenceRouter([client], store)
+    with scope():
+        await call(router)
+        await call(router)
+        assert client.calls == 1
+        client.settings = client.settings.model_copy(update={"reasoning_effort": "medium"})
+        await call(router)
+        assert client.calls == 2
+    with scope("another-company"):
+        await call(router)
+    assert client.calls == 3
+    with store.connection() as db:
+        records = str([tuple(row) for row in db.execute("SELECT * FROM inference_cache")])
+        records += str([tuple(row) for row in db.execute("SELECT * FROM inference_traces")])
+    assert "private-test-key" not in records
+    await router.close()
+    assert client.closed
+
+
 def scope(business="company-a", version=1):
     return inference_scope(business, "operation-a", "interpret", version)
 

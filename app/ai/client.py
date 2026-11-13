@@ -1,4 +1,4 @@
-"""Bounded async JSON client for a configured Chat Completions provider.
+"""Bounded async JSON client for a configured Chat Completions or Responses provider.
 
 JSON mode is used for compatibility; Pydantic and caller checks enforce the
 actual application contract. No request bodies, credentials or responses are logged.
@@ -8,7 +8,7 @@ import asyncio
 import json
 import os
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Literal, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
@@ -23,10 +23,14 @@ _ENV_FAMILIES = {
     "TEXT": {
         "TEXT_API_KEY": "api_key", "TEXT_MODEL": "model", "TEXT_API_BASE": "base_url",
         "TEXT_TIMEOUT_SECONDS": "timeout_seconds", "TEXT_MAX_RETRIES": "max_retries",
+        "TEXT_REASONING_EFFORT": "reasoning_effort",
+        "TEXT_WIRE_API": "wire_api",
     },
     "AI": {
         "AI_API_KEY": "api_key", "AI_MODEL": "model", "AI_BASE_URL": "base_url",
         "AI_TIMEOUT_SECONDS": "timeout_seconds", "AI_MAX_RETRIES": "max_retries",
+        "AI_REASONING_EFFORT": "reasoning_effort",
+        "AI_WIRE_API": "wire_api",
     },
 }
 
@@ -59,6 +63,8 @@ class AISettings(BaseModel):
     max_retries: int = Field(default=1, ge=0, le=2)
     max_response_bytes: int = Field(default=512_000, ge=1024, le=2_000_000)
     max_completion_tokens: int = Field(default=3000, ge=128, le=8000)
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None
+    wire_api: Literal["chat", "responses"] = "chat"
 
     @field_validator("api_key")
     @classmethod
@@ -188,12 +194,9 @@ class ChatJSONClient:
                     "\nПредыдущий результат не прошёл проверку. Проверь JSON, все поля, "
                     "длину, уникальность тем, допустимые ID и подтверждение фактов."
                 )
-            payload = {
-                "model": self.settings.model, "response_format": {"type": "json_object"},
-                "max_completion_tokens": self.settings.max_completion_tokens, "messages": messages,
-            }
+            endpoint, payload = self._wire_request(messages)
             async with self._http.stream(
-                "POST", self.settings.base_url + "/chat/completions", json=payload,
+                "POST", self.settings.base_url + endpoint, json=payload,
                 headers={"Authorization": "Bearer " + self.settings.api_key.get_secret_value()},
             ) as response:
                 status = response.status_code
@@ -217,13 +220,7 @@ class ChatJSONClient:
                         raise ProviderUnavailable("Ответ AI-провайдера превышает допустимый размер.")
             try:
                 envelope = json.loads(body)
-                choice = envelope["choices"][0]
-                message = choice["message"]
-                if message.get("refusal"):
-                    raise ProviderUnavailable("AI-провайдер отказался выполнять этот запрос.")
-                if choice.get("finish_reason") != "stop":
-                    raise ValueError("Incomplete model output")
-                content = message["content"]
+                content = self._output_text(envelope)
                 if not isinstance(content, str):
                     raise ValueError("Invalid message content")
                 result = schema.model_validate_json(content)
@@ -234,3 +231,53 @@ class ChatJSONClient:
                 repair = True
                 last_error = "Модель вернула результат, не соответствующий формату или ограничениям."
         raise ProviderUnavailable(last_error)
+
+    def _wire_request(self, messages: list[dict]) -> tuple[str, dict]:
+        if self.settings.wire_api == "responses":
+            payload = {
+                "model": self.settings.model, "instructions": messages[0]["content"],
+                "input": [messages[1]], "text": {"format": {"type": "json_object"}},
+                "max_output_tokens": self.settings.max_completion_tokens, "store": False,
+            }
+            if self.settings.reasoning_effort is not None:
+                payload["reasoning"] = {"effort": self.settings.reasoning_effort}
+            return "/responses", payload
+        payload = {
+            "model": self.settings.model, "response_format": {"type": "json_object"},
+            "max_completion_tokens": self.settings.max_completion_tokens, "messages": messages,
+            "store": False,
+        }
+        if self.settings.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.settings.reasoning_effort
+        return "/chat/completions", payload
+
+    def _output_text(self, envelope: dict) -> str:
+        if self.settings.wire_api == "chat":
+            choice = envelope["choices"][0]
+            message = choice["message"]
+            if message.get("refusal"):
+                raise ProviderUnavailable("AI-провайдер отказался выполнять этот запрос.")
+            if choice.get("finish_reason") != "stop" or message.get("tool_calls"):
+                raise ValueError("Incomplete or unexpected model output")
+            return message["content"]
+        if envelope.get("status") != "completed" or envelope.get("error") or envelope.get("incomplete_details"):
+            raise ValueError("Incomplete model output")
+        output = envelope["output"]
+        if not isinstance(output, list):
+            raise ValueError("Invalid model output")
+        parts = []
+        for item in output:
+            if item["type"] == "reasoning":
+                continue
+            if (item["type"] != "message" or item.get("role") != "assistant"
+                    or item.get("status") != "completed"):
+                raise ValueError("Unexpected model action")
+            for part in item["content"]:
+                if part["type"] == "refusal":
+                    raise ProviderUnavailable("AI-провайдер отказался выполнять этот запрос.")
+                if part["type"] != "output_text" or not isinstance(part.get("text"), str):
+                    raise ValueError("Invalid message content")
+                parts.append(part["text"])
+        if not parts:
+            raise ValueError("Missing model output")
+        return "".join(parts)
