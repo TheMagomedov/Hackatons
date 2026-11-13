@@ -6,6 +6,7 @@ import binascii
 import ipaddress
 import json
 import math
+import re
 import socket
 import ssl
 import urllib.error
@@ -108,6 +109,7 @@ class OpenAIImageProvider:
         endpoint: str = "https://api.openai.com/v1/images/generations",
         limits: MediaLimits = DEFAULT_LIMITS,
         transport: BlockingImageTransport | None = None,
+        allow_local_flux: bool = False,
     ):
         validate_limits(limits)
         if (
@@ -130,12 +132,19 @@ class OpenAIImageProvider:
             or timeout_seconds <= 0
         ):
             raise MediaConfigurationError("timeout_seconds must be a positive finite number.")
+        if type(allow_local_flux) is not bool:
+            raise MediaConfigurationError("allow_local_flux must be an explicit boolean.")
         try:
             parsed = urllib.parse.urlsplit(endpoint)
+            local_match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/v1/images/generations", endpoint)
+            local_endpoint = (
+                model == "flux1-dev" and local_match is not None
+                and 1024 <= int(local_match.group(1)) <= 65535
+            )
             valid_endpoint = (
                 isinstance(endpoint, str)
                 and len(endpoint) <= 2_048
-                and parsed.scheme == "https"
+                and (local_endpoint if allow_local_flux else parsed.scheme == "https")
                 and bool(parsed.hostname)
                 and parsed.username is None
                 and parsed.password is None
@@ -147,13 +156,17 @@ class OpenAIImageProvider:
         except (ValueError, TypeError, AttributeError):
             valid_endpoint = False
         if not valid_endpoint:
-            raise MediaConfigurationError("The image endpoint must be an HTTPS URL without credentials.")
+            raise MediaConfigurationError(
+                "Local FLUX requires model flux1-dev and canonical http://127.0.0.1:<1024-65535>/v1/images/generations."
+                if allow_local_flux else "The image endpoint must be an HTTPS URL without credentials."
+            )
         if transport is not None and not callable(getattr(transport, "send", None)):
             raise MediaConfigurationError("The image transport must implement send().")
         self._api_key = api_key
         self._model = model
         self._timeout_seconds = float(timeout_seconds)
         self._endpoint = endpoint
+        self._local_flux = allow_local_flux
         self._limits = limits
         self._transport = transport if transport is not None else UrllibImageTransport()
 
@@ -215,7 +228,7 @@ class OpenAIImageProvider:
         return GeneratedImage(
             content=image_bytes,
             mime_type="image/png",
-            provider="openai",
+            provider="flux1-dev" if self._local_flux else "openai",
             is_demo=False,
         )
 

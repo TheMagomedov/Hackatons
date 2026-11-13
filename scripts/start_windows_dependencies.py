@@ -7,6 +7,7 @@ takeover. Existing listeners must prove their protocol identity before reuse.
 import argparse
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import shutil
@@ -54,8 +55,12 @@ def request_json(url, key=None, *, payload=None):
 
 
 def listening(port):
+    return endpoint_listening("127.0.0.1", port)
+
+
+def endpoint_listening(host, port):
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+        with socket.create_connection((host, port), timeout=0.5):
             return True
     except OSError:
         return False
@@ -162,6 +167,128 @@ def ensure_local_text(config, root, *, check=False):
     print("Ollama подтвердил отключение облака и наличие выбранной локальной модели.", flush=True)
 
 
+def caddy_configuration(values, root, app_port):
+    """Adapt an explicitly configured Caddyfile without provisioning or issuing a certificate."""
+    supplied = [values.get(key, "").strip() for key in ("CADDY_EXE_PATH", "CADDY_CONFIG_PATH")]
+    if not any(supplied):
+        return None
+    if not all(supplied):
+        raise BootstrapError("Для прямого HTTPS нужны CADDY_EXE_PATH и CADDY_CONFIG_PATH.")
+    executable, path = [(root / value).resolve() for value in supplied]
+    if (not executable.is_file() or executable.name.lower() != "caddy.exe"
+            or not path.is_file() or path.stat().st_size > 131_072):
+        raise BootstrapError("Нужны установленный caddy.exe и небольшой локальный Caddyfile.")
+    try:
+        public = urlsplit(values.get("WINDOWS_PUBLIC_URL", ""))
+        valid_url = (public.scheme == "https" and public.hostname and public.path == "/mini/"
+                     and public.port in (None, 443) and not public.username and not public.password
+                     and not public.query and not public.fragment)
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise BootstrapError("Прямой HTTPS требует WINDOWS_PUBLIC_URL=https://<адрес>/mini/ на порту 443.")
+    extra = {key: values[key] for key in ("CADDY_PUBLIC_HOST", "CADDY_BIND_ADDRESS", "CADDY_STORAGE_PATH")
+             if values.get(key)}
+    try:
+        result = subprocess.run(
+            [str(executable), "adapt", "--config", str(path), "--adapter", "caddyfile"],
+            cwd=root, env=child_environment(extra), capture_output=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
+        )
+        if result.returncode or len(result.stdout) > 1_048_576:
+            raise ValueError
+        expected = json.loads(result.stdout)
+        if set(expected["apps"]) != {"http", "tls"}:
+            raise ValueError
+        storage = expected["storage"]
+        if storage.get("module") != "file_system" or not isinstance(storage.get("root"), str) or not storage["root"]:
+            raise ValueError
+        policies = expected["apps"]["tls"]["automation"]["policies"]
+        if {name for policy in policies for name in policy.get("subjects", [])} != {public.hostname}:
+            raise ValueError
+        admin = expected["admin"]["listen"]
+        admin_host, admin_port = admin.rsplit(":", 1)
+        admin_port = int(admin_port)
+        if (admin_host != "127.0.0.1" or not 1024 <= admin_port <= 65535
+                or admin_port in {app_port, 8188, 8190, 8192, 8193, 8194, 11434}):
+            raise ValueError
+        servers = expected["apps"]["http"]["servers"]
+        listeners = []
+        proxy_count = 0
+
+        def routes(items, scoped=False):
+            nonlocal proxy_count
+            for route in items:
+                matches = route.get("match", [])
+                restricted = scoped or bool(matches and all(m.get("path") == ["/mini/*"] for m in matches))
+                for handler in route.get("handle", []):
+                    kind = handler.get("handler")
+                    if kind == "subroute":
+                        routes(handler["routes"], restricted)
+                    elif kind == "reverse_proxy":
+                        if (not restricted or handler.get("upstreams") != [{"dial": f"127.0.0.1:{app_port}"}]
+                                or handler.get("dynamic_upstreams") or handler.get("rewrite")):
+                            raise ValueError
+                        proxy_count += 1
+                    elif kind == "static_response":
+                        status = int(handler["status_code"])
+                        if status != 404 and not (
+                            restricted and status in (301, 302, 307, 308)
+                            and handler.get("headers", {}).get("Location") == [
+                                f"https://{public.netloc}{{http.request.uri}}"]
+                        ):
+                            raise ValueError
+                    else:
+                        # Never accept a file server, arbitrary handler or route to another local service.
+                        raise ValueError
+
+        for server in servers.values():
+            if server.get("automatic_https", {}).get("disable_redirects") is not True or server.get("logs"):
+                raise ValueError  # HTTP must be explicitly bound; implicit wildcard listeners are forbidden.
+            for address in server["listen"]:
+                host, port = address.rsplit(":", 1)
+                ip, port = ipaddress.IPv4Address(host), int(port)
+                if (not ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast
+                        or not 1 <= port <= 65535 or port in {app_port, admin_port, 8188, 8190, 8192, 8193, 8194, 11434}):
+                    raise ValueError
+                listeners.append((host, port))
+            routes(server["routes"])
+        if not listeners or len({host for host, _ in listeners}) != 1 or proxy_count != 1:
+            raise ValueError
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError, subprocess.TimeoutExpired):
+        raise BootstrapError(
+            "Caddyfile не прошёл проверку: нужны точный LAN bind, loopback admin, "
+            "только /mini/* к локальному Mini App и 404 для остальных путей."
+        ) from None
+    return {"executable": executable, "path": path, "env": extra, "expected": expected,
+            "admin_url": f"http://127.0.0.1:{admin_port}/config/",
+            "listeners": listeners, "admin_port": admin_port}
+
+
+def caddy_ready(config):
+    status, active = request_json(config["admin_url"])
+    return (status == 200 and active == config["expected"]
+            and all(endpoint_listening(host, port) for host, port in config["listeners"]))
+
+
+def ensure_direct_https(config, root, *, check=False):
+    caddy = config.get("caddy")
+    if caddy is None:
+        return
+    if not caddy_ready(caddy):
+        if (endpoint_listening("127.0.0.1", caddy["admin_port"])
+                or any(endpoint_listening(host, port) for host, port in caddy["listeners"])):
+            raise BootstrapError("Порт Caddy занят или активный config отличается. Чужой процесс не изменён.")
+        if check:
+            raise BootstrapError("Прямой HTTPS ещё не запущен. --check ничего не запускает.")
+        child = start_hidden(
+            [str(caddy["executable"]), "run", "--config", str(caddy["path"]), "--adapter", "caddyfile"],
+            root, "caddy", caddy["env"],
+        )
+        wait_ready(lambda: caddy_ready(caddy), child, 30, "Caddy")
+    print("Caddy подтвердил точную конфигурацию и LAN-порты. Внешний HTTPS проверяется отдельно.", flush=True)
+
+
 def configuration(root):
     from dotenv import dotenv_values
 
@@ -209,7 +336,8 @@ def configuration(root):
     if local_text and local_text["port"] in {8188, 8190, 8192, 8193, int(port), int(app_port)}:
         raise BootstrapError("Ollama нужен отдельный локальный порт, по умолчанию 11434.")
     return {"port": int(port), "app_port": int(app_port), "base": image_base, "key": key, "local_text": local_text,
-            "starter": starter, "gateway_env": gateway_env, "app_env": values}
+            "starter": starter, "gateway_env": gateway_env, "app_env": values,
+            "caddy": caddy_configuration(values, root, int(app_port))}
 
 
 def child_environment(extra=None):
@@ -296,6 +424,8 @@ def bootstrap(root, *, check=False, dependencies_only=False, foreground=False):
         if not gateway_ready(config["base"], config["key"]):
             raise BootstrapError("Приватный API-адрес не подтвердил identity/key. Проверьте Tailscale и сохранённый Serve path.")
         print("Packaged gateway и приватный API подтвердили ключ и готовность.", flush=True)
+        if not dependencies_only:
+            ensure_direct_https(config, root, check=check)
         if check or dependencies_only:
             return
         if listening(config["app_port"]):
