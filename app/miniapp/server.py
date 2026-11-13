@@ -386,6 +386,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             "business": business_view(business),
             "jobs": [j.model_dump(mode="json") for j in svc.list_jobs(actor, business_id)[-20:][::-1]],
             "operations": svc.list_ai_operations(actor, business_id),
+            "knowledge": svc.knowledge_status(actor, business_id),
+            "traces": svc.ai_traces(actor, business_id),
             "usage": svc.ai_usage(actor),
             "failed_notifications": svc.failed_notifications(actor, business_id),
         })
@@ -408,6 +410,19 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         svc, actor = context(request)
         return web.json_response({"items": svc.conversation_history(actor, request.match_info["id"])})
 
+    async def knowledge_search(request):
+        svc, actor = context(request)
+        body = await json_body(request)
+        if not isinstance(body, dict) or set(body) - {"query", "limit"}:
+            raise InvalidInput("Передайте query и необязательный limit.")
+        return web.json_response({"items": await svc.search_knowledge(
+            actor, request.match_info["id"], body.get("query", ""), limit=body.get("limit", 4),
+        )})
+
+    async def traces(request):
+        svc, actor = context(request)
+        return web.json_response({"items": svc.ai_traces(actor, request.match_info["id"])})
+
     async def chat(request):
         svc, actor = context(request)
         business_id = request.match_info["id"]
@@ -416,7 +431,9 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         intent = await svc.interpret_request(actor, business_id, body.text, body.post_id, request_id=request_id)
         result = {"intent": intent.model_dump(mode="json")}
         if intent.action == "prepare":
-            result["job"] = svc.request_preparation(actor, business_id, intent.request, request_id).model_dump(mode="json")
+            result["job"] = (await svc.prepare_with_tools(
+                actor, business_id, intent.request, request_id,
+            )).model_dump(mode="json")
         elif intent.action == "report":
             end = svc.now()
             result["report"] = svc.build_report(actor, business_id, end - timedelta(days=7), end)
@@ -502,6 +519,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.get("/mini/api/business/{id}/jobs", jobs),
         web.get("/mini/api/business/{id}/history", history),
         web.post("/mini/api/business/{id}/chat", chat),
+        web.post("/mini/api/business/{id}/knowledge/search", knowledge_search),
+        web.get("/mini/api/business/{id}/traces", traces),
         web.get("/mini/api/job/{id}", job),
         web.post("/mini/api/job/{id}/cancel", cancel_job),
         web.get("/mini/api/post/{id}", post),

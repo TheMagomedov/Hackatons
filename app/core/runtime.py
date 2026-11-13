@@ -7,10 +7,12 @@ import logging
 import signal
 from dataclasses import dataclass
 
+from app.ai.resilience import InferenceStore, LocalInferenceRouter
 from app.config import Settings
 from app.core.demo import DemoAI, DemoImages, DemoNotifier, DemoPublisher, DemoReporter
 from app.core.instance_lock import InstanceLock
 from app.core.service import BackendService
+from app.knowledge import KnowledgeIndex
 from app.miniapp.server import run_live as run_mini_app
 from app.publishing import TelegramNotifier, TelegramPublisher
 from app.safety import ModeratedAI, ModeratedImages, NoopSafety, from_environment
@@ -88,6 +90,10 @@ async def build_runtime(settings: Settings) -> Runtime:
         # existing unbound database requires explicit operator adoption.
         repository.bind_runtime(settings.mode, settings.owner_id)
         files = FileStore(settings.data_dir / "assets", max_bytes=settings.max_upload_bytes)
+        knowledge = KnowledgeIndex(settings.data_dir / "knowledge.sqlite3")
+        telemetry = InferenceStore(settings.data_dir / "ai-runtime.sqlite3",
+                                   ttl_seconds=settings.ai_cache_ttl_seconds)
+        resources.extend([knowledge, telemetry])
         if settings.mode == "demo":
             safety = NoopSafety()
             ai, images = DemoAI(), DemoImages()
@@ -102,6 +108,28 @@ async def build_runtime(settings: Settings) -> Runtime:
                 resources,
             )
             images = _provider(settings, settings.image_factory, ("generate",), resources)
+            from app.ai.local import LocalAISettings, OllamaJSONClient
+            from app.ai.provider import ModelAI
+            if isinstance(ai, ModelAI) and isinstance(ai.client, OllamaJSONClient):
+                clients = [ai.client]
+                fallback = settings.local_text_fallback_model.strip()
+                if fallback:
+                    options = ai.client.settings.model_dump()
+                    if fallback == options["model"]:
+                        raise InvalidInput("Резервная локальная модель должна отличаться от основной.")
+                    options.update(model=fallback, timeout_seconds=min(
+                        options["timeout_seconds"], settings.provider_timeout_seconds / 2,
+                    ))
+                    # Both choices retain loopback-only transport and require installed local weights.
+                    try:
+                        selected = LocalAISettings.model_validate(options)
+                    except ValueError:
+                        raise InvalidInput("Резервная модель должна быть установленной локальной моделью Ollama.") from None
+                    ai.client.settings = ai.client.settings.model_copy(
+                        update={"timeout_seconds": selected.timeout_seconds},
+                    )
+                    clients.append(OllamaJSONClient(selected))
+                ai.client = LocalInferenceRouter(clients, telemetry)
             ai = ModeratedAI(ai, safety)
             images = ModeratedImages(images, safety)
             reporter = _provider(settings, settings.report_factory, ("build",), resources)
@@ -110,7 +138,8 @@ async def build_runtime(settings: Settings) -> Runtime:
             notifier = TelegramNotifier(settings.telegram_bot_token.get_secret_value())
             resources.append(notifier)
         runtime.service = BackendService(
-            repository, files, settings, ai, images, publisher, notifier, reporter, safety=safety
+            repository, files, settings, ai, images, publisher, notifier, reporter, safety=safety,
+            knowledge=knowledge, telemetry=telemetry,
         )
         if settings.bot_factory:
             if settings.mode != "live":

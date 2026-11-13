@@ -111,13 +111,15 @@ class TelegramBotAdapter:
             await self.updates.stop()
 
     async def send(self, notification: Notification) -> None:
+        from app.safety.privacy import redact_text
+
         rows = []
         if notification.job_id:
             rows.append([("Открыть задание", f"job:{notification.job_id}")])
         if notification.post_id:
             rows.append([("Открыть пост", f"post:{notification.post_id}")])
         await self.bot.send_message(
-            notification.owner_id, notification.text, reply_markup=menu(*rows), request_timeout=15
+            notification.owner_id, redact_text(notification.text), reply_markup=menu(*rows), request_timeout=15
         )
 
     async def close(self) -> None:

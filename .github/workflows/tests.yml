@@ -20,6 +20,7 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check .
       - run: python -m pytest -q
+      - run: python -m app.evals --output var/evals/report.json
       - run: python -B services/flux_gateway/image_api/test_image_api_server.py
       - run: python -m app demo
   container:

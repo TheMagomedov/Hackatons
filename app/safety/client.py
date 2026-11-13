@@ -105,6 +105,7 @@ class HTTPModeration:
                 or any(c.isspace() for c in api_key)):
             raise SafetyUnavailable()
         self._base_url = base_url.rstrip("/")
+        self._local = loopback
         self._api_key = api_key
         self._transport = transport or UrllibSafetyTransport()
 
@@ -140,6 +141,9 @@ class HTTPModeration:
                 or sum(map(len, texts)) > MAX_TEXT_CHARACTERS):
             raise InvalidInput("Для проверки нужен текст общим объёмом не более 12000 символов.")
         try:
+            if not self._local:
+                from app.safety.privacy import redact_for_egress
+                texts = redact_for_egress(texts)
             body = json.dumps({"texts": texts}, ensure_ascii=False, allow_nan=False).encode("utf-8")
         except (ValueError, UnicodeError):
             raise InvalidInput("Текст содержит неподдерживаемые символы.") from None

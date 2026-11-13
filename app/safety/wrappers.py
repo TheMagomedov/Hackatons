@@ -8,6 +8,7 @@ from app.shared.errors import ProviderUnavailable
 from app.shared.models import ContentPlan, GeneratedImage, TaskIntent, TextDraft
 
 from .client import MAX_TEXT_CHARACTERS, MAX_TEXT_ITEMS, SafetyPolicy
+from .privacy import guard_public_output
 
 
 def _model(model, value):
@@ -24,6 +25,7 @@ async def _review_texts(policy: SafetyPolicy, texts: list[str]) -> None:
             raise ProviderUnavailable("AI вернул слишком большой или некорректный текст.")
         if not text.strip():
             continue
+        guard_public_output(text)
         if length + len(text) > MAX_TEXT_CHARACTERS or len(batch) >= MAX_TEXT_ITEMS:
             await asyncio.to_thread(policy.check_text, batch)
             batch, length = [], 0

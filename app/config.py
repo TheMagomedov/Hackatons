@@ -37,6 +37,8 @@ class Settings(BaseModel):
     max_concurrent_ai_operations: int = Field(default=2, ge=1, le=10)
     max_sources_per_business: int = Field(default=10, ge=1, le=10)
     max_source_bytes_total: int = Field(default=20_000_000, ge=1024, le=100_000_000)
+    ai_cache_ttl_seconds: int = Field(default=900, ge=0, le=86400)
+    local_text_fallback_model: str = Field(default="", max_length=128)
 
     @field_validator("timezone")
     @classmethod
@@ -103,6 +105,8 @@ class Settings(BaseModel):
             "MAX_CONCURRENT_AI_OPERATIONS": "max_concurrent_ai_operations",
             "MAX_SOURCES_PER_BUSINESS": "max_sources_per_business",
             "MAX_SOURCE_BYTES_TOTAL": "max_source_bytes_total",
+            "AI_CACHE_TTL_SECONDS": "ai_cache_ttl_seconds",
+            "LOCAL_TEXT_FALLBACK_MODEL": "local_text_fallback_model",
         }
         return cls(
             **{field: os.environ[key] for key, field in names.items() if os.environ.get(key, "").strip()}

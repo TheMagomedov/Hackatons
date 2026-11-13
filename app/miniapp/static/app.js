@@ -201,6 +201,7 @@ function demoApi(url, method, body) {
     }
     if (parts[2] === "control") return {business, jobs: [...demoJobs.values()].filter(j => j.business_id === business.id),
       operations: [], usage: {used_today: [...demoJobs.values()].length, daily_limit: 100, running: 0}, failed_notifications: []};
+    if (parts[2] === "knowledge" && parts[3] === "search") return {items: [], preview: true};
     if (parts[2] === "jobs") return {items: [...demoJobs.values()].filter(j => j.business_id === business.id)};
     if (parts[2] === "pause") { business.publications_paused = body.paused; return business; }
     if (parts[2] === "automation") {
@@ -530,6 +531,32 @@ function conversationView() {
       ? 'Спросите о компании или поручите подготовить пост. Уточняйте задачу в следующих сообщениях — AI сохранит контекст.'
       : 'История диалога пока пуста.') + '</p>';
 }
+function diagnosticsView() {
+  const knowledge = controls.knowledge;
+  const traces = Array.isArray(controls.traces) ? controls.traces.slice(0, 30) : [];
+  const events = {started: "Начало операции", completed: "Операция завершена", failed: "Ошибка операции",
+    cache_hit: "Ответ из кеша", model_ok: "Модель ответила", model_failed: "Модель недоступна", fallback: "Резервная локальная модель"};
+  const kinds = {analyze: "Анализ компании", interpret: "Разбор запроса", plan: "Контент-план",
+    text: "Текст", image: "Изображение", prepare: "Подготовка", revise_text: "Правка текста", revise_image: "Правка изображения"};
+  return '<details class="panel report-detail activity-panel"><summary>Диагностика AI и базы знаний</summary>'
+    + '<p class="dialog-desc">Здесь видны модель, кеш и время выполнения. Тексты запросов и документов в этот журнал не записываются.</p>'
+    + (knowledge?.enabled ? '<p>Проиндексировано источников: <strong>' + safe(knowledge.sources || 0)
+      + '</strong> · фрагментов: <strong>' + safe(knowledge.chunks || 0) + '</strong>.</p>'
+      + '<p class="dialog-desc">Индекс обновляется при поиске и обращении AI к материалам компании.</p>'
+      : '<p class="dialog-desc">База знаний пока не подключена к этому запуску.</p>')
+    + (traces.length ? '<ol class="activity-list">' + traces.map(trace => {
+      const anchor = 'ai-trace-' + path(String(trace.id || 'unknown'));
+      const milliseconds = Number(trace.duration_ms);
+      const elapsed = Number.isFinite(milliseconds) && milliseconds >= 0 ? (milliseconds / 1000).toFixed(2) + ' с' : '—';
+      const created = typeof trace.created === 'number' ? new Date(trace.created * 1000) : new Date(trace.created);
+      const date = Number.isNaN(created.getTime()) ? 'Время не указано' : formatDate(created);
+      return '<li id="' + safe(anchor) + '"><strong>' + safe(events[trace.event] || 'Событие AI')
+        + ' · ' + safe(kinds[trace.kind] || trace.kind || 'Операция') + '</strong><span>'
+        + safe(trace.model || 'Обработка задания') + ' · ' + safe(elapsed) + ' · ' + safe(date) + '</span>'
+        + '<small>Запись: <a data-trace href="#' + safe(anchor) + '">' + safe(trace.id || '—') + '</a></small></li>';
+    }).join('') + '</ol>' : '<p class="dialog-desc">Записей пока нет. Они появятся после следующего обращения к AI.</p>')
+    + '</details>';
+}
 function workView() {
   const b = controls.business || state.business;
   const usage = controls.usage || {};
@@ -569,6 +596,7 @@ function workView() {
       '<li><strong>' + safe(({interpret: 'Разбор запроса', profile: 'Анализ компании', plan: 'Контент-план', text: 'Подготовка текста', image: 'Подготовка изображения', revise_text: 'Правка текста', revise_image: 'Правка изображения'})[op.kind] || op.kind)
       + '</strong><span>' + safe(jobLabels[op.status] || op.status) + ' · ' + safe(formatDate(op.created_at)) + '</span></li>').join('') + '</ol>'
       : '<p class="dialog-desc">Операции этой компании появятся после обращения к AI.</p>') + '</details>'
+    + diagnosticsView()
     + ((controls.failed_notifications || []).length ? '<div class="notice">Есть недоставленные уведомления: '
       + controls.failed_notifications.length + '. Откройте раздел уведомлений в Telegram-боте для повтора.</div>' : '');
 }
@@ -685,10 +713,12 @@ function businessView() {
     + button("Заполнить вручную", "manual-profile", "secondary", "posts")
     + button("Собрать с AI", "analyze", "secondary", "spark")
     + (profile && !b.profile_confirmed ? button("Подтвердить", "confirm-profile", "primary", "check") : "")
-    + '</section><div><section class="panel business-panel"><h2>Источники</h2><p>Описание, публичная страница сайта или PDF с текстовым слоем.</p><ul>'
+    + '</section><div><section class="panel business-panel"><h2>Источники</h2><p>Загрузите договор, регламент или брендбук; вопросы можно задать AI.</p>'
+    + '<p>Поддерживаются текст, публичная страница сайта и PDF с текстовым слоем.</p><ul>'
     + state.sources.map((s) => '<li>' + safe(s.name) + '</li>').join("") + '</ul>'
     + button("Добавить источник", "add-source", "secondary", "plus")
     + button("Загрузить PDF", "upload-pdf", "secondary", "posts")
+    + button("Поиск по документам", "knowledge-search", "secondary", "posts")
     + '</section><section class="panel business-panel"><h2>Канал</h2><p>'
     + safe(b.channel_title || b.channel_id || "Канал пока не подключён.") + '</p>'
     + button(b.channel_id ? "Изменить канал" : "Подключить канал", "channel", "secondary", "telegram")
@@ -846,6 +876,15 @@ function openForm(action, title, detail, fields, submit, id = businessId, revisi
     + '<button class="button primary" type="submit">' + safe(submit) + '</button>'
     + button("Отмена", "close", "secondary") + '</div></form>');
 }
+function knowledgeResults(result) {
+  if (result?.preview) return '<p class="notice">В предпросмотре документы не индексируются. Настоящий поиск доступен в рабочей студии.</p>';
+  if (!Array.isArray(result?.items)) throw new Error("Не удалось прочитать результаты поиска. Повторите запрос.");
+  if (!result.items.length) return '<p class="dialog-desc">Подходящих фрагментов нет. Уточните формулировку или добавьте документ с нужным условием.</p>';
+  return '<p class="dialog-desc">Фрагменты исходных документов. Проверьте полный пункт перед использованием; это ещё не ответ AI.</p>'
+    + result.items.slice(0, 6).map(hit => '<article class="post-sources"><h3>' + safe(hit.source_name || 'Документ')
+      + '</h3><p class="post-text">' + safe(hit.text) + '</p><details><summary>Ссылка на источник</summary><p>Источник: '
+      + safe(hit.source_id) + '</p><p>Фрагмент: ' + safe(hit.chunk_id) + '</p></details></article>').join('');
+}
 function showPost(post) {
   if (post.business_id !== businessId) { notify("Пост относится к другой компании. Переключитесь на неё, чтобы продолжить."); return; }
   const attrs = 'data-id="' + safe(post.id) + '" data-revision="' + post.revision + '"';
@@ -907,9 +946,19 @@ async function watchJob(job, business) {
   notify("Задание в работе. Бот сообщит о результате.");
 }
 document.addEventListener("click", async (event) => {
-  const control = event.target.closest("[data-view], [data-action]");
+  const control = event.target.closest("[data-view], [data-action], [data-trace]");
   if (!control || control.disabled) return;
   event.preventDefault();
+  if (control.dataset.trace !== undefined) {
+    // Keep signed Telegram launch parameters available to a late SDK and reload.
+    const entry = control.closest("li[id]");
+    if (entry) {
+      entry.setAttribute("tabindex", "-1");
+      entry.focus({preventScroll: true});
+      entry.scrollIntoView({block: "nearest"});
+    }
+    return;
+  }
   if (control.dataset.view) {
     try { await navigate(control.dataset.view); } catch (error) { announceError(error); }
     return;
@@ -1045,6 +1094,10 @@ document.addEventListener("click", async (event) => {
         '<label class="form-row"><span>Тип источника</span><select name="kind"><option value="text">Описание</option>'
         + '<option value="url">Страница сайта</option></select></label>'
         + formField("Материал", "value", "textarea", 'maxlength="16000"'), "Сохранить источник");
+    } else if (action === "knowledge-search") {
+      openForm("knowledge-search", "Поиск по документам", "Ищем только в материалах выбранной компании. Текст не отправляется в облачную модель.",
+        formField("Что найти в документах?", "query", "textarea", 'maxlength="2000" placeholder="Например: срок уведомления о расторжении договора"')
+        + '<section data-knowledge-results aria-live="polite" aria-busy="false"></section>', "Найти фрагменты");
     } else if (action === "channel") {
       openForm("channel", "Подключить канал", "Добавьте бота администратором канала с правом публикации.",
         formField("Канал", "value", "text", 'maxlength="128" placeholder="@channel или -100…"'), "Проверить канал");
@@ -1108,7 +1161,18 @@ dialog.addEventListener("submit", async (event) => {
   let submittingBusiness = businessId;
   const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
-    if (action === "manual-profile") {
+    if (action === "knowledge-search") {
+      const results = form.querySelector('[data-knowledge-results]');
+      results.setAttribute("aria-busy", "true");
+      results.textContent = "Ищем в документах…";
+      const errorNode = form.querySelector('#form-error'); if (errorNode) errorNode.textContent = "";
+      try {
+        const response = await api("/business/" + path(id) + "/knowledge/search", {query: values.query, limit: 4});
+        if (currentForm()) results.innerHTML = knowledgeResults(response);
+      } finally {
+        if (currentForm()) { results.setAttribute("aria-busy", "false"); if (results.textContent === "Ищем в документах…") results.textContent = ""; }
+      }
+    } else if (action === "manual-profile") {
       await api("/business/" + path(id) + "/profile/manual", {revision: Number(revision), description: values.description,
         products: profileLines(values.products, 19, "продуктов"), audience: values.audience, tone: values.tone,
         constraints: profileLines(values.constraints, 20, "правил бренда")});
