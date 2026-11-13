@@ -1,0 +1,46 @@
+# Copy to an ignored private path, then set the CADDY_* values in your local .env.
+# This template uses public TCP 80/443 forwarded to the same ports on one LAN IP.
+{
+	admin 127.0.0.1:12019
+	persist_config off
+	default_bind {$CADDY_BIND_ADDRESS}
+	default_sni {$CADDY_PUBLIC_HOST}
+	auto_https disable_redirects
+	storage file_system {
+		root "{$CADDY_STORAGE_PATH}"
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+
+http://{$CADDY_PUBLIC_HOST} {
+	bind {$CADDY_BIND_ADDRESS}
+	handle /mini/* {
+		redir https://{$CADDY_PUBLIC_HOST}{uri} 308
+	}
+	handle {
+		respond 404
+	}
+}
+
+https://{$CADDY_PUBLIC_HOST} {
+	bind {$CADDY_BIND_ADDRESS}
+	tls {
+		issuer acme https://acme-v02.api.letsencrypt.org/directory {
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
+	handle /mini/* {
+		reverse_proxy 127.0.0.1:8766 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 360s
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

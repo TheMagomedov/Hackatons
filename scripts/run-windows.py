@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows demo host: one private runtime, one temporary HTTPS tunnel, graceful stop."""
+"""Windows demo host: private runtime, fixed HTTPS or temporary tunnel, graceful stop."""
 
 import argparse
 import asyncio

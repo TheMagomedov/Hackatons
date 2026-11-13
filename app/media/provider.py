@@ -18,6 +18,7 @@ def build_provider(
     endpoint: str = "https://api.openai.com/v1/images/generations",
     limits: MediaLimits = DEFAULT_LIMITS,
     transport: BlockingImageTransport | None = None,
+    allow_local_flux: bool = False,
 ) -> ImageProvider:
     """No network, persistence, environment lookup, or live-to-demo fallback."""
     if settings.mode == "demo":
@@ -37,4 +38,5 @@ def build_provider(
         endpoint=endpoint,
         limits=limits,
         transport=transport,
+        allow_local_flux=allow_local_flux,
     )

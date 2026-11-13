@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from itertools import product
 from unittest.mock import patch, sentinel
 
 from app.config import Settings
@@ -27,9 +28,12 @@ TEXT = TextDraft(text="Кофе", image_brief="Чашка кофе")
 
 class RuntimeImageConfigurationTests(unittest.IsolatedAsyncioTestCase):
     async def test_absent_or_blank_model_with_key_defers_without_constructing_adapter(self):
-        for model in (None, "", " \t\n"):
-            with self.subTest(model=model):
-                environment = {"IMAGE_API_KEY": "private-test-key", "IMAGE_API_BASE": "invalid://"}
+        for model, local_flux in product((None, "", " \t\n"), ("0", "1")):
+            with self.subTest(model=model, local_flux=local_flux):
+                environment = {
+                    "IMAGE_API_KEY": "private-test-key", "IMAGE_API_BASE": "invalid://",
+                    "IMAGE_LOCAL_FLUX": local_flux,
+                }
                 if model is not None:
                     environment["IMAGE_MODEL"] = model
                 with patch.dict(os.environ, environment, clear=True), patch(
@@ -88,6 +92,7 @@ class RuntimeImageConfigurationTests(unittest.IsolatedAsyncioTestCase):
             constructor.assert_called_once_with(
                 settings, api_key=environment["IMAGE_API_KEY"], model=environment["IMAGE_MODEL"],
                 endpoint="https://images.example.invalid/custom/v1/images/generations",
+                allow_local_flux=False,
             )
 
     def test_demo_delegates_before_reading_any_live_environment(self):
