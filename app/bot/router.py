@@ -1,21 +1,26 @@
+import hashlib
 import io
+import json
 import logging
-from contextlib import contextmanager
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from aiogram import BaseMiddleware, F, Router
-from aiogram.filters import Command
+from aiogram import BaseMiddleware, Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonWebApp,
     Message,
     MessageOriginChannel,
     MessageReactionCountUpdated,
     Update,
+    WebAppInfo,
 )
 
 from app.core.service import BackendService
@@ -23,6 +28,8 @@ from app.shared.errors import AppError, Conflict, InvalidInput
 from app.shared.models import Business, PostStatus, PostView
 
 log = logging.getLogger(__name__)
+STUDIO_TITLE = "САЛАВАТСТЕКЛО · Контент-студия"
+STUDIO_BUTTON = "Открыть студию"
 STATES = {
     PostStatus.REVIEW: "ожидает согласования",
     PostStatus.EDITING: "редактируется",
@@ -30,20 +37,38 @@ STATES = {
     PostStatus.PUBLISHING: "отправляется",
     PostStatus.PUBLISHED: "опубликован",
     PostStatus.REJECTED: "отклонён",
-    PostStatus.FAILED: "ошибка отправки",
+    PostStatus.FAILED: "нужно исправить",
     PostStatus.DELIVERY_UNKNOWN: "результат неизвестен",
 }
 EDITABLE = {PostStatus.REVIEW, PostStatus.APPROVED, PostStatus.FAILED, PostStatus.REJECTED}
-POSTS_PER_PAGE = 10
+PAGE_SIZE = 10
 QUICK_SCHEDULE = {"in15": 15, "in60": 60}
+JOB_STATES = {
+    "pending": "в очереди",
+    "running": "готовится",
+    "done": "готово",
+    "failed": "ошибка",
+    "cancelled": "отменено",
+}
+STAGES = {
+    "queued": "Ожидает начала",
+    "plan": "Составляю план",
+    "planning": "Составляю план",
+    "text": "Готовлю текст",
+    "image": "Создаю изображение",
+    "saving": "Сохраняю результат",
+    "done": "Материалы готовы",
+    "failed": "Подготовка остановлена",
+    "cancelled": "Задание отменено",
+}
 INPUTS = {
     "name": "Введите название бизнеса.",
     "notes": "Пришлите сведения о бизнесе и пожелания к стилю.",
     "url": "Пришлите конечный публичный адрес страницы.",
     "pdf": "Прикрепите текстовый PDF до 8 МиБ и 24 страниц.",
     "channel": "Добавьте бота администратором канала с правом публиковать и пришлите @имя или ID канала.",
-    "request": "Опишите задачу, например «Подготовь три поста про завтраки».",
-    "auto": "Введите интервал в часах и задачу, например «24 Пост о завтраках».",
+    "request": "Опишите задачу, например «Подготовь три поста о стекле для современной архитектуры».",
+    "auto": "Введите интервал в часах и задачу, например «24 Пост о применении стекла в архитектуре».",
     "text": "Что изменить в тексте?",
     "image": "Что изменить на изображении?",
     "time": "Пришлите дату со смещением, например 2026-12-15 10:30+03:00.",
@@ -52,11 +77,31 @@ INPUTS = {
 }
 
 
-def menu(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=label, callback_data=action) for label, action in row]
-        for row in (*rows, [("Главное меню", "home")])
-    ])
+def menu(*rows: list[tuple[str, str]], mini_app_url: str | None = None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=([
+            [InlineKeyboardButton(text=STUDIO_BUTTON, web_app=WebAppInfo(url=mini_app_url))]
+        ] if mini_app_url else []) + [
+            [InlineKeyboardButton(text=label, callback_data=action) for label, action in row]
+            for row in (*rows, [("Главное меню", "home")])
+        ]
+    )
+
+
+async def install_mini_app_menu(bot: Bot, owner_id: int, mini_app_url: str | None) -> bool:
+    """A new owner's first /start retries setup; inline launch remains available if it fails."""
+    if not mini_app_url:
+        return False
+    try:
+        await bot.set_chat_menu_button(
+            chat_id=owner_id,
+            menu_button=MenuButtonWebApp(text=STUDIO_BUTTON, web_app=WebAppInfo(url=mini_app_url)),
+            request_timeout=15,
+        )
+    except TelegramAPIError:
+        log.warning("Telegram не установил меню Mini App. Кнопка запуска доступна в главном меню бота.")
+        return False
+    return True
 
 
 async def reply(message: Message, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
@@ -68,17 +113,19 @@ async def reply(message: Message, text: str, markup: InlineKeyboardMarkup | None
     await message.answer(text, reply_markup=markup)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Prompt:
     kind: str
     object_id: str = ""
     revision: int = 0
-    in_progress: bool = False
 
 
 class OwnerAccess(BaseMiddleware):
-    def __init__(self, owner: int):
-        self.owner = owner
+    def __init__(self, service: BackendService):
+        self.service = service
+        self.owner = service.settings.owner_id
+        # Fast local cache complements the durable receipt of every owner update.
+        self.seen: OrderedDict[int, None] = OrderedDict()
 
     async def __call__(self, handler, event, data):
         message = event.message if isinstance(event, CallbackQuery) else event
@@ -92,12 +139,42 @@ class OwnerAccess(BaseMiddleware):
             else:
                 await message.answer("Управлять ботом может только владелец.")
             return
+        update = data.get("event_update")
         try:
+            if isinstance(update, Update):
+                if update.update_id in self.seen:
+                    if isinstance(event, CallbackQuery):
+                        await event.answer("Это действие уже обработано. Откройте актуальное меню.")
+                    return
+                digest = hashlib.sha256(
+                    json.dumps(
+                        update.model_dump(mode="json", exclude_none=True),
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                accepted = self.service.accept_telegram_update(
+                    self.owner,
+                    event_key(update, event.bot.id),
+                    digest,
+                )
+                self.seen[update.update_id] = None
+                if len(self.seen) > 512:
+                    self.seen.popitem(last=False)
+                if not accepted:
+                    if isinstance(event, CallbackQuery):
+                        await event.answer("Это действие уже принято. Проверьте результат через меню.")
+                    return
             return await handler(event, data)
         except AppError as exc:
             await reply(message, str(exc), menu())
         except Exception as exc:
-            log.warning("Telegram handler failed (%s)", type(exc).__name__)
+            log.warning(
+                "Telegram handler failed update=%s (%s)",
+                update.update_id if isinstance(update, Update) else "unknown",
+                type(exc).__name__,
+            )
             await reply(message, "Действие не завершилось. Проверьте состояние через меню.", menu())
 
 
@@ -116,41 +193,74 @@ def format_time(value: datetime | None, timezone: str) -> str:
     return value.astimezone(ZoneInfo(timezone)).strftime("%d.%m.%Y %H:%M (%z)") if value else "не указано"
 
 
+def page_number(value: str) -> int:
+    if not value:
+        return 0
+    if not value.isascii() or not value.isdigit() or len(value) > 6:
+        raise InvalidInput("Откройте список заново.")
+    return int(value)
+
+
+def page_rows(items: list, page: int, callback_prefix: str):
+    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, pages - 1)
+    navigation = []
+    if page:
+        navigation.append(("← Назад", f"{callback_prefix}:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(("Далее →", f"{callback_prefix}:{page + 1}"))
+    return items[page * PAGE_SIZE : (page + 1) * PAGE_SIZE], navigation, f"{page + 1}/{pages}"
+
+
+def event_key(update: Update, bot_id: int) -> str:
+    return f"telegram:{bot_id}:update:{update.update_id}"
+
+
 def build_router(service: BackendService) -> Router:
     router = Router()
-    owner_access = OwnerAccess(service.settings.owner_id)
+    owner_access = OwnerAccess(service)
     router.message.outer_middleware(owner_access)
     router.callback_query.outer_middleware(owner_access)
     pending: Prompt | None = None
     selected: str | None = None
+    context_epoch = 0
+    inflight_inputs: set[int] = set()
 
-    @contextmanager
-    def use_prompt():
-        context = pending
-        if context is not None:
-            if context.in_progress:
-                raise Conflict("Предыдущий ответ ещё обрабатывается.")
-            context.in_progress = True
-        try:
-            yield context
-        finally:
-            if context is not None:
-                context.in_progress = False
+    def check_input_available() -> None:
+        if pending is None and context_epoch in inflight_inputs:
+            raise Conflict("Предыдущий ответ ещё обрабатывается. Можно открыть другое действие через меню.")
 
-    def finish_prompt(context: Prompt | None) -> None:
+    def restore_prompt(context: Prompt | None, epoch: int, actor: int) -> None:
         nonlocal pending
-        if pending is context:
-            pending = None
+        if context is None or epoch != context_epoch or pending is not None:
+            return
+        # A failed paid edit already consumed its revision; never restore its old prompt.
+        if context.kind in {"text", "image", "time", "found"}:
+            try:
+                if service.get_post(actor, context.object_id).revision != context.revision:
+                    return
+            except AppError:
+                return
+        pending = context
 
     async def home(message: Message, actor: int) -> None:
-        nonlocal pending, selected
+        nonlocal pending, selected, context_epoch
+        context_epoch += 1
         pending = None
         selected = None
         businesses = service.list_businesses(actor)
         rows = [[(b.name[:50], f"business:{b.id}")] for b in businesses[-15:]]
-        await reply(message, "Автономный AI-маркетолог. Выберите бизнес или создайте карточку.", menu(
-            *rows, [("Создать бизнес", "input:name")],
-        ))
+        await reply(
+            message,
+            STUDIO_TITLE + "\n\nВыберите бизнес или создайте карточку."
+            + (" В студии можно заполнить профиль, написать пост и загрузить своё изображение без нейросети."
+               if service.settings.mini_app_url else ""),
+            menu(
+                *rows,
+                [("Создать бизнес", "input:name")],
+                mini_app_url=service.settings.mini_app_url,
+            ),
+        )
 
     def active(actor: int) -> Business:
         if selected:
@@ -163,17 +273,36 @@ def build_router(service: BackendService) -> Router:
     async def business_menu(message: Message, actor: int, business: Business) -> None:
         sources = service.list_sources(actor, business.id)
         profile = business.profile
-        parts = [business.name, f"Канал: {business.channel_title or business.channel_id or 'не подключён'}",
-                 f"Источников: {len(sources)}"]
+        parts = [
+            business.name,
+            f"Канал: {business.channel_title or business.channel_id or 'не подключён'}",
+            f"Источников: {len(sources)}",
+            "Публикации приостановлены"
+            if business.publications_paused
+            else "Публикации по расписанию включены",
+        ]
         rows = [
-            [("Текст", f"input:notes:{business.id}"), ("Сайт", f"input:url:{business.id}"),
-             ("PDF", f"input:pdf:{business.id}")],
+            [
+                ("Текст", f"input:notes:{business.id}"),
+                ("Сайт", f"input:url:{business.id}"),
+                ("PDF", f"input:pdf:{business.id}"),
+            ],
             [("Собрать профиль", f"analyze:{business.id}"), ("Канал", f"input:channel:{business.id}")],
             [("Подготовить посты", f"input:request:{business.id}"), ("Посты", f"posts:{business.id}")],
             [("Отчёт за 7 дней", f"report:{business.id}"), ("Автоподготовка", f"input:auto:{business.id}")],
+            [("Задания", f"jobs:{business.id}"), ("Использование AI", f"usage:{business.id}")],
+            [("Недоставленные уведомления", f"notices:{business.id}")],
+            [
+                (
+                    "Возобновить публикации" if business.publications_paused else "Приостановить публикации",
+                    f"resume:{business.id}" if business.publications_paused else f"pause:{business.id}",
+                )
+            ],
         ]
         if business.automation_enabled:
-            parts.append(f"Следующая автоподготовка: {format_time(business.next_generation_at, business.timezone)}")
+            parts.append(
+                f"Следующая автоподготовка: {format_time(business.next_generation_at, business.timezone)}"
+            )
             rows.append([("Отключить автоподготовку", f"auto-off:{business.id}")])
         if not sources:
             parts.append("Начните с описания бизнеса, сайта или PDF.")
@@ -182,10 +311,16 @@ def build_router(service: BackendService) -> Router:
         elif business.profile_confirmed and not business.channel_id:
             parts.append("Подключите канал, чтобы подготовить черновики.")
         if profile:
-            parts.extend([
-                "Профиль подтверждён" if business.profile_confirmed else "Проверьте и подтвердите профиль",
-                profile.description, f"Стиль: {profile.tone}", f"Аудитория: {profile.audience or 'не указана'}",
-            ])
+            parts.extend(
+                [
+                    "Профиль подтверждён"
+                    if business.profile_confirmed
+                    else "Проверьте и подтвердите профиль",
+                    profile.description,
+                    f"Стиль: {profile.tone}",
+                    f"Аудитория: {profile.audience or 'не указана'}",
+                ]
+            )
             if profile.products:
                 parts.append("Продукты: " + ", ".join(profile.products))
             names = {s.id: s.name for s in sources}
@@ -210,65 +345,154 @@ def build_router(service: BackendService) -> Router:
             image_available = True
             await message.answer_photo(BufferedInputFile(content, asset.filename), caption=post.text)
         suffix = f"{post.id}:{post.revision}"
+        stale_profile = post.profile_version != business.profile_version or not business.profile_confirmed
         rows = []
         if post.status in EDITABLE:
-            rows.extend([
-                [("Изменить текст", f"text:{suffix}"), ("Изменить фото", f"image:{suffix}")],
-                [("Через 15 мин", f"in15:{suffix}"), ("Через час", f"in60:{suffix}")],
-                [("Указать время", f"time:{suffix}")],
-            ])
-            if (post.status == PostStatus.REVIEW and image_available
-                    and post.scheduled_at and post.scheduled_at > service.now()):
+            rows.extend(
+                [
+                    [("Изменить текст", f"text:{suffix}"), ("Изменить фото", f"image:{suffix}")],
+                    [("Через 15 мин", f"in15:{suffix}"), ("Через час", f"in60:{suffix}")],
+                    [("Указать время", f"time:{suffix}")],
+                ]
+            )
+            if stale_profile:
+                rows.append([("Проверил текст по новому профилю", f"refresh:{suffix}")])
+            if (
+                post.status == PostStatus.REVIEW
+                and not stale_profile
+                and image_available
+                and post.scheduled_at
+                and post.scheduled_at > service.now()
+            ):
                 rows.append([("Согласовать версию", f"approve:{suffix}")])
             if post.status in {PostStatus.REVIEW, PostStatus.APPROVED}:
                 rows.append([("Отклонить", f"reject:{suffix}")])
         if post.status == PostStatus.DELIVERY_UNKNOWN:
-            rows.extend([
-                [("Подтвердить пересланным сообщением", f"found:{suffix}")],
-                [("Проверил канал: поста нет", f"missing:{suffix}")],
-            ])
+            rows.extend(
+                [
+                    [("Подтвердить пересланным сообщением", f"found:{suffix}")],
+                    [("Проверил канал: поста нет", f"missing:{suffix}")],
+                ]
+            )
         info = (
             f"Версия {post.revision} · {STATES[post.status]}\nКанал: {post.channel_id}\n"
             f"Время: {format_time(post.scheduled_at, business.timezone)}"
         )
+        if stale_profile:
+            info += (
+                "\nПрофиль бизнеса изменился или ещё не подтверждён. Сверьте текст с актуальными сведениями."
+            )
+        if post.profile_version is not None:
+            info += f"\nПодготовлено по версии профиля: {post.profile_version}."
+        if post.used_source_ids:
+            names = {source.id: source.name for source in service.list_sources(actor, post.business_id)}
+            info += "\nИсточники: " + ", ".join(
+                names.get(source_id, "Источник недоступен") for source_id in post.used_source_ids
+            )
+        if post.warnings:
+            info += "\nПеред согласованием проверьте:\n" + "\n".join(
+                f"• {warning}" for warning in post.warnings
+            )
+        if business.publications_paused:
+            info += "\nПубликации приостановлены. Согласование сохранится, отправка ждёт возобновления."
         for detail in (post.last_error, post.message_url):
             if detail:
                 info += f"\n{detail}"
         await reply(message, info, menu(*rows))
 
-    async def show_posts(
-        message: Message, posts: list[PostView], business_id: str = "", page: int = 0,
-    ) -> None:
-        if not posts:
-            await reply(message, "Постов пока нет.", menu())
-            return
-        page_count = (len(posts) + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE
-        page = min(page, page_count - 1)
-        offset = page * POSTS_PER_PAGE
-        ordered = posts[::-1] if business_id else posts
-        visible = ordered[offset:offset + POSTS_PER_PAGE]
+    async def show_posts(message: Message, posts: list[PostView], prefix: str, page: int = 0) -> None:
+        # Repository insertion order breaks ties when a batch shares one timestamp.
+        ordered = sorted(reversed(posts), key=lambda post: post.created_at, reverse=True)
+        visible, navigation, counter = page_rows(ordered, page, prefix)
         rows = [[(f"{STATES[p.status]} · {p.text[:25]}", f"post:{p.id}")] for p in visible]
-        if business_id and page_count > 1:
-            navigation = []
-            if page > 0:
-                navigation.append(("← Новее", f"posts:{business_id}:{page - 1}"))
-            if page + 1 < page_count:
-                navigation.append(("Старее →", f"posts:{business_id}:{page + 1}"))
+        if navigation:
             rows.append(navigation)
-        await reply(message, f"Посты · {page + 1}/{page_count}", menu(*rows))
+        await reply(message, f"Посты · страница {counter}" if ordered else "Постов пока нет.", menu(*rows))
+
+    async def show_jobs(message: Message, actor: int, business_id: str, page: int = 0) -> None:
+        jobs = sorted(
+            service.list_jobs(actor, business_id), key=lambda job: (job.created_at, job.id), reverse=True
+        )
+        visible, navigation, counter = page_rows(jobs, page, f"jobs:{business_id}")
+        rows = [[(f"{JOB_STATES[job.status]} · {job.request[:35]}", f"job:{job.id}")] for job in visible]
+        if navigation:
+            rows.append(navigation)
+        await reply(message, f"Задания · страница {counter}" if jobs else "Заданий пока нет.", menu(*rows))
 
     async def show_job(message: Message, actor: int, job_id: str) -> None:
         job = service.get_job(actor, job_id)
         if job.status in {"pending", "running"}:
-            await reply(message, "Задание принято. Подготовка продолжается.", menu([("Обновить", f"job:{job.id}")]))
+            progress = STAGES.get(job.stage, "Подготовка продолжается")
+            if job.total:
+                progress += f" · этапов завершено: {job.processed} из {job.total}"
+            if job.updated_at:
+                business = service.get_business(actor, job.business_id)
+                progress += f"\nПоследнее изменение: {format_time(job.updated_at, business.timezone)}"
+            rows = [[("Обновить", f"job:{job.id}")]]
+            if job.status == "pending":
+                rows.append([("Отменить задание", f"cancel-job:{job.id}")])
+            await reply(message, "Задание принято. " + progress + ".", menu(*rows))
+            return
+        if job.status == "cancelled":
+            await reply(
+                message,
+                "Задание отменено до начала подготовки.",
+                menu([("Задания", f"jobs:{job.business_id}")]),
+            )
             return
         if job.status == "failed":
-            await reply(message, job.error or "Подготовка не завершилась.", menu())
+            await reply(
+                message,
+                (job.error or "Подготовка не завершилась.") + f"\nНомер задания: {job.id}",
+                menu([("Задания", f"jobs:{job.business_id}")]),
+            )
             return
         plan = service.get_plan(actor, job.id)
         if plan:
-            await reply(message, "Контент-план\n" + "\n".join(f"• {item.topic} — {item.goal}" for item in plan.items))
-        await show_posts(message, service.get_job_posts(actor, job.id))
+            await reply(
+                message, "Контент-план\n" + "\n".join(f"• {item.topic} — {item.goal}" for item in plan.items)
+            )
+        await show_posts(message, service.get_job_posts(actor, job.id), f"job-posts:{job.id}")
+
+    async def show_usage(message: Message, actor: int, business_id: str) -> None:
+        usage = service.ai_usage(actor)
+        await reply(
+            message,
+            f"Использование AI за сегодня (UTC)\n"
+            f"Операций: {usage['used_today']} из {usage['daily_limit']}\n"
+            f"Сейчас выполняется: {usage['running']} из {usage['parallel_limit']}\n"
+            f"Завершено: {usage['done_today']} · С ошибкой: {usage['failed_today']}\n"
+            "Это количество операций, а не сумма списания провайдером.",
+            menu([("Последние операции", f"operations:{business_id}")]),
+        )
+
+    async def show_operations(message: Message, actor: int, business_id: str) -> None:
+        entries = service.list_ai_operations(actor, business_id, limit=10)
+        if not entries:
+            await reply(message, "AI-операций для этого бизнеса пока нет.", menu())
+            return
+        lines = ["Последние AI-операции"]
+        states = {"running": "выполняется", "done": "готово", "failed": "ошибка"}
+        for entry in entries:
+            lines.append(f"{entry['id']} · {states.get(entry['status'], entry['status'])}")
+            lines.append(f"Обновлено: {entry['updated_at']}")
+            if entry.get("error_code"):
+                lines.append(f"Код причины: {entry['error_code']}")
+        await reply(message, "\n".join(lines), menu([("Обновить", f"operations:{business_id}")]))
+
+    async def show_notices(message: Message, actor: int, business_id: str) -> None:
+        entries = service.failed_notifications(actor, business_id, limit=50)
+        rows = [
+            [(f"Уведомление {entry['id'][:8]} · {entry['attempts']} попыток", f"notice:{entry['id']}")]
+            for entry in entries
+        ]
+        await reply(
+            message,
+            "Не удалось доставить уведомления. Выберите конкретное для повтора."
+            if entries
+            else "Недоставленных после всех попыток уведомлений нет.",
+            menu(*rows),
+        )
 
     async def ask(message: Message, prompt: Prompt) -> None:
         nonlocal pending
@@ -276,51 +500,135 @@ def build_router(service: BackendService) -> Router:
         await reply(message, INPUTS[prompt.kind], menu())
 
     @router.message(Command("start", "menu", "cancel"))
-    async def start(message: Message) -> None:
+    async def start(message: Message, command: CommandObject) -> None:
         await home(message, message.from_user.id)
+        # Reply first: a slow or failed menu update must not delay the launch button.
+        if command.command == "start":
+            await install_mini_app_menu(message.bot, message.from_user.id, service.settings.mini_app_url)
 
     @router.message(Command("help"))
     async def help_message(message: Message) -> None:
-        await reply(message, "Создайте бизнес, добавьте материалы и соберите профиль. "
-                    "После подтверждения профиля подключите канал и подготовьте посты. "
-                    "Откройте черновик, выберите время и согласуйте именно эту версию. "
-                    "/menu открывает список бизнесов, /cancel отменяет текущий ввод.", menu())
+        await reply(
+            message,
+            "Создайте бизнес, добавьте материалы и соберите профиль. "
+            "После подтверждения профиля подключите канал и подготовьте посты. "
+            "Откройте черновик, проверьте предупреждения, выберите время и согласуйте эту версию. "
+            "В меню бизнеса доступны задания, пауза публикаций и использование AI. "
+            "/menu открывает список бизнесов, /cancel отменяет текущий ввод.",
+            menu(),
+        )
 
     @router.callback_query()
-    async def callback(query: CallbackQuery) -> None:
-        nonlocal pending, selected
-        await query.answer()
+    async def callback(query: CallbackQuery, event_update: Update) -> None:
+        nonlocal pending, selected, context_epoch
         message, actor = query.message, query.from_user.id
         action, _, tail = (query.data or "").partition(":")
         target, _, version = tail.partition(":")
-        pending = None
+        changes_context = action in {
+            "home",
+            "business",
+            "input",
+            "profile-tone",
+            "text",
+            "image",
+            "time",
+            "found",
+        }
+        if changes_context:
+            context_epoch += 1
+            pending = None
+        epoch = context_epoch
+        await query.answer()
+        if changes_context and epoch != context_epoch:
+            return  # A newer selection/input won while Telegram acknowledged this old button.
         if action == "home":
             await home(message, actor)
         elif action == "business":
             business = service.get_business(actor, target)
-            selected = business.id
+            pending = None
+            selected = business.id  # Select before awaiting; a late render never retargets input.
             await business_menu(message, actor, business)
         elif action == "input" and target in {"name", "notes", "url", "pdf", "channel", "request", "auto"}:
             business_id = "" if target == "name" else service.get_business(actor, version).id
+            if target == "request":
+                # A reply to the interpreter's clarification must stay in the
+                # company of this button, even when it came from an older menu.
+                selected = business_id
             await ask(message, Prompt(target, business_id))
         elif action == "analyze":
             await reply(message, "Изучаю материалы…")
-            await business_menu(message, actor, await service.analyze_business(actor, target))
+            await business_menu(
+                message,
+                actor,
+                await service.analyze_business(
+                    actor, target, request_id=event_key(event_update, query.bot.id)
+                ),
+            )
         elif action == "posts":
-            if version and (not version.isascii() or not version.isdigit() or len(version) > 6):
-                raise InvalidInput("Откройте список постов заново.")
-            await show_posts(message, service.list_posts(actor, target), target, int(version or "0"))
+            await show_posts(
+                message, service.list_posts(actor, target), f"posts:{target}", page_number(version)
+            )
+        elif action == "job-posts":
+            await show_posts(
+                message, service.get_job_posts(actor, target), f"job-posts:{target}", page_number(version)
+            )
         elif action == "post":
             await preview(message, actor, service.get_post(actor, target))
         elif action == "job":
             await show_job(message, actor, target)
+        elif action == "jobs":
+            await show_jobs(message, actor, target, page_number(version))
+        elif action == "cancel-job":
+            service.cancel_job(actor, target)
+            await show_job(message, actor, target)
+        elif action in {"pause", "resume"}:
+            business = service.set_publications_paused(actor, target, action == "pause")
+            await reply(
+                message,
+                "Новые отправки приостановлены. Уже начавшаяся отправка может завершиться; проверьте её статус."
+                if action == "pause"
+                else "Публикации возобновлены. Посты с пропущенным временем потребуют нового расписания и согласования.",
+            )
+            await business_menu(message, actor, business)
+        elif action == "usage":
+            service.get_business(actor, target)
+            await show_usage(message, actor, target)
+        elif action == "operations":
+            await show_operations(message, actor, target)
+        elif action == "notices":
+            await show_notices(message, actor, target)
+        elif action in {"notice", "retry-notice"}:
+            entry = service.get_failed_notification(actor, target)
+            if action == "retry-notice":
+                service.retry_notification(actor, entry["business_id"], target)
+                await reply(
+                    message,
+                    "Уведомление поставлено на повторную доставку. Посты и генерация не запускались.",
+                    menu([("К списку уведомлений", f"notices:{entry['business_id']}")]),
+                )
+            else:
+                await reply(
+                    message,
+                    f"Уведомление {entry['id']}\nНе доставлено после {entry['attempts']} попыток.\n"
+                    "Повтор отправит только это уведомление. После обрыва связи ранее отправленное сообщение может повториться.",
+                    menu([("Повторить это уведомление", f"retry-notice:{target}")]),
+                )
         elif action == "report":
             now = service.now()
             await reply(message, service.build_report(actor, target, now - timedelta(days=7), now), menu())
         elif action == "auto-off":
             await business_menu(message, actor, service.configure_automation(actor, target, False))
         elif action in {
-            "confirm", "profile-tone", "text", "image", "time", "found", "approve", "reject", "missing",
+            "confirm",
+            "profile-tone",
+            "text",
+            "image",
+            "time",
+            "found",
+            "approve",
+            "reject",
+            "missing",
+            "refresh",
             *QUICK_SCHEDULE,
         }:
             if not version.isascii() or not version.isdigit() or len(version) > 9:
@@ -337,10 +645,13 @@ def build_router(service: BackendService) -> Router:
             elif action == "reject":
                 service.reject_post(actor, target, revision)
                 await reply(message, "Пост отклонён.", menu())
+            elif action == "refresh":
+                updated = service.refresh_post_context(actor, target, revision)
+                await preview(message, actor, updated)
             elif action in QUICK_SCHEDULE:
                 when = service.now() + timedelta(minutes=QUICK_SCHEDULE[action])
-                post = service.edit_post(actor, target, revision, scheduled_at=when)
-                await preview(message, actor, post)
+                updated = service.edit_post(actor, target, revision, scheduled_at=when)
+                await preview(message, actor, updated)
             elif action == "missing":
                 post = service.resolve_unknown_delivery(actor, target, revision, confirmed_not_sent=True)
                 await preview(message, actor, post)
@@ -354,11 +665,10 @@ def build_router(service: BackendService) -> Router:
 
     @router.message(F.document)
     async def document(message: Message) -> None:
-        with use_prompt() as context:
-            await receive_document(message, context)
-
-    async def receive_document(message: Message, context: Prompt | None) -> None:
+        nonlocal pending, context_epoch
+        check_input_available()
         actor = message.from_user.id
+        context = pending
         if context and context.kind != "pdf":
             raise InvalidInput("Завершите текущее действие или нажмите /cancel перед загрузкой PDF.")
         business = service.get_business(actor, context.object_id) if context else active(actor)
@@ -366,13 +676,24 @@ def build_router(service: BackendService) -> Router:
         limit = min(8 * 1024 * 1024, service.settings.max_upload_bytes)
         if not (file.file_name or "").lower().endswith(".pdf") or (file.file_size or 0) > limit:
             raise InvalidInput("Пришлите PDF до 8 МиБ.")
-        with LimitedFile(limit) as destination:
-            await message.bot.download(file, destination=destination, timeout=20)
-            service.add_pdf_source(actor, business.id, file.file_name, destination.getvalue())
-        finish_prompt(context)
+        pending = None  # Consume before downloading; later callbacks can safely set a new prompt.
+        context_epoch += 1
+        epoch = context_epoch
+        inflight_inputs.add(epoch)
+        try:
+            with LimitedFile(limit) as destination:
+                await message.bot.download(file, destination=destination, timeout=20)
+                service.add_pdf_source(actor, business.id, file.file_name, destination.getvalue())
+        except AppError:
+            restore_prompt(context, epoch, actor)
+            raise
+        finally:
+            inflight_inputs.discard(epoch)
         await business_menu(message, actor, service.get_business(actor, business.id))
 
-    async def handle_post_input(message: Message, actor: int, prompt: Prompt, text: str) -> None:
+    async def handle_post_input(
+        message: Message, actor: int, prompt: Prompt, text: str, request_id: str
+    ) -> None:
         post_id, revision = prompt.object_id, prompt.revision
         if prompt.kind == "found":
             post = service.get_post(actor, post_id)
@@ -395,31 +716,42 @@ def build_router(service: BackendService) -> Router:
                 raise InvalidInput(INPUTS["time"]) from exc
             updated = service.edit_post(actor, post_id, revision, scheduled_at=when)
         elif prompt.kind == "text":
-            updated = await service.revise_text(actor, post_id, revision, text)
+            updated = await service.revise_text(actor, post_id, revision, text, request_id=request_id)
         else:
-            updated = await service.revise_image(actor, post_id, revision, text)
-        finish_prompt(prompt)
+            updated = await service.revise_image(actor, post_id, revision, text, request_id=request_id)
         await preview(message, actor, updated)
 
     @router.message()
     async def receive(message: Message, event_update: Update) -> None:
-        with use_prompt() as context:
+        nonlocal pending, context_epoch
+        check_input_available()
+        context = pending
+        pending = None  # Never clear or replace a newer prompt after a provider await.
+        context_epoch += 1
+        epoch = context_epoch
+        if context is not None:
+            inflight_inputs.add(epoch)
+        try:
             await receive_text(message, event_update, context)
+        except AppError:
+            restore_prompt(context, epoch, message.from_user.id)
+            raise
+        finally:
+            inflight_inputs.discard(epoch)
 
     async def receive_text(message: Message, event_update: Update, context: Prompt | None) -> None:
         nonlocal selected
         actor = message.from_user.id
         text = (message.text or "").strip()
         if context and context.kind == "found":
-            await handle_post_input(message, actor, context, text)
+            await handle_post_input(message, actor, context, text, event_key(event_update, message.bot.id))
         elif not text:
             raise InvalidInput("Пришлите текст или выберите загрузку PDF.")
         elif context and context.kind in {"text", "image", "time"}:
-            await handle_post_input(message, actor, context, text)
+            await handle_post_input(message, actor, context, text, event_key(event_update, message.bot.id))
         elif context and context.kind == "name":
             business = service.create_business(actor, text)
             selected = business.id
-            finish_prompt(context)
             await business_menu(message, actor, business)
         else:
             business = service.get_business(actor, context.object_id) if context else active(actor)
@@ -434,39 +766,50 @@ def build_router(service: BackendService) -> Router:
                 hours, _, request = text.partition(" ")
                 if not hours.isascii() or not hours.isdigit() or len(hours) > 4 or not request.strip():
                     raise InvalidInput(INPUTS["auto"])
-                business = service.configure_automation(actor, business.id, True, request=request,
-                                                        interval_hours=int(hours))
+                business = service.configure_automation(
+                    actor, business.id, True, request=request, interval_hours=int(hours)
+                )
             elif kind == "profile-tone":
                 if not business.profile or len(text) > 400:
                     raise InvalidInput("Нужен профиль и описание стиля до 400 символов.")
-                business = service.save_profile(actor, business.id, context.revision,
-                                                business.profile.model_copy(update={"tone": text}))
+                business = service.save_profile(
+                    actor, business.id, context.revision, business.profile.model_copy(update={"tone": text})
+                )
             elif kind == "pdf":
                 raise InvalidInput(INPUTS["pdf"])
             elif kind == "request":
-                intent = None if context else await service.interpret_request(actor, business.id, text)
-                if intent is None or intent.action == "prepare":
-                    request = (intent.request or text) if intent else text
+                intent = await service.interpret_request(
+                    actor, business.id, text, request_id=event_key(event_update, message.bot.id)
+                )
+                if intent.action == "prepare":
+                    request = intent.request or text
                     job = service.request_preparation(
-                        actor, business.id, request, f"telegram_update:{event_update.update_id}",
+                        actor, business.id, request, event_key(event_update, message.bot.id)
                     )
-                    finish_prompt(context)
                     await show_job(message, actor, job.id)
                 elif intent.action == "report":
                     now = service.now()
-                    await reply(message, service.build_report(actor, business.id, now - timedelta(days=7), now), menu())
+                    await reply(
+                        message,
+                        service.build_report(actor, business.id, now - timedelta(days=7), now),
+                        menu(),
+                    )
+                elif intent.action == "answer":
+                    await reply(message, intent.answer, menu())
                 else:
                     question = "\n".join(intent.questions) or "Уточните запрос или выберите конкретный пост."
                     await reply(message, question, menu())
-                finish_prompt(context)
                 return
-            finish_prompt(context)
             await business_menu(message, actor, service.get_business(actor, business.id))
-        finish_prompt(context)
 
     @router.message_reaction_count()
     async def reactions(event: MessageReactionCountUpdated, event_update: Update) -> None:
-        service.record_reactions(str(event.chat.id), event.message_id, sum(r.total_count for r in event.reactions),
-                                 event.date, f"telegram_update:{event_update.update_id}")
+        service.record_reactions(
+            str(event.chat.id),
+            event.message_id,
+            sum(r.total_count for r in event.reactions),
+            event.date,
+            event_key(event_update, event.bot.id),
+        )
 
     return router

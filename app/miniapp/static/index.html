@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#FFFFFF">
+  <meta name="description" content="САЛАВАТСТЕКЛО — контент-студия: материалы компании, публикации и согласование.">
+  <title>САЛАВАТСТЕКЛО · Контент-студия</title>
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./overview.css">
+  <link rel="stylesheet" href="./calendar.css">
+  <link rel="stylesheet" href="./brand.css">
+  <!-- TELEGRAM_BRIDGE -->
+  <script src="./demo-store.js" defer></script>
+  <script src="./transport.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body data-mode="preview">
+  <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-logo" viewBox="0 0 24 24"><path d="M5 6h14M12 6v13M5 12h3m-3 5h3m8-5h3m-3 5h3"/></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.4"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.4"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.4"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.4"/></symbol>
+    <symbol id="i-posts" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></symbol>
+    <symbol id="i-report" viewBox="0 0 24 24"><path d="M4 4v15h16M8 15v-4m4 4V8m4 7V5"/></symbol>
+    <symbol id="i-business" viewBox="0 0 24 24"><rect x="3.5" y="7" width="17" height="13" rx="2"/><path d="M8.5 7V5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 15.5 5v2M4 12a19 19 0 0 0 16 0m-8 1v3"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 2l2.2 7.8L22 12l-7.8 2.2L12 22l-2.2-7.8L2 12l7.8-2.2L12 2Z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5l3.5 2"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5.5" width="16" height="14.5" rx="2"/><path d="M8 3.5v4m8-4v4M4 10h16"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="i-telegram" viewBox="0 0 24 24"><path d="m3 11 17-7-3.4 16-5.5-4.4-3 2.6.5-4.7L17 7.7 7.3 13.1 3 11Z"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="16" rx="2"/><circle cx="9" cy="9" r="1.5"/><path d="m4 17 4.5-4.5 3 3 3.5-5 5 6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19 8a8 8 0 1 0 1 6M19 4v5h-5"/></symbol>
+    <symbol id="i-theme" viewBox="0 0 24 24"><path d="M20 15.2A8.6 8.6 0 0 1 8.8 4 8.6 8.6 0 1 0 20 15.2Z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2m0 15v2M2.5 12h2m15 0h2M5.3 5.3l1.4 1.4m10.6 10.6 1.4 1.4m0-13.4-1.4 1.4M6.7 17.3l-1.4 1.4"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8 6 4-6 4z"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6"/></symbol>
+  </svg>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="#overview" data-view="overview" aria-label="САЛАВАТСТЕКЛО, главная">
+        <span class="brand-logo-window">
+          <img class="brand-logo brand-logo-color" src="./brand-logo.png" alt="САЛАВАТСТЕКЛО" width="1182" height="1182">
+          <img class="brand-logo brand-logo-white" src="./brand-logo-white.png" alt="" aria-hidden="true" width="1182" height="1182">
+        </span>
+        <span class="brand-product">Контент-студия</span>
+      </a>
+      <nav class="desktop-nav" aria-label="Разделы контент-студии">
+        <button data-view="overview" aria-current="page">Главная</button>
+        <button data-view="content">Посты</button>
+        <button data-view="work">Задачи</button>
+        <button data-view="reports">Отчёты</button>
+        <button data-view="business">Бизнес</button>
+      </nav>
+      <div class="top-actions">
+        <label class="workspace"><svg class="icon"><use href="#i-business"></use></svg>
+          <select id="workspace" aria-label="Выбрать бизнес"></select>
+          <svg class="icon chevron"><use href="#i-down"></use></svg>
+        </label>
+        <button class="icon-button theme-button" data-action="theme" aria-label="Сменить тему">
+          <svg class="icon"><use href="#i-theme"></use></svg>
+        </button>
+      </div>
+    </header>
+    <div id="mode-banner" class="mode-banner" hidden></div>
+    <main id="main" aria-busy="true" tabindex="-1">
+      <div class="loading"><span class="spinner"></span> Загружаем пространство…</div>
+    </main>
+  </div>
+  <nav class="dock" aria-label="Основное меню">
+    <button data-view="overview" aria-current="page"><span class="dock-icon"><svg class="icon"><use href="#i-home"></use></svg></span>Главная</button>
+    <button data-view="content"><span class="dock-icon"><svg class="icon"><use href="#i-posts"></use></svg></span>Посты</button>
+    <button data-view="work"><span class="dock-icon"><svg class="icon"><use href="#i-spark"></use></svg></span>Задачи</button>
+    <button data-view="reports"><span class="dock-icon"><svg class="icon"><use href="#i-report"></use></svg></span>Отчёты</button>
+    <button data-view="business"><span class="dock-icon"><svg class="icon"><use href="#i-business"></use></svg></span>Бизнес</button>
+  </nav>
+  <dialog id="dialog" aria-labelledby="dialog-title">
+    <div class="dialog-inner">
+      <button class="icon-button close" data-action="close" aria-label="Закрыть"><svg class="icon"><use href="#i-close"></use></svg></button>
+      <div id="dialog-body"></div>
+    </div>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

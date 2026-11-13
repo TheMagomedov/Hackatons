@@ -6,10 +6,13 @@ import binascii
 import json
 import math
 import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Protocol
+
+import certifi
 
 from app.shared.models import BusinessProfile, GeneratedImage, TextDraft
 
@@ -41,7 +44,13 @@ class UrllibImageTransport:
     """Default blocking transport. The provider always calls it in a worker thread."""
 
     def send(self, request: urllib.request.Request, timeout_seconds: float, max_response_bytes: int) -> bytes:
-        opener = urllib.request.build_opener(_NoRedirects())
+        # Some Python installations (notably python.org macOS builds) have no
+        # usable default CA file until a manual installer step is run. Retain
+        # system trust and add the already-pinned public CA bundle; never disable
+        # hostname/certificate verification to make image generation work.
+        context = ssl.create_default_context()
+        context.load_verify_locations(cafile=certifi.where())
+        opener = urllib.request.build_opener(_NoRedirects(), urllib.request.HTTPSHandler(context=context))
         with opener.open(request, timeout=timeout_seconds) as response:
             if response.status != 200:
                 raise InvalidImageResponseError("The image service returned an unexpected status.")

@@ -13,6 +13,7 @@ import pytest
 
 from app.core.instance_lock import InstanceLock
 from app.storage import Repository
+from app.storage.repository import SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 11, 9, tzinfo=UTC)
@@ -47,6 +48,9 @@ def database(directory: Path, *, legacy=False):
     business = repo.create_business(77, "private-business-name-must-not-be-exposed", "UTC", NOW)
     if legacy:
         with closing(sqlite3.connect(directory / "backend.sqlite3")) as conn:
+            conn.execute("DROP TABLE conversation_turns")
+            conn.execute("DROP TABLE ai_operations")
+            conn.execute("DROP TABLE inbound_events")
             conn.execute("DROP TABLE runtime_binding")
             conn.execute("PRAGMA user_version=1")
             conn.commit()
@@ -98,7 +102,7 @@ def test_adopt_legacy_keeps_data_and_locks_mode_and_owner(tmp_path):
     repo = Repository(directory / "backend.sqlite3")
     assert repo.runtime_binding() == {"mode": "live", "owner_id": 77}
     assert repo.get_business(business.id) == business
-    assert version(directory) == 2
+    assert version(directory) == SCHEMA_VERSION
     # Adoption is repeatable for the same identity, but never a mode-switch override.
     assert (
         command("adopt-data", "--data-dir", str(directory), "--mode", "live", "--owner-id", "77").returncode
