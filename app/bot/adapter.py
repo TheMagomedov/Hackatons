@@ -51,8 +51,25 @@ class TelegramBotAdapter:
         self.updates = UpdateLifecycle()
         self.dispatcher.update.outer_middleware(self.updates)
         self.dispatcher.include_router(build_router(service))
+        self.service = service
         self.owner_id = service.settings.owner_id
         self.mini_app_url = mini_app_url
+
+    async def refresh_mini_app_menus(self) -> None:
+        """A rotated host must reach every active member's persistent Telegram menu."""
+        if not self.mini_app_url:
+            return
+        members = self.service.repo.list_access(self.owner_id)["members"]
+        actors = {self.owner_id, *(member["actor_id"] for member in members if member["revoked_at"] is None)}
+        limit = asyncio.Semaphore(4)
+
+        async def install(actor: int) -> None:
+            async with limit:
+                # Membership may have changed while another menu request was in flight.
+                if self.service.access_role(actor) is not None:
+                    await install_mini_app_menu(self.bot, actor, self.mini_app_url)
+
+        await asyncio.gather(*(install(actor) for actor in sorted(actors)))
 
     async def run(self, stop_event: asyncio.Event) -> None:
         if stop_event.is_set():
@@ -68,7 +85,7 @@ class TelegramBotAdapter:
                 "У этого бота настроен webhook. Для polling нужен отдельный токен или отключение webhook."
             )
         if self.mini_app_url:
-            await install_mini_app_menu(self.bot, self.owner_id, self.mini_app_url)
+            await self.refresh_mini_app_menus()
         log.info("Telegram bot @%s connected", me.username)
         polling = asyncio.create_task(
             self.dispatcher.start_polling(

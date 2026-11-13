@@ -18,8 +18,11 @@ def event(host="test123.lhr.life", **changes):
 def test_structured_tunnel_parser_rejects_banner_injection_and_untrusted_targets():
     assert tunnel.tunnel_url(event()) == "https://test123.lhr.life/mini/"
     assert tunnel.tunnel_url(event("test123.localhost.run")) == "https://test123.localhost.run/mini/"
+    assert tunnel.tunnel_url(event("test123.app.lhr.life")) == "https://test123.app.lhr.life/mini/"
+    assert tunnel.tunnel_url(event("rotated.app.lhr.life", type="run.localhost.tunnel.rotated")) == "https://rotated.app.lhr.life/mini/"
     for line in ["https://test123.lhr.life", "{broken", "[]", event("evil.example"),
-                 event("lhr.life.evil.example"), event("test123.lhr.life/evil"),
+                 event("lhr.life.evil.example"), event("test123.app.lhr.life.evil.example"),
+                 event("nested.test123.app.lhr.life"), event("test123.lhr.life/evil"),
                  event("test123.lhr.life@evil.example"), event(type="run.localhost.tunnel.closed"),
                  event(subject="other.lhr.life"), event(data={"address": "test123.lhr.life", "port": 443})]:
         assert tunnel.tunnel_url(line) is None

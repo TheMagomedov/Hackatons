@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -91,7 +91,7 @@ def menu(*rows: list[tuple[str, str]], mini_app_url: str | None = None) -> Inlin
 
 
 async def install_mini_app_menu(bot: Bot, owner_id: int, mini_app_url: str | None) -> bool:
-    """A new owner's first /start retries setup; inline launch remains available if it fails."""
+    """Update one member's menu; an inline launch remains available on Telegram failure."""
     if not mini_app_url:
         return False
     try:
@@ -294,12 +294,17 @@ def build_router(service: BackendService) -> Router:
             STUDIO_TITLE + ("\n\nНаблюдатель · только просмотр. Выберите бизнес." if viewer
                             else "\n\nОператор · выберите бизнес или создайте карточку.")
             + (" В студии можно заполнить профиль, написать пост и загрузить своё изображение без нейросети."
-               if service.settings.mini_app_url and not viewer else ""),
+               if service.settings.mini_app_url and not viewer else "")
+            + ("\n\nЕсли студия не открывается, отправьте /menu и используйте новую кнопку."
+               if service.settings.mini_app_url else ""),
             menu(
                 *rows,
                 mini_app_url=service.settings.mini_app_url,
             ),
         )
+        # Every way back home repairs a stale personal menu after a URL rotation.
+        # Reply first so a slow/failed Telegram menu update cannot hide the fresh inline button.
+        await install_mini_app_menu(message.bot, actor, service.settings.mini_app_url)
 
     def active(actor: int) -> Business:
         if state().selected:
@@ -547,11 +552,8 @@ def build_router(service: BackendService) -> Router:
         await reply(message, INPUTS[prompt.kind], menu())
 
     @router.message(Command("start", "menu", "cancel"))
-    async def start(message: Message, command: CommandObject) -> None:
+    async def start(message: Message) -> None:
         await home(message, message.from_user.id)
-        # Reply first: a slow or failed menu update must not delay the launch button.
-        if command.command == "start":
-            await install_mini_app_menu(message.bot, message.from_user.id, service.settings.mini_app_url)
 
     @router.message(Command("help"))
     async def help_message(message: Message) -> None:

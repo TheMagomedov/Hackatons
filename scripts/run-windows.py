@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import http.client
 import importlib.util
 import json
 import logging
@@ -12,15 +13,67 @@ import signal
 import socket
 import subprocess
 import sys
+import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 STATE = REPO / "var" / "windows-run"
+HEALTH_INTERVAL = 15
+HEALTH_FAILURE_LIMIT = 3
 
 spec = importlib.util.spec_from_file_location("local_tunnel", REPO / "scripts/run-local-tunnel.py")
 local_tunnel = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local_tunnel)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def healthy_endpoint(url, *, local=False):
+    """Read only a small public health document; never send credentials or follow redirects."""
+    handlers = [NoRedirect()]
+    if local:
+        handlers.append(urllib.request.ProxyHandler({}))
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment):
+            return False
+        _ = parsed.port
+        request = urllib.request.Request(url, headers={"Accept": "application/json", "Cache-Control": "no-cache"})
+        with urllib.request.build_opener(*handlers).open(request, timeout=6) as response:
+            if response.status != 200 or response.headers.get_content_type() != "application/json":
+                return False
+            content = response.read(4097)
+            if len(content) > 4096:
+                return False
+            data = json.loads(content)
+            return isinstance(data, dict) and all(data.get(key) == value for key, value in {
+                "status": "ok", "mode": "live", "runtime_mode": "live",
+            }.items())
+    except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException):
+        return False
+
+
+class TunnelWatchdog:
+    def __init__(self):
+        self.failures = 0
+
+    def observe(self, *, local_ok, public_ok):
+        # A tunnel reconnect cannot fix a backend which has not started yet.
+        self.failures = self.failures + 1 if local_ok and not public_ok else 0
+        return self.failures >= HEALTH_FAILURE_LIMIT
+
+
+def save_state(url, status):
+    (STATE / "state.json").write_text(json.dumps({
+        "pid": os.getpid(), "url": url, "status": status, "checked_at": int(time.time()),
+    }), encoding="utf-8")
 
 
 def configuration():
@@ -127,18 +180,21 @@ async def supervise(settings):
         logger.addFilter(conflict)
         app = tunnel = job = None
         url = None
+        next_probe = 0
+        watchdog = TunnelWatchdog()
         try:
             while not stop.is_set():
                 job = WindowsJob()
                 # Gate before SSH startup so the owner exiting cannot leave a tunnel behind.
                 runner = REPO / "app/ai/_windows_process.py"
-                tunnel = await asyncio.create_subprocess_exec(
-                    sys.executable, str(runner), *tunnel_command(ssh, settings.mini_app_port),
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL, limit=131_072,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    env=tunnel_environment(),
-                )
+                with (STATE / "tunnel.stderr.log").open("wb") as tunnel_log:
+                    tunnel = await asyncio.create_subprocess_exec(
+                        sys.executable, str(runner), *tunnel_command(ssh, settings.mini_app_port),
+                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                        stderr=tunnel_log, limit=131_072,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        env=tunnel_environment(),
+                    )
                 job.assign(tunnel.pid)
                 tunnel.stdin.write(b"\0")
                 await tunnel.stdin.drain()
@@ -151,6 +207,18 @@ async def supervise(settings):
                     if app is not None and app.done():
                         app.result()
                         raise RuntimeError("Бот завершился. Проверьте журнал; автоматического повторного запуска отправок нет.")
+                    if url is not None and loop.time() >= next_probe:
+                        local_ok, public_ok = await asyncio.gather(
+                            asyncio.to_thread(healthy_endpoint, f"http://127.0.0.1:{settings.mini_app_port}/mini/health", local=True),
+                            asyncio.to_thread(healthy_endpoint, url + "health"),
+                        )
+                        next_probe = loop.time() + HEALTH_INTERVAL
+                        reconnect = watchdog.observe(local_ok=local_ok, public_ok=public_ok)
+                        save_state(url, "ready" if local_ok and public_ok else "degraded")
+                        if reconnect:
+                            save_state(None, "reconnecting")
+                            print("Внешний адрес трижды недоступен при работающей студии. Переподключаю только свой туннель и бот.", flush=True)
+                            break
                     try:
                         line = await asyncio.wait_for(tunnel.stdout.readline(), 1)
                     except TimeoutError:
@@ -165,9 +233,9 @@ async def supervise(settings):
                         url = next_url
                         current = settings.model_copy(update={"mini_app_url": url})
                         app = asyncio.create_task(run_application(current), name="windows-demo-app")
-                        (STATE / "state.json").write_text(json.dumps({
-                            "pid": os.getpid(), "url": url, "status": "starting",
-                        }), encoding="utf-8")
+                        watchdog = TunnelWatchdog()
+                        next_probe = loop.time() + 2
+                        save_state(url, "starting")
                         print("Mini App: " + url, flush=True)
                 await cancel_app(app)
                 app = None
