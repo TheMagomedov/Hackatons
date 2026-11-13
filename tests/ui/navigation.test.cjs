@@ -134,3 +134,43 @@ test('home distinguishes AI from manual creation and explains the missing-channe
   assert.match(main.innerHTML,/data-action="channel"/);
   assert.doesNotMatch(main.innerHTML,/data-action="confirm-profile"/,'A completed setup step is not a new mutation');
 });
+
+test('only synchronous AI POST routes receive 330 seconds; queued jobs and ordinary requests keep defaults',async()=>{
+  const app=await application(owner);
+  for (const url of ['/business/one/profile/analyze','/business/one/chat','/post/post-id/revise-text','/post/post-id/revise-image']) {
+    app.context.testUrl=url;
+    await app.run('api(testUrl,{request_id:"test"})');
+    assert.equal(app.requests.at(-1).options.timeoutMs,330000,url);
+    await app.run('api(testUrl)');
+    assert.equal(app.requests.at(-1).options.timeoutMs,undefined,'GET retains its default');
+  }
+  for (const url of ['/business/one/prepare','/business/one/automation','/business/one/profile/confirm',
+    '/business/one/profile/manual','/post/post-id/approve','/post/post-id/edit','/business/one/image',
+    '/business/one/chat/extra','/business/one/profile/analyze?extra=true']) {
+    app.context.testUrl=url;
+    await app.run('api(testUrl,{request_id:"test"})');
+    assert.equal(app.requests.at(-1).options.timeoutMs,undefined,url);
+  }
+});
+
+test('a slow chat disables repeated submissions and a failure never retries the POST automatically',async()=>{
+  const app=await application(owner);
+  const pending=deferred();
+  app.setResponder(()=>pending.promise);
+  const submit={disabled:false};
+  const form={dataset:{},elements:{text:{value:'Справочный вопрос',disabled:false}},
+    matches:selector=>selector==='[data-chat]',querySelector:()=>submit};
+  const event={target:form,preventDefault() {}};
+  const first=app.listeners.get('#main:submit')(event);
+  assert.equal(submit.disabled,true);
+  assert.equal(form.elements.text.disabled,true);
+  await app.listeners.get('#main:submit')(event);
+  assert.equal(app.requests.length,2,'Only startup GET and a single chat POST reach transport');
+  assert.equal(app.requests.at(-1).options.timeoutMs,330000);
+  pending.reject(new Error('Локальная модель не ответила вовремя'));
+  await first; await tick();
+  assert.equal(app.requests.length,2,'No automatic replay on failure');
+  assert.equal(submit.disabled,false);
+  assert.equal(form.elements.text.disabled,false);
+  assert.match(app.nodes.get('#chat-error').textContent,/Локальная модель/);
+});

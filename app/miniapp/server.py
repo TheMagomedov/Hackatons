@@ -202,7 +202,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         if SERVICE in request.app:
             html = html.replace('data-mode="preview"', 'data-mode="live"').replace(
                 "<!-- TELEGRAM_BRIDGE -->",
-                '<script src="https://telegram.org/js/telegram-web-app.js" defer></script>',
+                '<script id="telegram-sdk" src="https://telegram.org/js/telegram-web-app.js" async></script>',
             )
         return web.Response(text=html, content_type="text/html")
 
@@ -482,7 +482,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     app.add_routes([
         web.get("/mini/", index),
         web.get("/mini/health", health),
-        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|demo-store\.js|transport\.js|access\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
+        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|session\.js|demo-store\.js|transport\.js|access\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
         web.get("/mini/api/business/{id}/calendar", calendar),

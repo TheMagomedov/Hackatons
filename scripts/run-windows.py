@@ -37,14 +37,16 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def healthy_endpoint(url, *, local=False):
     """Read only a small public health document; never send credentials or follow redirects."""
     handlers = [NoRedirect()]
-    if local:
-        handlers.append(urllib.request.ProxyHandler({}))
     try:
         parsed = urllib.parse.urlsplit(url)
         if (parsed.scheme not in {"http", "https"} or not parsed.hostname
                 or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment):
             return False
         _ = parsed.port
+        # The host already has the Tailscale route; an ambient VPN proxy can break it.
+        # This is host-side readiness, not independent verification of public Funnel ingress.
+        if local or (parsed.scheme == "https" and parsed.hostname.endswith(".ts.net")):
+            handlers.append(urllib.request.ProxyHandler({}))
         request = urllib.request.Request(url, headers={"Accept": "application/json", "Cache-Control": "no-cache"})
         with urllib.request.build_opener(*handlers).open(request, timeout=6) as response:
             if response.status != 200 or response.headers.get_content_type() != "application/json":

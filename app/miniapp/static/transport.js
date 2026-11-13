@@ -6,7 +6,7 @@ window.TirazhHTTP = Object.freeze({
     const {timeoutMs, signal, ...init} = options;
     const readOnly = ["GET", "HEAD"].includes((init.method || "GET").toUpperCase());
     const delay = timeoutMs ?? (readOnly ? 20000 : 150000);
-    if (!Number.isFinite(delay) || delay <= 0 || delay > 180000) throw new TypeError("Invalid request timeout");
+    if (!Number.isFinite(delay) || delay <= 0 || delay > 330000) throw new TypeError("Invalid request timeout");
     const controller = new AbortController();
     let timedOut = false;
     const cancel = () => controller.abort();

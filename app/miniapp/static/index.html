@@ -6,11 +6,14 @@
   <meta name="theme-color" content="#FFFFFF">
   <meta name="description" content="САЛАВАТСТЕКЛО — контент-студия: материалы компании, публикации и согласование.">
   <title>САЛАВАТСТЕКЛО · Контент-студия</title>
+  <link rel="icon" type="image/png" href="./brand-logo.png">
+  <link rel="apple-touch-icon" href="./brand-logo.png">
   <link rel="stylesheet" href="./styles.css">
   <link rel="stylesheet" href="./overview.css">
   <link rel="stylesheet" href="./calendar.css">
   <link rel="stylesheet" href="./brand.css">
   <!-- TELEGRAM_BRIDGE -->
+  <script src="./session.js" defer></script>
   <script src="./demo-store.js" defer></script>
   <script src="./transport.js" defer></script>
   <script src="./access.js" defer></script>
@@ -73,6 +76,9 @@
     </aside>
     <main id="main" aria-busy="true" tabindex="-1">
       <div class="loading"><span class="spinner"></span> Загружаем пространство…</div>
+      <p class="loading-hint">Если загрузка затянулась, закройте студию, отправьте боту <strong>/menu</strong> и откройте её по новой кнопке.</p>
+      <button id="startup-reload" class="button secondary" type="button">Обновить загрузку</button>
+      <noscript><p class="notice">Для студии нужен JavaScript. Откройте приложение через меню Telegram-бота.</p></noscript>
     </main>
   </div>
   <nav class="dock" aria-label="Основное меню">

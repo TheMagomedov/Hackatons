@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -165,3 +166,168 @@ def test_gateway_key_mismatch_stops_before_spawn(configured, monkeypatch):
     monkeypatch.setattr(bootstrap, "start_hidden", lambda *args: pytest.fail("Unexpected process launch"))
     with pytest.raises(bootstrap.BootstrapError, match="не совпадает"):
         bootstrap.bootstrap(configured)
+
+
+@pytest.fixture
+def local_config(configured, monkeypatch):
+    executable = configured / "local-model" / "ollama.exe"
+    executable.parent.mkdir()
+    executable.touch()
+    models = configured / "local-model" / "models"
+    models.mkdir()
+    values = {
+        "AI_PROVIDER_FACTORY": "app.ai.local:build_provider",
+        "LOCAL_TEXT_MODEL": "qwen3:4b-instruct", "LOCAL_TEXT_API_BASE": "http://127.0.0.1:11435",
+        "OLLAMA_EXE_PATH": str(executable), "OLLAMA_MODELS_PATH": str(models),
+    }
+    for key in values:
+        monkeypatch.delenv(key, raising=False)
+    with (configured / ".env").open("a", encoding="utf-8") as stream:
+        stream.write("\n" + "\n".join(key + "=" + value for key, value in values.items()))
+    return bootstrap.configuration(configured)
+
+
+def test_local_configuration_matches_client_and_never_reads_other_env_namespace(local_config, monkeypatch):
+    settings = local_config["local_text"]["settings"]
+    assert settings.base_url == "http://127.0.0.1:11435" and local_config["local_text"]["port"] == 11435
+    assert settings.model == "qwen3:4b-instruct"
+    monkeypatch.setenv("LOCAL_TEXT_API_BASE", "https://must-not-be-read.invalid")
+    explicit = bootstrap.local_text_configuration({"AI_PROVIDER_FACTORY": "app.ai.local:build_provider"}, Path("."))
+    assert explicit["settings"].base_url == "http://127.0.0.1:11434"
+
+
+@pytest.mark.parametrize("fault", ["version", "status_missing", "cloud_enabled", "truthy", "unknown"])
+def test_ollama_identity_requires_explicit_disabled_cloud(local_config, monkeypatch, fault):
+    calls = []
+
+    def request(url, key=None, *, payload=None):
+        calls.append((url, key, payload))
+        if url.endswith("/api/version"):
+            return 200, {"version": "" if fault == "version" else "0.40.16"}
+        if fault == "status_missing":
+            return 404, None
+        if fault == "unknown":
+            return 200, {"cloud": None}
+        return 200, {"cloud": {"disabled": "true" if fault == "truthy" else False}}
+
+    monkeypatch.setattr(bootstrap, "request_json", request)
+    assert not bootstrap.ollama_server_ready(local_config["local_text"]["settings"])
+    assert all(url.startswith("http://127.0.0.1:11435/") and key is None and payload is None
+               for url, key, payload in calls)
+
+
+def test_ollama_ready_checks_cloud_and_model_without_generation(local_config, configured, monkeypatch):
+    calls = []
+
+    def request(url, key=None, *, payload=None):
+        calls.append((url, key, payload))
+        if url.endswith("/api/version"):
+            return 200, {"version": "0.40.16"}
+        if url.endswith("/api/status"):
+            return 200, {"cloud": {"disabled": True, "source": "env"}}
+        assert url.endswith("/api/show")
+        return 200, {"details": {"format": "gguf"}, "model_info": {"general.architecture": "qwen3"}}
+
+    monkeypatch.setattr(bootstrap, "request_json", request)
+    monkeypatch.setattr(bootstrap, "start_hidden", lambda *_args: pytest.fail("Existing Ollama must be reused"))
+    bootstrap.ensure_local_text(local_config, configured, check=True)
+    assert len(calls) == 3 and calls[-1][2] == {"model": "qwen3:4b-instruct", "verbose": False}
+    assert all(key is None for _, key, _ in calls)
+
+
+@pytest.mark.parametrize("metadata", [
+    None, {}, {"details": None, "model_info": {"general.architecture": "qwen3"}},
+    {"details": {"format": "gguf"}, "model_info": {}, "remote_host": "https://ollama.com"},
+    {"details": {"format": "gguf"}, "model_info": {"general.architecture": "qwen3"}, "remote_model": "cloud"},
+])
+def test_unverified_model_never_starts_or_downloads(local_config, configured, monkeypatch, metadata):
+    monkeypatch.setattr(bootstrap, "ollama_server_ready", lambda _: True)
+    monkeypatch.setattr(bootstrap, "request_json", lambda *_args, **_kwargs: (200, metadata))
+    monkeypatch.setattr(bootstrap, "start_hidden", lambda *_args: pytest.fail("No downloads or restart"))
+    with pytest.raises(bootstrap.BootstrapError, match="не скачивает модели"):
+        bootstrap.ensure_local_text(local_config, configured)
+
+
+def test_unknown_ollama_listener_blocks_all_startup_without_takeover(local_config, configured, monkeypatch):
+    monkeypatch.setattr(bootstrap, "ollama_server_ready", lambda _: False)
+    monkeypatch.setattr(bootstrap, "listening", lambda port: port == 11435)
+    monkeypatch.setattr(bootstrap, "core_ready", lambda *_: pytest.fail("Do not start FLUX after failed Ollama check"))
+    monkeypatch.setattr(bootstrap, "start_hidden", lambda *_args: pytest.fail("No process takeover"))
+    with pytest.raises(bootstrap.BootstrapError, match="cloud.disabled=true"):
+        bootstrap.bootstrap(configured)
+
+
+def test_local_check_only_never_starts_even_when_executable_exists(local_config, configured, monkeypatch):
+    monkeypatch.setattr(bootstrap, "ollama_server_ready", lambda _: False)
+    monkeypatch.setattr(bootstrap, "listening", lambda _: False)
+    monkeypatch.setattr(bootstrap, "start_hidden", lambda *_args: pytest.fail("Read-only check"))
+    with pytest.raises(bootstrap.BootstrapError, match="--check"):
+        bootstrap.bootstrap(configured, check=True)
+
+
+def test_ollama_start_uses_selected_loopback_port_isolated_env_and_no_pull(local_config, configured, monkeypatch):
+    started = []
+    monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0:9999")
+    monkeypatch.setenv("OLLAMA_NO_CLOUD", "0")
+    monkeypatch.setattr(bootstrap, "ollama_server_ready", lambda _: bool(started))
+    monkeypatch.setattr(bootstrap, "ollama_model_ready", lambda _: True)
+    monkeypatch.setattr(bootstrap, "listening", lambda _: False)
+
+    def start(command, root, name, extra=None):
+        started.append((command, name, bootstrap.child_environment(extra)))
+        return SimpleNamespace(poll=lambda: None)
+
+    monkeypatch.setattr(bootstrap, "start_hidden", start)
+    bootstrap.ensure_local_text(local_config, configured)
+    assert len(started) == 1
+    command, name, environment = started[0]
+    assert command == [str(local_config["local_text"]["executable"]), "serve"] and name == "ollama"
+    assert environment["OLLAMA_HOST"] == "127.0.0.1:11435" and environment["OLLAMA_NO_CLOUD"] == "1"
+    assert environment["OLLAMA_MODELS"] == str(local_config["local_text"]["models"])
+    assert environment["OLLAMA_NUM_PARALLEL"] == "1" and environment["OLLAMA_DEBUG"] == "0"
+    assert "TELEGRAM_BOT_TOKEN" not in environment and "IMAGE_API_KEY" not in environment
+    assert os.environ["OLLAMA_HOST"] == "0.0.0.0:9999" and os.environ["OLLAMA_NO_CLOUD"] == "0"
+
+
+@pytest.mark.parametrize("missing", ["executable", "models"])
+def test_ollama_installation_must_already_exist(local_config, configured, monkeypatch, missing):
+    local_config["local_text"][missing] = None
+    monkeypatch.setattr(bootstrap, "ollama_server_ready", lambda _: False)
+    monkeypatch.setattr(bootstrap, "listening", lambda _: False)
+    monkeypatch.setattr(bootstrap, "start_hidden", lambda *_args: pytest.fail("No install/download"))
+    with pytest.raises(bootstrap.BootstrapError, match="OLLAMA_"):
+        bootstrap.ensure_local_text(local_config, configured)
+
+
+def test_ollama_configured_port_cannot_overlap_private_service(configured):
+    with (configured / ".env").open("a", encoding="utf-8") as stream:
+        stream.write("\nAI_PROVIDER_FACTORY=app.ai.local:build_provider\nLOCAL_TEXT_API_BASE=http://127.0.0.1:8188")
+    with pytest.raises(bootstrap.BootstrapError, match="отдельный локальный порт"):
+        bootstrap.configuration(configured)
+
+
+def test_readonly_metadata_post_has_no_credential_and_response_is_bounded(monkeypatch):
+    requests = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def read(self, limit):
+            assert limit == 1_048_577
+            return b"{" + b" " * 1_048_576
+
+    def open_request(request, timeout):
+        requests.append(request)
+        assert timeout == 5
+        return Response()
+
+    monkeypatch.setattr(bootstrap, "HTTP", SimpleNamespace(open=open_request))
+    assert bootstrap.request_json("http://127.0.0.1:11434/api/show", payload={"model": "qwen3:4b-instruct"}) == (200, None)
+    assert requests[0].get_method() == "POST" and json.loads(requests[0].data) == {"model": "qwen3:4b-instruct"}
+    assert not requests[0].has_header("Authorization")

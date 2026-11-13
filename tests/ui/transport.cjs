@@ -4,8 +4,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../../app/miniapp/static/transport.js'), 'utf8');
 
-function client(fetch, online = true) {
-  const context = {window: {fetch, navigator: {onLine: online}}, AbortController, Response, setTimeout, clearTimeout};
+function client(fetch, online = true, timers = {setTimeout, clearTimeout}) {
+  const context = {window: {fetch, navigator: {onLine: online}}, AbortController, Response, ...timers};
   vm.runInNewContext(source, context);
   return context.window.TirazhHTTP;
 }
@@ -26,6 +26,16 @@ function client(fetch, online = true) {
   assert.equal(received.headers.get('Content-Type'), 'application/json');
   assert.deepEqual(await received.json(), {error:'conflict'});
   assert.equal(calls, 1, 'Conflict responses must not retry');
+
+  const deadlines=[];
+  const timed=client(async () => new Response('{}'),true,{
+    setTimeout(_callback,delay) {deadlines.push(delay);return 1;},clearTimeout() {},
+  });
+  await timed.request('/api/state');
+  await timed.request('/api/business',{method:'POST'});
+  await timed.request('/api/chat',{method:'POST',timeoutMs:330000});
+  assert.deepEqual(deadlines,[20000,150000,330000],'Only explicit long-running calls extend the default budget');
+  await assert.rejects(timed.request('/api/chat',{method:'POST',timeoutMs:330001}),/Invalid request timeout/);
 
   calls = 0;
   await assert.rejects(client((url, {signal}) => {

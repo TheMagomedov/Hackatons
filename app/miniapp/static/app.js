@@ -8,8 +8,9 @@ const workspace = $("#workspace");
 const toast = $("#toast");
 const demo = document.body.dataset.mode === "preview";
 const accessRules = window.TirazhAccess;
-const telegram = window.Telegram?.WebApp;
-const insideTelegram = Boolean(!demo && telegram?.initData);
+const session = window.TirazhSession;
+let telegram = session.sdk();
+let insideTelegram = Boolean(!demo && telegram && session.initData());
 const labels = {
   review: "На согласовании", approved: "Запланирован", publishing: "Отправляется",
   published: "Опубликован", failed: "Ошибка", editing: "Редактируется",
@@ -308,16 +309,24 @@ function demoApi(url, method, body) {
   }
   throw new Error("Действие недоступно.");
 }
+function apiTimeout(url, method) {
+  // Only synchronous inference needs the backend's 300s budget plus transport margin.
+  // Creating a generation job is a short queue operation and keeps the default.
+  return method === "POST" && /^(?:\/business\/[^/?#]+\/(?:profile\/analyze|chat)|\/post\/[^/?#]+\/revise-(?:text|image))$/.test(url)
+    ? 330000 : undefined;
+}
 async function api(url, body) {
   const method = body ? "POST" : "GET";
   accessRules.assertRequest(currentAccess(), method);
   if (demo) { const result = demoApi(url, method, body); if (method === "POST") persistDemo(); return result; }
-  if (!telegram?.initData) throw new Error("Откройте мини-приложение из меню Telegram-бота.");
+  const initData = session.initData();
+  if (!initData) throw new Error("Не получены данные входа Telegram. Закройте студию и откройте её заново из меню бота.");
   const response = await request("./api" + url, {
-      method, headers: {"X-Telegram-Init-Data": telegram.initData,
+      method, headers: {"X-Telegram-Init-Data": initData,
         ...(body ? {"Content-Type": "application/json"} : {})},
       body: body ? JSON.stringify(body) : undefined,
       cache: "no-store",
+      timeoutMs: apiTimeout(url, method),
     });
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
@@ -335,17 +344,17 @@ function postArt(post, additionalClass = "") {
     + icon("image") + '</div>';
 }
 async function loadImages(container) {
-  if (demo || !telegram?.initData) return;
+  if (demo || !session.initData()) return;
   await Promise.all([...container.querySelectorAll("[data-asset]")].map(loadImage));
 }
 async function loadImage(node) {
   const id = node?.dataset.asset;
-  if (!id || demo || !telegram?.initData) return;
+  if (!id || demo || !session.initData()) return;
   node.setAttribute("aria-busy", "true");
   node.innerHTML = icon("image");
   if (!imageUrls.has(id)) {
     const pending = request("./api/asset/" + path(id), {
-      headers: {"X-Telegram-Init-Data": telegram.initData}, cache: "no-store", timeoutMs: 60000,
+      headers: {"X-Telegram-Init-Data": session.initData()}, cache: "no-store", timeoutMs: 60000,
     }).then(async (response) => {
       if (!response.ok) throw new Error("Нет изображения");
       const blob = await response.blob();
@@ -798,7 +807,7 @@ async function navigate(next, filter = "") {
   view = next;
   statusFilter = filter;
   selectionFeedback();
-  history.replaceState(null, "", "#" + next);
+  session.navigateHash(next);
   root.focus({preventScroll: true});
   window.scrollTo({top: 0, behavior: "instant"});
   if (!await refresh({transition: true})) return;
@@ -1033,7 +1042,7 @@ document.addEventListener("click", async (event) => {
         showDialog(dialogHeading("AI пока не подключён", "Заполните профиль вручную — это откроет работу с черновиками без обращения к модели.")
           + '<div class="dialog-actions">' + button("Заполнить профиль", "manual-profile", "primary") + button("Закрыть", "close", "secondary") + '</div>'); return;
       }
-      if (action === "analyze") notify("AI изучает материалы. Это может занять до двух минут.");
+      if (action === "analyze") notify("AI изучает материалы. Это может занять несколько минут; дождитесь результата.");
       await api("/business/" + path(businessId) + "/profile/" + (action === "analyze" ? "analyze" : "confirm"),
         action === "analyze" ? {request_id: crypto.randomUUID()} : {revision: state.business.profile_version});
       await refresh();
@@ -1122,7 +1131,7 @@ dialog.addEventListener("submit", async (event) => {
         persistDemo();
       } else {
         const data = new FormData(); data.append("file", file);
-        const response = await request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
+        const response = await request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": session.initData()}, body: data});
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось загрузить документ.");
       }
       if (currentForm()) dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
@@ -1199,7 +1208,7 @@ async function uploadManualImage(file, business, form) {
     assetId = crypto.randomUUID(); demoAssets.set(assetId, {id: assetId, business_id: business, data_url: await fileData(file)});
   } else {
     const data = new FormData(); data.append("file", file);
-    const response = await request("./api/business/" + path(business) + "/image", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
+    const response = await request("./api/business/" + path(business) + "/image", {method: "POST", headers: {"X-Telegram-Init-Data": session.initData()}, body: data});
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось сохранить изображение.");
     assetId = (await response.json()).id;
   }
@@ -1289,24 +1298,38 @@ window.addEventListener("pagehide", () => {
   imageTypes.clear();
 });
 dialog.addEventListener("close", () => { ++postRequest; syncBackButton(); if (manualPreviewUrl) { URL.revokeObjectURL(manualPreviewUrl); manualPreviewUrl = null; } });
-if (insideTelegram) {
-  telegram.ready();
-  telegram.expand();
-  telegram.onEvent("themeChanged", () => {
-    themeOverride = null;
-    useTheme();
-  });
-  if (telegram.isVersionAtLeast("6.1")) {
-    telegram.BackButton.onClick(() => {
-      if (dialog.open) dialog.close();
-      else void navigate("overview").catch(announceError);
+let attachedBridge = null;
+function attachTelegramBridge() {
+  telegram = session.sdk();
+  insideTelegram = Boolean(!demo && telegram && session.initData());
+  if (!insideTelegram || attachedBridge === telegram) return;
+  attachedBridge = telegram;
+  try {
+    session.ready();
+    telegram.expand();
+    telegram.onEvent("themeChanged", () => {
+      themeOverride = null;
+      useTheme();
     });
-  }
+    if (telegram.isVersionAtLeast("6.1")) {
+      telegram.BackButton.onClick(() => {
+        if (dialog.open) dialog.close();
+        else void navigate("overview").catch(announceError);
+      });
+    }
+    useTheme();
+    syncBackButton();
+  } catch { /* Optional Telegram chrome cannot block the application. */ }
 }
+session.onBridge(attachTelegramBridge);
 if (demo) {
   const banner = $("#mode-banner"); banner.hidden = false;
   banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>AI, отправка и расписание имитируются. <span id="demo-storage-note">Изменения сохраняются в этом браузере.</span></span>' + button("Сбросить", "reset-demo", "demo-reset");
   if (restoredDemo.issue) notify(restoredDemo.issue);
 }
 useTheme();
-void refresh({transition: true}).catch(() => {}); // Persistent recovery is rendered by refresh.
+session.ready();
+void session.waitForInitData().then(() => {
+  attachTelegramBridge();
+  return refresh({transition: true});
+}).catch(() => {}); // Persistent recovery is rendered by refresh; mutations are never replayed.
