@@ -360,13 +360,14 @@ async function stopFixture(child) {
    assert.equal(retryPosts,1,'Failed content GET is not retried automatically');
    assert.equal(await retryPage.locator('#main').getAttribute('data-business')||'','','No business content has rendered yet');
    await retryPage.getByRole('button',{name:'Повторить загрузку',exact:true}).click();
+   await retryPage.locator('#main[data-screen="content"][aria-busy="false"]').waitFor();
    await retryPage.getByRole('heading',{name:'Посты',exact:true}).waitFor();
    assert.equal(retryStates.length,2,'Explicit retry refreshes the selected business');
    assert.equal(retryPosts,2,'Explicit retry reloads the failed content exactly once');
    assert.equal(retryStates[1],retryStates[0]);
    assert.equal(await retryPage.locator('#main').getAttribute('data-business'),retryStates[0]);
    assert.equal(await retryPage.locator('#workspace').inputValue(),retryStates[0]);
-  } finally {await retryPage.close();}
+  } finally {await retryPage.unrouteAll({behavior:'ignoreErrors'});await retryPage.close();}
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}
