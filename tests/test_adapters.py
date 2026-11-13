@@ -1,19 +1,22 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerCallbackQuery, SendMessage, SendPhoto
 from aiogram.types import Chat, Message, Update
 
+from app.ai.client import AISettings, ChatJSONClient
+from app.ai.provider import ModelAI
 from app.ai.provider import build_provider as build_ai_provider
 from app.bot.router import build_router
 from app.config import Settings
 from app.core.runtime import build_runtime
 from app.media.runtime import build_provider
-from app.shared.errors import ProviderUnavailable
-from app.shared.models import BusinessProfile, TextDraft
+from app.shared.errors import InvalidInput, ProviderUnavailable
+from app.shared.models import BusinessProfile, Source, SourceInput, TextDraft
 
 
 class RecordingSession(BaseSession):
@@ -140,6 +143,37 @@ async def test_bot_owner_onboarding_queue_preview_and_stale_approval(tmp_path, m
                        for row in session.requests[-1].reply_markup.inline_keyboard)
     finally:
         await runtime.close()
+
+
+async def test_ai_uses_backend_source_ids_and_rejects_nonpublic_urls():
+    import json
+
+    calls = []
+
+    def model_response(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": (
+                '{"name":"Кофейня","description":"Кофейня","facts":[{"text":"Кофе","source_ids":["s1"]}]}'
+        )}}]})
+
+    source = Source(
+        id="s1", business_id="b1", kind="text", name="Описание", text="Кофе и тосты",
+        created_at=datetime.now(UTC),
+    )
+    ai = ModelAI(ChatJSONClient(
+        AISettings(api_key="test-only", model="test", max_retries=0),
+        transport=httpx.MockTransport(model_response),
+    ))
+    try:
+        profile = await ai.build_profile([SourceInput(source=source)])
+        assert profile.facts[0].source_ids == ["s1"]
+        assert "Кофе и тосты" in calls[0]["messages"][1]["content"]
+        unsafe = source.model_copy(update={"kind": "url", "text": None, "url": "http://127.0.0.1/"})
+        with pytest.raises(InvalidInput):
+            await ai.build_profile([SourceInput(source=unsafe)])
+    finally:
+        await ai.close()
 
 
 async def test_live_adapters_defer_missing_generation_credentials(monkeypatch):
