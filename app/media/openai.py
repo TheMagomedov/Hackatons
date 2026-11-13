@@ -176,7 +176,13 @@ class OpenAIImageProvider:
     async def generate(
         self, profile: BusinessProfile, text: TextDraft, feedback: str | None = None
     ) -> GeneratedImage:
+        from app.safety.input_guard import guard_payload
+        from app.safety.privacy import redact_text
+
+        guard_payload([profile.model_dump(mode="json"), text.model_dump(mode="json"), feedback])
         prompt = build_image_prompt(profile, text, feedback, self._limits)
+        if not self._local_flux:
+            prompt = redact_text(prompt)
         body = json.dumps(
             {"model": self._model, "prompt": prompt, "n": 1, "output_format": "png"},
             ensure_ascii=False,

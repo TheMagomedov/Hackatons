@@ -210,6 +210,9 @@ class TelegramPublisher(_TelegramClient):
         return ChannelInfo(id=canonical_id, title=title)
 
     async def publish(self, post: PostView, image: bytes, mime_type: str) -> PublicationResult:
+        from app.safety.privacy import guard_public_output
+
+        guard_public_output(post.text)
         if post.is_demo:
             raise DeliveryRejected("Demo posts cannot be published by the real Telegram adapter.")
         if not _plain_text_valid(post.text, 900, 1024):
@@ -266,12 +269,14 @@ class TelegramNotifier(_TelegramClient):
     """Notification retries and deduplication are owned by the core outbox."""
 
     async def send(self, notification: Notification) -> None:
+        from app.safety.privacy import redact_text
+
         if not _positive_id(notification.owner_id):
             raise InvalidInput("A valid Telegram notification recipient is required.")
         if not _plain_text_valid(notification.text, 4096, 4096):
             raise InvalidInput("The notification text exceeds the supported limits or is invalid.")
         result = await self._call(
-            "sendMessage", {"chat_id": notification.owner_id, "text": notification.text}
+            "sendMessage", {"chat_id": notification.owner_id, "text": redact_text(notification.text)}
         )
         if (
             not isinstance(result, dict)

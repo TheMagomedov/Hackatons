@@ -63,7 +63,9 @@ class RecordingSession(BaseSession):
     def __init__(self):
         super().__init__()
         self.requests = []
-        self.download = b"%PDF-1.4\n% Test transport fixture\n"
+        from tests.ai.test_sources import pdf_bytes
+        # The same source now passes real RAG extraction during a conversation.
+        self.download = pdf_bytes(text="Coffee and breakfast menu. Opening hours need confirmation.")
         self.slow_callback_id = None
         self.callback_started = asyncio.Event()
         self.callback_release = asyncio.Event()

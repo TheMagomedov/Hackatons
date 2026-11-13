@@ -118,6 +118,9 @@ async def install_mini_app_menu(bot: Bot, owner_id: int, mini_app_url: str | Non
 
 
 async def reply(message: Message, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
+    from app.safety.privacy import redact_text
+
+    text = redact_text(text)
     while len(text) > 1800:
         cut = text.rfind("\n", 0, 1800)
         cut = cut if cut > 600 else 1800
@@ -414,7 +417,12 @@ def build_router(service: BackendService) -> Router:
         await reply(message, "\n".join(parts), menu(*rows, mini_app_url=service.settings.mini_app_url))
 
     async def preview(message: Message, actor: int, post: PostView) -> None:
+        from app.safety.privacy import guard_public_output
+
         business = service.get_business(actor, post.business_id)
+        guard_public_output(post.text)
+        for warning in post.warnings:
+            guard_public_output(warning)
         try:
             asset, content = service.read_asset(actor, post.image_asset_id)
         except AppError:
@@ -878,7 +886,7 @@ def build_router(service: BackendService) -> Router:
                 )
                 if intent.action == "prepare":
                     request = intent.request or text
-                    job = service.request_preparation(
+                    job = await service.prepare_with_tools(
                         actor, business.id, request, event_key(event_update, message.bot.id)
                     )
                     await show_job(message, actor, job.id)

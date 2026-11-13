@@ -20,6 +20,8 @@ from pydantic import ValidationError
 from app.ai.client import SYSTEM
 from app.ai.provider import ModelAI
 from app.config import Settings
+from app.safety.input_guard import guard_payload
+from app.safety.privacy import redact_for_egress
 from app.shared.errors import InvalidInput, ProviderUnavailable
 
 _ENV_KEYS = {
@@ -120,7 +122,10 @@ class ChatGPTClient:
                 self._processes.discard(process)
 
     async def complete(self, schema, instruction, data, validate=None):
-        payload = json.dumps({"input": data}, ensure_ascii=False)
+        if len(json.dumps(data, ensure_ascii=False)) > 160_000:
+            raise InvalidInput("Слишком много данных для одного запроса.")
+        guard_payload(data)
+        payload = json.dumps({"input": redact_for_egress(data)}, ensure_ascii=False)
         if len(payload) > 160_000:
             raise InvalidInput("Слишком много данных для одного запроса.")
         prompt = (

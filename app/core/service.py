@@ -6,6 +6,7 @@ import io
 import ipaddress
 import json
 import logging
+import time
 import warnings
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
@@ -17,8 +18,11 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from app.access import actor_action
+from app.ai.resilience import inference_scope
 from app.config import Settings
 from app.safety import NoopSafety, SafetyPolicy
+from app.safety.input_guard import guard_input, guard_payload, inspect_input
+from app.safety.privacy import guard_public_output
 from app.shared.errors import (
     AppError,
     Conflict,
@@ -70,6 +74,8 @@ class BackendService:
         clock: Callable[[], datetime] = utc_now,
         *,
         safety: SafetyPolicy | None = None,
+        knowledge=None,
+        telemetry=None,
     ):
         self.repo = repository
         self.files = files
@@ -81,6 +87,8 @@ class BackendService:
         self.reporter = reporter
         self.clock = clock
         self.safety = NoopSafety() if safety is None else safety
+        self.knowledge = knowledge
+        self.telemetry = telemetry
         self._notification_lock = asyncio.Lock()
 
     def now(self) -> datetime:
@@ -127,11 +135,19 @@ class BackendService:
     @staticmethod
     def _provider_result(model, result):
         try:
-            return model.model_validate(result)
+            validated = model.model_validate(result)
         except ValidationError:
             raise ProviderUnavailable(
                 "Внешний сервис вернул ответ, не соответствующий общему контракту."
             ) from None
+        if isinstance(validated, TextDraft):
+            for value in [validated.text, validated.image_brief, *validated.warnings]:
+                guard_public_output(value)
+        if isinstance(validated, ContentPlan):
+            for item in validated.items:
+                for value in [item.topic, item.goal, item.brief, item.image_brief]:
+                    guard_public_output(value)
+        return validated
 
     async def _ai_operation(
         self,
@@ -174,12 +190,17 @@ class BackendService:
             )
         operation_id = entry["id"]
         log.info("AI operation started id=%s kind=%s", operation_id, kind)
+        scope = {"business_id": business.id, "operation_id": operation_id, "kind": kind}
+        started = time.monotonic()
+        self._trace(scope, "started")
         try:
-            result = self._provider_result(model, await operation())
+            with inference_scope(business.id, operation_id, kind, business.profile_version):
+                result = self._provider_result(model, await operation())
             self.repo.finish_ai_operation(
                 operation_id, result.model_dump(mode="json"), self.now(), dialogue_text=dialogue_text
             )
             log.info("AI operation completed id=%s kind=%s", operation_id, kind)
+            self._trace(scope, "completed", (time.monotonic() - started) * 1000)
             return result
         except BaseException as exc:
             code = (
@@ -196,6 +217,7 @@ class BackendService:
                     type(persist_error).__name__,
                 )
             log.warning("AI operation failed id=%s kind=%s code=%s", operation_id, kind, code)
+            self._trace(scope, "failed", (time.monotonic() - started) * 1000)
             if isinstance(exc, (AppError, asyncio.CancelledError)):
                 raise
             if not isinstance(exc, Exception):
@@ -203,6 +225,67 @@ class BackendService:
             raise ProviderUnavailable(
                 f"Не удалось завершить AI-действие. Код операции: {operation_id}."
             ) from None
+
+    def _trace(self, scope, event, duration_ms=0):
+        if self.telemetry is not None:
+            try:
+                self.telemetry.trace(scope, event, duration_ms=duration_ms)
+            except Exception:
+                log.warning("AI metadata trace could not be saved")
+
+    def ai_traces(self, actor_id: int, business_id: str, *, limit: int = 30) -> list[dict]:
+        self._business(actor_id, business_id, write=False)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise InvalidInput("Лимит журнала: от 1 до 100.")
+        return [] if self.telemetry is None else self.telemetry.recent(business_id, limit=limit)
+
+    def _source_inputs(self, business_id: str) -> list[SourceInput]:
+        return [SourceInput(source=source, content=self.files.read(self.repo.get_asset(source.asset_id))
+                            if source.asset_id else None)
+                for source in self._check_source_limits(business_id)]
+
+    async def search_knowledge(self, actor_id: int, business_id: str, query: str, *, limit: int = 4) -> list[dict]:
+        self._business(actor_id, business_id, write=False)
+        self._plain_text(query, 4000, "Поисковый запрос должен содержать от 1 до 4000 символов.")
+        guard_input(query)
+        if type(limit) is not int or not 1 <= limit <= 6:
+            raise InvalidInput("Лимит фрагментов: от 1 до 6.")
+        if self.knowledge is None:
+            return []
+        inputs = self._source_inputs(business_id)
+        await self.knowledge.index_sources(business_id, inputs)
+        self._business(actor_id, business_id, write=False)  # Permission may change while extracting.
+        current = {source.id for source in self.repo.list_sources(business_id)}
+        if current != {item.source.id for item in inputs}:
+            raise Conflict("Источники изменились во время поиска. Повторите запрос.")
+        hits = self.knowledge.search(business_id, query, limit=limit, allowed_source_ids=current,
+                                     max_context_chars=5000)
+        result = [hit.as_context() for hit in hits]
+        guard_payload(result)
+        return result
+
+    def knowledge_status(self, actor_id: int, business_id: str) -> dict:
+        self._business(actor_id, business_id, write=False)
+        if self.knowledge is None:
+            return {"enabled": False, "sources": 0, "chunks": 0}
+        ids = {source.id for source in self.repo.list_sources(business_id)}
+        status = self.knowledge.status(business_id, allowed_source_ids=ids)
+        return {"enabled": True, "sources": status.sources, "chunks": status.chunks,
+                "fingerprint": status.fingerprint, "method": "local_bm25"}
+
+    async def _knowledge_profile(self, business: Business, query: str) -> BusinessProfile:
+        """Enrich an inference snapshot; never silently approve or persist retrieved clauses."""
+        hits = await self.search_knowledge(business.owner_id, business.id, query[:4000])
+        profile = business.profile
+        facts = list(profile.facts)
+        for hit in hits:
+            fact = Fact(text=hit["text"][:900], source_ids=[hit["source_id"]])
+            if fact in facts:
+                continue
+            candidate = profile.model_copy(update={"facts": [*facts, fact]})
+            if len(candidate.model_dump_json()) <= 5900:
+                facts.append(fact)
+        return profile.model_copy(update={"facts": facts})
 
     def _notification(
         self, business: Business, kind: str, text: str, post_id: str | None = None, job_id: str | None = None
@@ -311,6 +394,7 @@ class BackendService:
         self._business(actor_id, business_id)
         if not text.strip() or len(text.encode("utf-8")) > self.settings.max_upload_bytes:
             raise InvalidInput("Пустой или слишком большой источник.")
+        guard_input(text, source="document")
         self._check_source_limits(business_id, extra_bytes=len(text.encode("utf-8")))
         source = Source(
             id=str(uuid4()),
@@ -519,6 +603,10 @@ class BackendService:
         """
         profile = business.profile
         history = self.repo.conversation_history(business.id, limit=8)
+        # Quarantine old poisoned memory without deleting it or blocking every future question.
+        history = [item for item in history if not inspect_input(
+            item["user_text"][:1200] + "\n" + item["assistant_text"][:1200], source="document",
+        )]
         posts = sorted(self.repo.list_posts(business.id), key=lambda p: (p.updated_at, p.id), reverse=True)
         jobs = sorted(self.repo.list_jobs(business.id), key=lambda j: (j.created_at, j.id), reverse=True)
         selected = next((post for post in posts if post.id == post_id), None)
@@ -573,27 +661,37 @@ class BackendService:
     ) -> TaskIntent:
         business = self._business(actor_id, business_id)
         self._plain_text(text, 4000, "Запрос должен содержать от 1 до 4000 символов.")
+        guard_input(text)
         if post_id and self._post(actor_id, post_id).business_id != business_id:
             raise Forbidden("Пост относится к другому бизнесу.")
 
         # Intent is a suggestion only; there is deliberately no 'approve/publish' model action.
         async def interpret():
+            context = self._conversation_context(business, post_id)
+            context["knowledge"] = await self.search_knowledge(actor_id, business_id, text)
             intent = self._provider_result(
                 TaskIntent,
                 await self._external(
-                    self.ai.interpret_request(text, self._conversation_context(business, post_id))
+                    self.ai.interpret_request(text, context)
                 ),
             )
             if intent.post_id and intent.post_id != post_id:
                 raise InvalidInput("Выберите пост явно перед изменением.")
             if intent.action == "answer" and not intent.answer.strip():
                 raise ProviderUnavailable("AI вернул пустой ответ. Уточните вопрос.")
+            if intent.action == "answer" and context["knowledge"]:
+                names = list(dict.fromkeys(hit["source_name"] for hit in context["knowledge"]))[:3]
+                evidence = "\n\nИсточники для проверки: " + "; ".join(name[:160] for name in names)
+                if len(intent.answer) + len(evidence) <= 4000:
+                    intent = intent.model_copy(update={"answer": intent.answer + evidence})
             if any(not question.strip() or len(question) > 1000 for question in intent.questions):
                 raise ProviderUnavailable("AI вернул некорректные уточняющие вопросы.")
+            for value in [intent.answer, intent.request, *intent.questions]:
+                guard_public_output(value)
             self._business(actor_id, business_id)
             return intent
 
-        return await self._ai_operation(
+        result = await self._ai_operation(
             business,
             "interpret",
             {"text": text, "post_id": post_id},
@@ -602,10 +700,15 @@ class BackendService:
             request_id=request_id,
             dialogue_text=text,
         )
+        # Replayed durable results must respect the current output policy as well.
+        for value in [result.answer, result.request, *result.questions]:
+            guard_public_output(value)
+        return result
 
     @actor_action
     def request_preparation(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
         business = self._business(actor_id, business_id)
+        guard_input(request)
         request = self._plain_text(request, 4000, "Укажите запрос длиной до 4000 символов.").strip()
         if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 200:
             raise InvalidInput("Укажите запрос и стабильный идентификатор действия.")
@@ -625,6 +728,15 @@ class BackendService:
             max_pending=self.settings.max_pending_jobs,
             max_per_day=self.settings.max_generation_jobs_per_day,
         )
+
+    async def prepare_with_tools(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
+        from app.mcp_tools import ToolDispatcher
+
+        tool = ToolDispatcher(self, actor_id, business_ids={business_id}, allow_prepare=True)
+        result = await tool.call("studio_request_preparation", {
+            "business_id": business_id, "request": request, "request_id": request_id,
+        })
+        return self.get_job(actor_id, result["job"]["id"])
 
     def get_job(self, actor_id: int, job_id: str) -> Job:
         self.require_access(actor_id)
@@ -799,6 +911,7 @@ class BackendService:
     def _validate_caption(text: str) -> str:
         message = "Подпись должна быть непустой и помещаться в один пост с изображением."
         BackendService._plain_text(text, 900, message)
+        guard_public_output(text)
         if len(text.encode("utf-16-le")) // 2 > 1024:
             raise InvalidInput(message)
         return text
@@ -883,6 +996,7 @@ class BackendService:
         if post.channel_id != business.channel_id:
             raise Conflict("Сначала обновите канал в предпросмотре поста.")
         self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        guard_input(feedback)
         # This durable reservation invalidates old buttons before any paid call.
         return business, self.repo.begin_edit(post_id, expected_revision, self.now())
 
@@ -917,6 +1031,7 @@ class BackendService:
     ) -> PostView:
         post = self._post(actor_id, post_id)
         self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        guard_input(feedback)
         await self._ai_operation(
             self._business(actor_id, post.business_id),
             "revise_text",
@@ -990,6 +1105,7 @@ class BackendService:
     ) -> PostView:
         post = self._post(actor_id, post_id)
         self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        guard_input(feedback)
         await self._ai_operation(
             self._business(actor_id, post.business_id),
             "revise_image",
@@ -1051,6 +1167,7 @@ class BackendService:
             raise InvalidInput("Некорректное изображение.")
         self.files.read(asset)
         self._validate_caption(post.text)
+        guard_public_output(post.text)
         if self.settings.mode == "live" and (post.is_demo or asset.is_demo):
             raise InvalidInput("Тестовый материал нельзя публиковать в live-режиме.")
         return self.repo.approve_post(post_id, expected_revision, actor_id, self.now())
@@ -1076,6 +1193,7 @@ class BackendService:
         if enabled:
             self._ready(business)
         self._plain_text(request, 4000, "Укажите запрос длиной до 4000 символов.")
+        guard_input(request)
         if type(interval_hours) is not int or not 1 <= interval_hours <= 720:
             raise InvalidInput("Период должен быть от 1 до 720 часов, запрос — до 4000 символов.")
         next_at = as_utc(first_run_at) if first_run_at else self.now() + timedelta(hours=interval_hours)
@@ -1107,6 +1225,8 @@ class BackendService:
         business = self.repo.get_business(job.business_id)
         try:
             self._ready(business)
+            guard_input(job.request)
+            profile = await self._knowledge_profile(business, job.request)
             self.repo.set_job_progress(job.id, "plan", 0, 0, self.now())
             request = f"{job.request}\nПодготовь не более {self.settings.max_posts_per_job} публикаций."
             plan = await self._ai_operation(
@@ -1114,7 +1234,7 @@ class BackendService:
                 "plan",
                 {"request": request, "profile_version": business.profile_version},
                 ContentPlan,
-                lambda: self._external(self.ai.make_plan(business.profile, request)),
+                lambda: self._external(self.ai.make_plan(profile, request)),
                 request_id=f"job:{job.id}:plan",
             )
             self._current_context(business)
@@ -1132,7 +1252,7 @@ class BackendService:
                     "text",
                     {"item": item.model_dump(mode="json"), "profile_version": business.profile_version},
                     TextDraft,
-                    lambda: self._external(self.ai.write_post(business.profile, item)),
+                    lambda: self._external(self.ai.write_post(profile, item)),
                     request_id=f"job:{job.id}:text:{index}",
                 )
                 self._current_context(business)
@@ -1268,6 +1388,7 @@ class BackendService:
             image = self.files.read(asset)
             if self.settings.mode == "live" and (post.is_demo or asset.is_demo):
                 raise InvalidInput("Публикация тестового материала запрещена.")
+            guard_public_output(post.text)
             await asyncio.to_thread(self.safety.check_text, [post.text])
             await asyncio.to_thread(self.safety.check_image, image, asset.mime_type)
             try:
