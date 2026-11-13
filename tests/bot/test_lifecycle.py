@@ -47,6 +47,7 @@ async def test_shutdown_waits_for_user_handler_cleanup_before_closing_clients():
             sequence.append("closed-client")
 
     adapter = object.__new__(TelegramBotAdapter)
+    adapter.mini_app_url = None
     adapter.bot, adapter.dispatcher, adapter.updates = FakeBot(), Dispatcher(), lifecycle
     stop = asyncio.Event()
     running = asyncio.create_task(adapter.run(stop))

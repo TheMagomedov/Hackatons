@@ -3,6 +3,7 @@
 import asyncio
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from aiogram import Bot, Dispatcher
@@ -15,7 +16,7 @@ from app.config import Settings
 from app.core.demo import DemoAI
 from app.core.runtime import build_runtime
 from app.reports.provider import PlainTextReportProvider
-from app.shared.models import Notification, PostStatus, TextDraft
+from app.shared.models import Notification, PostStatus, TaskIntent, TextDraft
 
 OWNER = 42
 NOW = datetime(2026, 11, 9, 12, tzinfo=UTC)
@@ -504,14 +505,15 @@ async def test_every_button_fits_telegram_callback_limit(harness):
             )
 
 
-async def test_help_and_explicit_prepare_do_not_pay_for_intent_recognition(harness):
+async def test_help_is_free_and_prepare_button_uses_company_context(harness):
     h = harness
     business = await h.ready_business()
     await h.send(text="/help")
     assert "согласуйте" in h.last_text
+    assert h.ai.calls["intent"] == 0
     await h.send(button=f"input:request:{business.id}")
     await h.send(text="Подготовь один пост")
-    assert h.ai.calls["intent"] == 0
+    assert h.ai.calls["intent"] == 1
     assert len(h.service.list_jobs(OWNER, business.id)) == 1
 
 
@@ -557,3 +559,73 @@ async def test_unknown_delivery_rejects_old_forward_and_accepts_corrected_input(
     assert resolved.status == PostStatus.PUBLISHED
     assert resolved.message_id == 999
     assert h.ai.calls["intent"] == 1
+
+
+async def test_telegram_followup_uses_history_and_answer_does_not_enqueue(harness):
+    h = harness
+    business = await h.ready_business()
+    h.ai.interpret_request = AsyncMock(side_effect=[
+        TaskIntent(action="clarify", questions=["О завтраках или о кофе?"]),
+        TaskIntent(action="prepare", request="Подготовь один пост о завтраках, без цен."),
+        TaskIntent(action="answer", answer="Вы попросили один пост о завтраках, без цен."),
+    ])
+    await h.send(text="Подготовь один пост")
+    assert h.last_text == "О завтраках или о кофе?"
+    await h.send(text="О завтраках, без цен")
+    assert h.service.list_jobs(OWNER, business.id)[0].request == "Подготовь один пост о завтраках, без цен."
+    event = await h.send(text="Что я поручил?")
+    assert h.last_text == "Вы попросили один пост о завтраках, без цен."
+    assert len(h.service.list_jobs(OWNER, business.id)) == 1
+    context = h.ai.interpret_request.call_args.args[1]
+    assert context["history"][0]["assistant_text"] == "О завтраках или о кофе?"
+    assert len(h.service.conversation_history(OWNER, business.id)) == 3
+    await h.feed(event)
+    assert h.ai.interpret_request.await_count == 3
+    assert len(h.service.conversation_history(OWNER, business.id)) == 3
+    assert h.service.publisher.sent == []
+
+
+async def test_prepare_button_resolves_followup_without_losing_company_or_creating_early_job(harness):
+    h = harness
+    business = await h.ready_business()
+    h.ai.interpret_request = AsyncMock(side_effect=[
+        TaskIntent(action="prepare", request="Подготовь один пост о завтраках, без цен."),
+        TaskIntent(action="clarify", questions=["Два новых поста о завтраках, тоже без цен?"]),
+        TaskIntent(action="prepare", request="Подготовь два новых поста о завтраках, без цен."),
+        TaskIntent(action="answer", answer="Вы попросили ещё два поста о завтраках, без цен."),
+    ])
+    await h.send(button=f"input:request:{business.id}")
+    await h.send(text="Один пост о завтраках, без цен")
+    assert len(h.service.list_jobs(OWNER, business.id)) == 1
+
+    # An old company-A button remains safe after the owner selected company B.
+    other = h.service.create_business(OWNER, "Студия стекла")
+    await h.send(button=f"business:{other.id}")
+    await h.send(button=f"input:request:{business.id}")
+    await h.send(text="Ещё два таких")
+    assert h.last_text == "Два новых поста о завтраках, тоже без цен?"
+    assert len(h.service.list_jobs(OWNER, business.id)) == 1
+    assert h.service.list_jobs(OWNER, other.id) == []
+    context = h.ai.interpret_request.call_args.args[1]
+    assert context["business_id"] == business.id
+    assert context["history"][0]["user_text"] == "Один пост о завтраках, без цен"
+
+    # A plain reply to that clarification must use A's history, not B's selection.
+    response = await h.send(text="Да, без цен")
+    jobs = h.service.list_jobs(OWNER, business.id)
+    assert len(jobs) == 2
+    assert "Подготовь два новых поста о завтраках, без цен." in {job.request for job in jobs}
+    context = h.ai.interpret_request.call_args.args[1]
+    assert context["business_id"] == business.id
+    assert context["history"][-1]["action"] == "clarify"
+    await h.feed(response)
+    assert h.ai.interpret_request.await_count == 3
+    assert len(h.service.list_jobs(OWNER, business.id)) == 2
+
+    await h.send(button=f"input:request:{business.id}")
+    await h.send(text="Что я попросил?")
+    assert h.last_text == "Вы попросили ещё два поста о завтраках, без цен."
+    assert len(h.service.list_jobs(OWNER, business.id)) == 2
+    assert h.service.list_jobs(OWNER, other.id) == []
+    assert h.service.conversation_history(OWNER, other.id) == []
+    assert h.service.publisher.sent == []

@@ -1,0 +1,12 @@
+services:
+  marketer:
+    build:
+      context: .
+      dockerfile: Dockerfile.chatgpt
+    environment:
+      AI_PROVIDER_FACTORY: app.ai.chatgpt:build_provider
+    volumes:
+      - chatgpt-auth:/home/marketer/.codex
+
+volumes:
+  chatgpt-auth:

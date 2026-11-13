@@ -26,6 +26,7 @@ class Settings(BaseModel):
     bot_factory: str | None = None
     mini_app_url: str | None = None
     mini_app_port: int = Field(default=8766, ge=1024, le=65535)
+    mini_app_host: Literal["127.0.0.1", "0.0.0.0"] = "127.0.0.1"
     provider_timeout_seconds: float = Field(default=120, gt=0, le=600)
     max_upload_bytes: int = Field(default=10_000_000, gt=0, le=20_000_000)
     max_posts_per_job: int = Field(default=3, ge=1, le=5)
@@ -87,6 +88,7 @@ class Settings(BaseModel):
             "BOT_FACTORY": "bot_factory",
             "MINI_APP_URL": "mini_app_url",
             "MINI_APP_PORT": "mini_app_port",
+            "MINI_APP_HOST": "mini_app_host",
             "PROVIDER_TIMEOUT_SECONDS": "provider_timeout_seconds",
             "MAX_UPLOAD_BYTES": "max_upload_bytes",
             "MAX_POSTS_PER_JOB": "max_posts_per_job",

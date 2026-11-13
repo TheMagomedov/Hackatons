@@ -23,7 +23,34 @@ jobs:
       - run: python -m app demo
   container:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dockerfile: [Dockerfile, Dockerfile.chatgpt]
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t marketer:test .
+      - run: docker build -f ${{ matrix.dockerfile }} -t marketer:test .
       - run: docker run --rm --network none marketer:test demo
+  mini-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: python -m pip install -r requirements-dev.txt
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Check responsive preview and authenticated backend workflow
+        run: |
+          python -m app miniapp-preview > /tmp/tirazh-preview.log 2>&1 &
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8765/mini/health > /dev/null; then break; fi
+            sleep 1
+          done
+          npm run test:ui
+          npm run test:ui:backend

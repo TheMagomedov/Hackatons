@@ -34,9 +34,10 @@ from app.shared.models import (
     PublicationResult,
     ReportInput,
     Source,
+    TaskIntent,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
@@ -131,6 +132,9 @@ class Repository:
                 version = 2
             if version == 2:
                 self._migrate_v2_to_v3(conn)
+                version = 3
+            if version == 3:
+                self._migrate_v3_to_v4(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if version != 0:
@@ -161,6 +165,7 @@ class Repository:
                 conn.execute(statement)
             self._migrate_v1_to_v2(conn)
             self._migrate_v2_to_v3(conn)
+            self._migrate_v3_to_v4(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -188,6 +193,30 @@ class Repository:
             "CREATE TABLE inbound_events (owner_id INTEGER NOT NULL, event_key TEXT NOT NULL, "
             "digest TEXT NOT NULL, received_at TEXT NOT NULL, PRIMARY KEY(owner_id,event_key))"
         )
+
+    @staticmethod
+    def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE conversation_turns (sequence INTEGER PRIMARY KEY, "
+            "operation_id TEXT NOT NULL UNIQUE REFERENCES ai_operations(id), "
+            "business_id TEXT NOT NULL REFERENCES businesses(id), "
+            "user_text TEXT NOT NULL, assistant_text TEXT NOT NULL, "
+            "action TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        conn.execute("CREATE INDEX conversation_business ON conversation_turns(business_id,sequence)")
+
+    def conversation_history(self, business_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Completed turns, bounded and chronological, scoped before reading any text."""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise InvalidInput("Размер истории должен быть от 1 до 50")
+        with self._reader() as conn:
+            self._business(conn, business_id)
+            rows = conn.execute(
+                "SELECT operation_id AS id,business_id,user_text,assistant_text,action,created_at "
+                "FROM conversation_turns WHERE business_id=? ORDER BY sequence DESC LIMIT ?",
+                (business_id, limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
 
     def claim_inbound_event(self, owner_id: int, event_key: str, digest: str, now: datetime) -> bool:
         """Claim an incoming event once, before mutable dialog state routes it.
@@ -1432,7 +1461,9 @@ class Repository:
             row = conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
             return {**self._operation_dict(row), "created": True}
 
-    def finish_ai_operation(self, operation_id: str, result: dict | None, now: datetime) -> dict[str, Any]:
+    def finish_ai_operation(
+        self, operation_id: str, result: dict | None, now: datetime, *, dialogue_text: str | None = None
+    ) -> dict[str, Any]:
         now = _utc(now)
         if result is not None and not isinstance(result, dict):
             raise InvalidInput("Результат AI-операции должен быть JSON-объектом")
@@ -1442,6 +1473,11 @@ class Repository:
                 raise ValueError
         except (TypeError, ValueError, UnicodeEncodeError):
             raise InvalidInput("Результат AI-операции не подходит для хранения") from None
+        intent = None
+        if dialogue_text is not None:
+            if not isinstance(dialogue_text, str) or not 1 <= len(dialogue_text.strip()) <= 4000:
+                raise InvalidInput("Сообщение диалога должно содержать от 1 до 4000 символов")
+            intent = TaskIntent.model_validate(result)
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM ai_operations WHERE id=?", (operation_id,)).fetchone()
             if row is None:
@@ -1450,6 +1486,24 @@ class Repository:
                 return self._operation_dict(row)
             if row["status"] != "running":
                 raise Conflict("AI-операция уже завершена")
+            if intent is not None:
+                if row["kind"] != "interpret":
+                    raise InvalidInput("История диалога относится только к интерпретации запроса")
+                # A turn and its cached AI result commit together. A replay cannot
+                # duplicate history or pay for a second interpretation.
+                assistant = {
+                    "prepare": "Бриф для подготовки: " + intent.request,
+                    "report": "Запрошен отчёт по компании.",
+                    "revise_text": "Предложена правка текста: " + intent.request,
+                    "revise_image": "Предложена правка изображения: " + intent.request,
+                    "clarify": "\n".join(intent.questions),
+                    "answer": intent.answer,
+                }[intent.action]
+                conn.execute(
+                    "INSERT INTO conversation_turns(operation_id,business_id,user_text,assistant_text,"
+                    "action,created_at) VALUES (?,?,?,?,?,?)",
+                    (operation_id, row["business_id"], dialogue_text, assistant, intent.action, _stamp(now)),
+                )
             conn.execute(
                 "UPDATE ai_operations SET status='done',result=?,updated_at=? WHERE id=?",
                 (encoded, _stamp(now), operation_id),

@@ -68,6 +68,7 @@ def begin(
 
 def legacy_v2(repo, post_id=None):
     with closing(sqlite3.connect(repo.db_path)) as conn:
+        conn.execute("DROP TABLE conversation_turns")
         conn.execute("DROP TABLE ai_operations")
         conn.execute("DROP TABLE inbound_events")
         conn.execute("PRAGMA user_version=2")
@@ -96,7 +97,7 @@ def raw_snapshot(repo):
         names = [
             row[0]
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('ai_operations','inbound_events')"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('ai_operations','inbound_events','conversation_turns')"
             )
         ]
         return {name: conn.execute(f'SELECT * FROM "{name}" ORDER BY rowid').fetchall() for name in names}

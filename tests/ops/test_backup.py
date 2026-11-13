@@ -120,6 +120,7 @@ def test_restore_rejects_tampering_without_partial_destination(data, tmp_path, c
 def test_legacy_snapshot_restores_with_migration_without_changing_backup(data, tmp_path):
     source, _, business = data
     with closing(sqlite3.connect(source / "backend.sqlite3")) as conn:
+        conn.execute("DROP TABLE conversation_turns")
         conn.execute("DROP TABLE ai_operations")
         conn.execute("DROP TABLE inbound_events")
         conn.execute("PRAGMA user_version=2")

@@ -1,11 +1,12 @@
 import asyncio
+import json
 import logging
 from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiohttp import web
+from aiohttp import BodyPartReader, web
 from pydantic import AwareDatetime, Field, ValidationError
 
 from app.config import Settings
@@ -20,10 +21,12 @@ SERVICE = web.AppKey("service", BackendService)
 TOKEN = web.AppKey("token", str)
 ACTOR = web.RequestKey("actor", int)
 PAGE_SIZE = 12
+JSON_LIMIT = 96 * 1024
 
 
 class NewBusiness(Contract):
     name: str = Field(min_length=1, max_length=150)
+    timezone: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class SourceInput(Contract):
@@ -49,6 +52,46 @@ class NewJob(Contract):
     request_id: str = Field(min_length=1, max_length=100)
 
 
+class IdentityInput(Contract):
+    request_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class PauseInput(Contract):
+    paused: bool = Field(strict=True)
+
+
+class AutomationInput(Contract):
+    enabled: bool = Field(strict=True)
+    interval_hours: int = Field(default=24, strict=True, ge=1, le=720)
+    request: str = Field(default="Подготовь один полезный пост о бизнесе", min_length=1, max_length=4000)
+    first_run_at: AwareDatetime | None = None
+
+
+class RevisionFeedback(RevisionInput):
+    feedback: str = Field(min_length=1, max_length=4000)
+    request_id: str = Field(min_length=1, max_length=100)
+
+
+class ChatInput(Contract):
+    text: str = Field(min_length=1, max_length=4000)
+    request_id: str = Field(min_length=1, max_length=100)
+    post_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+async def json_body(request):
+    """JSON stays small even though the upload route accepts larger PDF bodies."""
+    if request.content_type != "application/json":
+        raise InvalidInput("Ожидается JSON-запрос.")
+    if request.content_length is not None and request.content_length > JSON_LIMIT:
+        raise web.HTTPRequestEntityTooLarge(max_size=JSON_LIMIT, actual_size=request.content_length)
+    content = bytearray()
+    async for chunk in request.content.iter_chunked(16 * 1024):
+        content.extend(chunk)
+        if len(content) > JSON_LIMIT:
+            raise web.HTTPRequestEntityTooLarge(max_size=JSON_LIMIT, actual_size=len(content))
+    return json.loads(content)
+
+
 @web.middleware
 async def guard(request, handler):
     try:
@@ -70,6 +113,9 @@ async def guard(request, handler):
             Forbidden: 403, NotFound: 404, Conflict: 409, ProviderUnavailable: 502,
         }.get(type(exc), 400)
         response = web.json_response({"error": str(exc)}, status=status)
+    except web.HTTPException as exc:
+        message = "Файл или запрос превышает допустимый размер." if exc.status == 413 else "Запрос недоступен."
+        response = web.json_response({"error": message}, status=exc.status)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers.setdefault("Cache-Control", "no-store")
@@ -96,7 +142,8 @@ def context(request) -> tuple[BackendService, int]:
 def create_app(service: BackendService | None = None, *, token: str = "") -> web.Application:
     if service is not None and not token:
         raise ValueError("A bot token is required for the live Mini App")
-    app = web.Application(middlewares=[guard], client_max_size=96 * 1024)
+    upload_limit = service.settings.max_upload_bytes if service else JSON_LIMIT
+    app = web.Application(middlewares=[guard], client_max_size=upload_limit + JSON_LIMIT)
     if service is not None:
         app[SERVICE] = service
         app[TOKEN] = token
@@ -109,6 +156,12 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
                 '<script src="https://telegram.org/js/telegram-web-app.js" defer></script>',
             )
         return web.Response(text=html, content_type="text/html")
+
+    async def health(request):
+        return web.json_response({
+            "status": "ok", "mode": "live" if SERVICE in request.app else "preview",
+            "runtime_mode": request.app[SERVICE].settings.mode if SERVICE in request.app else "preview",
+        })
 
     async def static_file(request):
         name = request.match_info["name"]
@@ -123,7 +176,9 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         selected_id = request.query.get("business")
         selected = svc.get_business(actor, selected_id) if selected_id else (businesses[-1] if businesses else None)
         if selected is None:
-            return web.json_response({"businesses": [], "business": None, "posts": [], "counts": {}})
+            return web.json_response({"businesses": [], "business": None, "posts": [], "counts": {},
+                                      "sources": [], "jobs": [], "usage": svc.ai_usage(actor),
+                                      "runtime_mode": svc.settings.mode})
         posts = svc.list_posts(actor, selected.id)
         counts = Counter(p.status for p in posts)
         sources = svc.list_sources(actor, selected.id)
@@ -136,6 +191,9 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             "posts": [p.model_dump(mode="json") for p in posts[-6:][::-1]],
             "counts": {**counts, "total": len(posts)},
             "upcoming": upcoming.model_dump(mode="json") if upcoming else None,
+            "jobs": [j.model_dump(mode="json") for j in svc.list_jobs(actor, selected.id)[-6:][::-1]],
+            "usage": svc.ai_usage(actor),
+            "runtime_mode": svc.settings.mode,
         })
 
     async def posts(request):
@@ -154,44 +212,133 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
 
     async def create_business(request):
         svc, actor = context(request)
-        body = NewBusiness.model_validate(await request.json())
-        return web.json_response(business_view(svc.create_business(actor, body.name)), status=201)
+        body = NewBusiness.model_validate(await json_body(request))
+        return web.json_response(business_view(svc.create_business(actor, body.name, body.timezone)), status=201)
 
     async def add_source(request):
         svc, actor = context(request)
         business_id = request.match_info["id"]
-        body = SourceInput.model_validate(await request.json())
+        body = SourceInput.model_validate(await json_body(request))
         if body.kind == "text":
             return show(svc.add_text_source(actor, business_id, body.value))
         if body.kind == "url":
             return show(svc.add_url_source(actor, business_id, body.value))
         raise InvalidInput("Выберите описание или ссылку.")
 
+    async def upload_pdf(request):
+        svc, actor = context(request)
+        business_id = request.match_info["id"]
+        svc.get_business(actor, business_id)
+        maximum = svc.settings.max_upload_bytes
+        if request.content_length is not None and request.content_length > maximum + JSON_LIMIT:
+            raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=request.content_length)
+        if request.content_type != "multipart/form-data":
+            raise InvalidInput("Загрузите PDF как файл.")
+        reader = await request.multipart()
+        part = await reader.next()
+        if not isinstance(part, BodyPartReader) or part.name != "file" or not part.filename:
+            raise InvalidInput("Выберите один PDF-файл.")
+        if part.headers.get("Content-Encoding") or part.headers.get("Content-Transfer-Encoding"):
+            raise InvalidInput("Сжатые или перекодированные загрузки не поддерживаются.")
+        filename = part.filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if not filename.lower().endswith(".pdf"):
+            raise InvalidInput("Выберите PDF-файл.")
+        content = bytearray()
+        while chunk := await part.read_chunk(64 * 1024):
+            content.extend(chunk)
+            if len(content) > maximum:
+                raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=len(content))
+        if await reader.next() is not None:
+            raise InvalidInput("Загружайте по одному PDF-файлу.")
+        return show(svc.add_pdf_source(actor, business_id, filename, bytes(content)))
+
     async def profile(request):
         svc, actor = context(request)
         business_id = request.match_info["id"]
         if request.match_info["action"] == "analyze":
-            business = await svc.analyze_business(actor, business_id)
+            body = IdentityInput.model_validate(await json_body(request))
+            business = await svc.analyze_business(
+                actor, business_id, request_id=f"miniapp:{body.request_id}" if body.request_id else None,
+            )
         else:
-            body = RevisionInput.model_validate(await request.json())
+            body = RevisionInput.model_validate(await json_body(request))
             business = svc.confirm_profile(actor, business_id, body.revision)
         return web.json_response(business_view(business))
 
     async def connect(request):
         svc, actor = context(request)
-        body = ChannelInput.model_validate(await request.json())
+        body = ChannelInput.model_validate(await json_body(request))
         business = await svc.connect_channel(actor, request.match_info["id"], body.value)
         return web.json_response(business_view(business))
 
     async def prepare(request):
         svc, actor = context(request)
-        body = NewJob.model_validate(await request.json())
+        body = NewJob.model_validate(await json_body(request))
         return show(svc.request_preparation(actor, request.match_info["id"], body.request,
                                             f"miniapp:{body.request_id}"))
 
     async def job(request):
         svc, actor = context(request)
         return show(svc.get_job(actor, request.match_info["id"]))
+
+    async def jobs(request):
+        svc, actor = context(request)
+        entries = svc.list_jobs(actor, request.match_info["id"])[::-1]
+        page = int(request.query.get("page", "0"))
+        if not 0 <= page <= 100_000:
+            raise InvalidInput("Откройте список заново.")
+        start = page * PAGE_SIZE
+        return web.json_response({"items": [j.model_dump(mode="json") for j in entries[start:start + PAGE_SIZE]],
+                                  "more": len(entries) > start + PAGE_SIZE})
+
+    async def cancel_job(request):
+        svc, actor = context(request)
+        return show(svc.cancel_job(actor, request.match_info["id"]))
+
+    async def control(request):
+        svc, actor = context(request)
+        business_id = request.match_info["id"]
+        business = svc.get_business(actor, business_id)
+        return web.json_response({
+            "business": business_view(business),
+            "jobs": [j.model_dump(mode="json") for j in svc.list_jobs(actor, business_id)[-20:][::-1]],
+            "operations": svc.list_ai_operations(actor, business_id),
+            "usage": svc.ai_usage(actor),
+            "failed_notifications": svc.failed_notifications(actor, business_id),
+        })
+
+    async def pause(request):
+        svc, actor = context(request)
+        body = PauseInput.model_validate(await json_body(request))
+        return web.json_response(business_view(
+            svc.set_publications_paused(actor, request.match_info["id"], body.paused),
+        ))
+
+    async def automation(request):
+        svc, actor = context(request)
+        body = AutomationInput.model_validate(await json_body(request))
+        return web.json_response(business_view(svc.configure_automation(
+            actor, request.match_info["id"], body.enabled, body.request, body.interval_hours, body.first_run_at,
+        )))
+
+    async def history(request):
+        svc, actor = context(request)
+        return web.json_response({"items": svc.conversation_history(actor, request.match_info["id"])})
+
+    async def chat(request):
+        svc, actor = context(request)
+        business_id = request.match_info["id"]
+        body = ChatInput.model_validate(await json_body(request))
+        request_id = f"miniapp:{body.request_id}"
+        intent = await svc.interpret_request(actor, business_id, body.text, body.post_id, request_id=request_id)
+        result = {"intent": intent.model_dump(mode="json")}
+        if intent.action == "prepare":
+            result["job"] = svc.request_preparation(actor, business_id, intent.request, request_id).model_dump(mode="json")
+        elif intent.action == "report":
+            end = svc.now()
+            result["report"] = svc.build_report(actor, business_id, end - timedelta(days=7), end)
+        # Revising requires an explicit post/revision confirmation in the UI. Model output never approves.
+        return web.json_response(result)
 
     async def post(request):
         svc, actor = context(request)
@@ -200,7 +347,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     async def change_post(request):
         svc, actor = context(request)
         post_id, action = request.match_info["id"], request.match_info["action"]
-        payload = await request.json()
+        payload = await json_body(request)
         if action == "edit":
             edit = PostEdit.model_validate(payload)
             return show(svc.edit_post(actor, post_id, edit.revision, text=edit.text,
@@ -208,6 +355,18 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         body = RevisionInput.model_validate(payload)
         change = svc.approve_post if action == "approve" else svc.reject_post
         return show(change(actor, post_id, body.revision))
+
+    async def revise_post(request):
+        svc, actor = context(request)
+        body = RevisionFeedback.model_validate(await json_body(request))
+        revise = svc.revise_text if request.match_info["kind"] == "text" else svc.revise_image
+        return show(await revise(actor, request.match_info["id"], body.revision, body.feedback,
+                                 request_id=f"miniapp:{body.request_id}"))
+
+    async def refresh_context(request):
+        svc, actor = context(request)
+        body = RevisionInput.model_validate(await json_body(request))
+        return show(svc.refresh_post_context(actor, request.match_info["id"], body.revision))
 
     async def asset(request):
         svc, actor = context(request)
@@ -237,30 +396,41 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
 
     app.add_routes([
         web.get("/mini/", index),
+        web.get("/mini/health", health),
         web.get(r"/mini/{name:styles\.css|overview\.css|app\.js|inter-variable\.woff2|inter-OFL\.txt}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
         web.post("/mini/api/business", create_business),
         web.post("/mini/api/business/{id}/source", add_source),
+        web.post("/mini/api/business/{id}/pdf", upload_pdf),
         web.post("/mini/api/business/{id}/profile/{action:analyze|confirm}", profile),
         web.post("/mini/api/business/{id}/channel", connect),
         web.post("/mini/api/business/{id}/prepare", prepare),
+        web.get("/mini/api/business/{id}/control", control),
+        web.post("/mini/api/business/{id}/pause", pause),
+        web.post("/mini/api/business/{id}/automation", automation),
+        web.get("/mini/api/business/{id}/jobs", jobs),
+        web.get("/mini/api/business/{id}/history", history),
+        web.post("/mini/api/business/{id}/chat", chat),
         web.get("/mini/api/job/{id}", job),
+        web.post("/mini/api/job/{id}/cancel", cancel_job),
         web.get("/mini/api/post/{id}", post),
         web.post("/mini/api/post/{id}/{action:edit|approve|reject}", change_post),
+        web.post("/mini/api/post/{id}/revise-{kind:text|image}", revise_post),
+        web.post("/mini/api/post/{id}/refresh-context", refresh_context),
         web.get("/mini/api/asset/{id}", asset),
         web.get("/mini/api/business/{id}/report", report),
     ])
     return app
 
 
-async def serve(app: web.Application, port: int, stop: asyncio.Event) -> None:
+async def serve(app: web.Application, port: int, stop: asyncio.Event, *, host: str = "127.0.0.1") -> None:
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     try:
-        site = web.TCPSite(runner, "127.0.0.1", port)
+        site = web.TCPSite(runner, host, port)
         await site.start()
-        log.info("Mini App: http://127.0.0.1:%s/mini/", port)
+        log.info("Mini App: http://%s:%s/mini/", host, port)
         await stop.wait()
     finally:
         await runner.cleanup()
@@ -268,4 +438,4 @@ async def serve(app: web.Application, port: int, stop: asyncio.Event) -> None:
 
 async def run_live(service: BackendService, settings: Settings, stop: asyncio.Event) -> None:
     token = settings.telegram_bot_token.get_secret_value()
-    await serve(create_app(service, token=token), settings.mini_app_port, stop)
+    await serve(create_app(service, token=token), settings.mini_app_port, stop, host=settings.mini_app_host)

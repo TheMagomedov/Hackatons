@@ -1,0 +1,11 @@
+{
+  "name": "tirazh-ui-checks",
+  "private": true,
+  "scripts": {
+    "test:ui": "node tests/ui/smoke.cjs",
+    "test:ui:backend": "node tests/ui/backend.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

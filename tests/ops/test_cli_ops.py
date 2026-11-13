@@ -48,6 +48,7 @@ def database(directory: Path, *, legacy=False):
     business = repo.create_business(77, "private-business-name-must-not-be-exposed", "UTC", NOW)
     if legacy:
         with closing(sqlite3.connect(directory / "backend.sqlite3")) as conn:
+            conn.execute("DROP TABLE conversation_turns")
             conn.execute("DROP TABLE ai_operations")
             conn.execute("DROP TABLE inbound_events")
             conn.execute("DROP TABLE runtime_binding")

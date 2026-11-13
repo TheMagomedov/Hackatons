@@ -521,6 +521,10 @@ def build_router(service: BackendService) -> Router:
             await business_menu(message, actor, business)
         elif action == "input" and target in {"name", "notes", "url", "pdf", "channel", "request", "auto"}:
             business_id = "" if target == "name" else service.get_business(actor, version).id
+            if target == "request":
+                # A reply to the interpreter's clarification must stay in the
+                # company of this button, even when it came from an older menu.
+                selected = business_id
             await ask(message, Prompt(target, business_id))
         elif action == "analyze":
             await reply(message, "Изучаю материалы…")
@@ -745,15 +749,11 @@ def build_router(service: BackendService) -> Router:
             elif kind == "pdf":
                 raise InvalidInput(INPUTS["pdf"])
             elif kind == "request":
-                intent = (
-                    None
-                    if context
-                    else await service.interpret_request(
-                        actor, business.id, text, request_id=event_key(event_update, message.bot.id)
-                    )
+                intent = await service.interpret_request(
+                    actor, business.id, text, request_id=event_key(event_update, message.bot.id)
                 )
-                if intent is None or intent.action == "prepare":
-                    request = (intent.request or text) if intent else text
+                if intent.action == "prepare":
+                    request = intent.request or text
                     job = service.request_preparation(
                         actor, business.id, request, event_key(event_update, message.bot.id)
                     )
@@ -765,6 +765,8 @@ def build_router(service: BackendService) -> Router:
                         service.build_report(actor, business.id, now - timedelta(days=7), now),
                         menu(),
                     )
+                elif intent.action == "answer":
+                    await reply(message, intent.answer, menu())
                 else:
                     question = "\n".join(intent.questions) or "Уточните запрос или выберите конкретный пост."
                     await reply(message, question, menu())

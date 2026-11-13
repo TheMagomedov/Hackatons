@@ -64,10 +64,11 @@ class Business(Contract):
 
 
 class TaskIntent(Contract):
-    action: Literal["prepare", "revise_text", "revise_image", "report", "clarify"]
-    request: str = ""
+    action: Literal["prepare", "revise_text", "revise_image", "report", "clarify", "answer"]
+    request: str = Field(default="", max_length=4000)
     post_id: str | None = None
-    questions: list[str] = Field(default_factory=list)
+    questions: list[str] = Field(default_factory=list, max_length=5)
+    answer: str = Field(default="", max_length=4000)
 
 
 class PlanItem(Contract):

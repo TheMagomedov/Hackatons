@@ -1,0 +1,22 @@
+# docker compose -f compose.yaml -f compose.https.yaml up --build -d
+# Set MINI_APP_DOMAIN and MINI_APP_URL=https://that-domain/mini/ in .env.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      MINI_APP_DOMAIN: ${MINI_APP_DOMAIN:?Set MINI_APP_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      marketer:
+        condition: service_healthy
+
+volumes:
+  caddy-data:
+  caddy-config:

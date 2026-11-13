@@ -94,6 +94,7 @@ class HardeningTests(unittest.TestCase):
         # Runtime-binding is v2's sole schema addition. Remove it from a populated
         # compatible fixture to recreate the exact v1 table shape and contents.
         with closing(sqlite3.connect(self.path)) as conn:
+            conn.execute("DROP TABLE conversation_turns")
             conn.execute("DROP TABLE ai_operations")
             conn.execute("DROP TABLE inbound_events")
             conn.execute("DROP TABLE runtime_binding")
@@ -105,7 +106,7 @@ class HardeningTests(unittest.TestCase):
             names = [
                 row[0]
                 for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('runtime_binding','ai_operations','inbound_events') ORDER BY name"
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('runtime_binding','ai_operations','inbound_events','conversation_turns') ORDER BY name"
                 )
             ]
             return {name: conn.execute(f'SELECT * FROM "{name}" ORDER BY rowid').fetchall() for name in names}

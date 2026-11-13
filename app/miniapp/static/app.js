@@ -15,7 +15,7 @@ const labels = {
   rejected: "Отклонён", delivery_unknown: "Проверьте доставку",
 };
 const editable = new Set(["review", "approved", "failed", "rejected"]);
-const views = new Set(["overview", "content", "reports", "business"]);
+const views = new Set(["overview", "content", "work", "reports", "business"]);
 const icon = (name) => '<svg class="icon" aria-hidden="true"><use href="#i-' + name + '"></use></svg>';
 const safe = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -47,6 +47,10 @@ const demoWorkspaces = [{
       revision: 1, created_at: sampleDate(-6, 0), published_at: sampleDate(-5, 0), scheduled_at: sampleDate(-5, 0)},
   ],
 }];
+for (const entry of demoWorkspaces) for (const post of entry.posts) Object.assign(post, {
+  business_id: entry.business.id, channel_id: entry.business.channel_id, profile_version: 1,
+  used_source_ids: ["note"], warnings: [],
+});
 const demoJobs = new Map();
 let state = {businesses: [], business: null, sources: [], posts: [], counts: {}};
 let view = views.has(location.hash.slice(1)) ? location.hash.slice(1) : "overview";
@@ -54,6 +58,10 @@ let businessId = "";
 let statusFilter = "";
 let content = {items: [], more: false, page: 0};
 let report = null;
+let controls = {jobs: [], operations: [], usage: {}};
+let postRequest = 0;
+let conversation = [];
+const demoConversations = new Map();
 let pageRequest = 0;
 let stateRequest = 0;
 let toastTimer;
@@ -142,6 +150,24 @@ function demoApi(url, method, body) {
   }
   if (parts[0] === "business") {
     const {business, sources, posts} = selected;
+    if (parts[2] === "history") return {items: demoConversations.get(business.id) || []};
+    if (parts[2] === "chat") {
+      const history = demoConversations.get(business.id) || [];
+      const answer = "Это демонстрационный ответ. В рабочем режиме AI использует профиль «" + business.name
+        + "», факты из материалов и историю этой компании. Для подготовки тестового черновика нажмите «Новое задание».";
+      history.push({user_text: body.text, assistant_text: answer, created_at: new Date().toISOString()});
+      demoConversations.set(business.id, history);
+      return {intent: {action: "answer", answer}};
+    }
+    if (parts[2] === "control") return {business, jobs: [...demoJobs.values()].filter(j => j.business_id === business.id),
+      operations: [], usage: {used_today: [...demoJobs.values()].length, daily_limit: 100, running: 0}, failed_notifications: []};
+    if (parts[2] === "jobs") return {items: [...demoJobs.values()].filter(j => j.business_id === business.id)};
+    if (parts[2] === "pause") { business.publications_paused = body.paused; return business; }
+    if (parts[2] === "automation") {
+      Object.assign(business, {automation_enabled: body.enabled, interval_hours: body.interval_hours,
+        automation_request: body.request, next_generation_at: body.enabled ? body.first_run_at || sampleDate(1, 0) : null});
+      return business;
+    }
     if (parts[2] === "posts") {
       const filtered = params.get("status") ? posts.filter((p) => p.status === params.get("status")) : posts;
       const start = Number(params.get("page") || 0) * 12;
@@ -178,13 +204,21 @@ function demoApi(url, method, body) {
     }
     if (parts[2] === "prepare") {
       const id = crypto.randomUUID();
-      posts.unshift({id, text: body.request, status: "review", art: "coffee", revision: 1,
-        created_at: new Date().toISOString()});
-      demoJobs.set(id, {id, status: "done"});
+      if (!business.profile_confirmed || !business.channel_id) throw new Error("Сначала подтвердите профиль и подключите канал.");
+      posts.unshift({id, business_id: business.id, channel_id: business.channel_id, profile_version: business.profile_version,
+        used_source_ids: sources.map(s => s.id), warnings: [], text: "Демонстрационный черновик\n" + body.request,
+        status: "review", art: "coffee", revision: 1, created_at: new Date().toISOString()});
+      demoJobs.set(id, {id, business_id: business.id, request: body.request, status: "done", stage: "done",
+        processed: 1, total: 1, created_at: new Date().toISOString()});
       return demoJobs.get(id);
     }
   }
-  if (parts[0] === "job") return demoJobs.get(parts[1]);
+  if (parts[0] === "job") {
+    const job = demoJobs.get(parts[1]);
+    if (!job) throw new Error("Задание не найдено.");
+    if (parts[2] === "cancel") { job.status = "cancelled"; job.stage = "cancelled"; }
+    return job;
+  }
   if (parts[0] === "post") {
     const post = demoWorkspaces.flatMap((w) => w.posts).find((p) => p.id === parts[1]);
     if (!post) throw new Error("Пост не найден.");
@@ -195,6 +229,15 @@ function demoApi(url, method, body) {
           throw new Error("Выберите время в будущем.");
         }
         Object.assign(post, body, {revision: post.revision + 1, status: "review"});
+      }
+      if (parts[2] === "revise-text" || parts[2] === "revise-image") {
+        if (parts[2] === "revise-text") post.text += "\nДемо-правка: " + body.feedback;
+        else post.art = post.art === "coffee" ? "pastry" : "coffee";
+        post.revision++; post.status = "review";
+      }
+      if (parts[2] === "refresh-context") {
+        post.profile_version = demoWorkspaces.find(w => w.business.id === post.business_id).business.profile_version;
+        post.revision++; post.status = "review";
       }
       if (parts[2] === "approve") {
         if (!post.scheduled_at) throw new Error("Сначала укажите время.");
@@ -255,8 +298,13 @@ async function loadImages(container) {
         img.src = url;
         img.alt = "Изображение к посту";
         node.replaceChildren(img);
+        await img.decode().catch(() => {});
+        if (node.closest("#dialog-body") && img.naturalWidth > 0) {
+          dialogBody.querySelector("[data-requires-image]")?.removeAttribute("disabled");
+        }
       }
-    } catch { /* Keep the placeholder if the image is unavailable. */ }
+      if (!url && node.isConnected) node.innerHTML = '<span class="image-error">Не удалось загрузить изображение. Откройте пост заново перед согласованием.</span>';
+    } catch { if (node.isConnected) node.innerHTML = '<span class="image-error">Изображение недоступно. Обновите предпросмотр.</span>'; }
   }));
 }
 function postCards(posts) {
@@ -328,49 +376,109 @@ function switchSlide(control, action) {
   });
   selectionFeedback();
 }
+function setupProgress() {
+  const b = state.business;
+  const steps = [
+    [state.sources.length > 0, "Материалы", "add-source", "Добавьте описание, сайт или PDF"],
+    [Boolean(b.profile_confirmed), "Профиль", b.profile ? "confirm-profile" : "analyze", "Проверьте знания AI о компании"],
+    [Boolean(b.channel_id), "Канал", "channel", "Подключите тестовый Telegram-канал"],
+  ];
+  const done = steps.filter(s => s[0]).length;
+  return '<section class="setup-panel panel"><div class="section-top"><div><p class="eyebrow">НАСТРОЙКА КОМПАНИИ</p>'
+    + '<h2>' + (done === 3 ? "Всё готово к работе" : "Ещё " + (3 - done) + " шага до первого поста")
+    + '</h2></div><span class="setup-count">' + done + '/3</span></div><div class="setup-steps">'
+    + steps.map(([complete, title, action, detail], i) => '<button class="setup-step ' + (complete ? "complete" : "")
+      + '" data-action="' + action + '"><span class="setup-number">' + (complete ? icon("check") : i + 1)
+      + '</span><span><strong>' + title + '</strong><small>' + (complete ? "Готово" : detail) + '</small></span>'
+      + icon("next") + '</button>').join("") + '</div></section>';
+}
 function overview() {
+  const b = state.business;
   const upcoming = state.upcoming;
-  const posts = state.posts;
-  return '<div class="press"><div class="press-opening">'
-    + pressArt("draft", "press-backdrop")
-    + '<section class="press-hero" aria-labelledby="press-title"><div class="press-intro">'
-    + '<p class="press-kicker">' + (demo ? "ДЕМО / " : "") + 'СТУДИЯ ПУБЛИКАЦИЙ</p>'
-    + '<h1 id="press-title">От идеи до поста</h1>'
-    + '<p class="press-lede">Готовьте тексты, согласовывайте черновики и планируйте публикации для своего Telegram-канала.</p>'
-    + '<div class="press-actions">' + button("Создать пост", "new-post", "outline")
-    + '<button class="press-jump" type="button" data-action="show-workflow">' + icon("play") + 'Как это работает</button></div></div>'
-    + '<div class="press-note glass-card"><span class="press-badge">' + icon("calendar") + '</span><div>'
-    + '<p class="press-kicker">СЛЕДУЮЩИЙ ПОСТ</p><strong>'
-    + (upcoming ? safe(upcoming.text.split("\n")[0].slice(0, 85)) : 'Пока без даты') + '</strong><p>'
-    + (upcoming ? safe(formatDate(upcoming.scheduled_at)) : 'Согласуйте черновик, чтобы поставить его в расписание.')
-    + '</p></div></div>' + pressCarousel(true) + '</section>'
-    + '<section class="press-section" aria-labelledby="press-workflow">' + pressHeading("press-workflow", "От черновика к публикации")
-    + '<div class="press-features">' + editorialSteps.slice(0, 2).map((step) =>
-      '<article class="glass-card press-feature">' + stepContent(step) + '</article>').join("") + '</div></section></div>'
-    + '<section class="press-section press-posts" aria-labelledby="press-posts">' + pressHeading("press-posts", "Последние посты")
-    + (posts.length ? '<div class="press-grid">' + posts.map((post) => {
-      const art = post.status === "published" ? "send" : post.status === "approved" ? "calendar" : "draft";
-      const [title, ...body] = post.text.split("\n");
-      return '<button class="press-post glass-card" type="button" data-action="open-post" data-id="' + safe(post.id) + '">'
-        + pressArt(art) + '<div class="press-post-copy">' + statusLabel(post.status)
-        + '<h3>' + safe(title.slice(0, 85)) + '</h3><p>' + safe(body.join(" ").slice(0, 110)) + '</p>'
-        + '<span class="press-post-end"><time class="date">' + safe(formatDate(post.scheduled_at || post.created_at))
-        + '</time><span class="press-arrow">' + icon("next") + '</span></span></div></button>';
-    }).join("") + '</div>' : '<div class="empty">Первый черновик появится здесь после подготовки.</div>')
-    + '<button class="button outline press-all" type="button" data-view="content">Все посты ' + icon("arrow") + '</button></section>'
-    + '<section class="press-section" aria-labelledby="press-status">' + pressHeading("press-status", "Статус редакции")
-    + '<div class="press-metrics">' + editorialStatuses.map(([status, label, glyph, detail]) =>
-      '<button class="press-metric glass-card" type="button" data-action="filter" data-status="' + status + '">'
-      + '<span class="press-badge">' + icon(glyph) + '</span><span><strong>' + (state.counts[status] || 0)
-      + ' <span>' + label + '</span></strong><span>' + detail + '</span></span></button>').join("") + '</div></section>'
-    + '<section class="press-section" aria-labelledby="press-guide">' + pressHeading("press-guide", "Рабочий процесс")
-    + pressCarousel(false) + '</section>'
-    + '<footer class="press-footer"><div><strong>Тираж</strong><p>Студия публикаций в Telegram</p></div>'
-    + '<button class="text-button" type="button" data-view="reports">Отчёты ' + icon("arrow") + '</button>'
-    + '<button class="text-button" type="button" data-view="business">Настройки бизнеса ' + icon("arrow") + '</button></footer></div>';
+  const ready = b.profile_confirmed && b.channel_id;
+  return '<div class="workspace-home"><section class="workspace-hero"><div><p class="press-kicker">ВАШ AI-МАРКЕТОЛОГ</p>'
+    + '<h1>Идеи — в дело.</h1><p class="hero-description">' + safe(b.name) + ' · '
+    + (ready ? "Всё для контента в одном пространстве." : "Давайте познакомим AI с вашим бизнесом.") + '</p>'
+    + '<div class="press-actions">' + button("Создать пост", "new-post", "primary", "plus")
+    + button("Автоподготовка", "automation", "secondary", "spark") + '</div>'
+    + '<p class="approval-note">' + icon("check") + 'Каждый пост выходит только после вашего согласования.</p></div>'
+    + pressArt("draft", "workspace-illustration") + '</section>'
+    + (!ready ? setupProgress() : '')
+    + '<div class="dashboard-metrics">' + editorialStatuses.map(([status, label, glyph]) =>
+      '<button class="metric-card panel" data-action="filter" data-status="' + status + '"><span class="metric-heading">'
+      + icon(glyph) + label + '</span><strong>' + (state.counts[status] || 0) + '</strong>'
+      + '<span class="metric-link">Открыть ' + icon("next") + '</span></button>').join("") + '</div>'
+    + '<section class="next-publication panel"><span class="press-badge">' + icon(b.publications_paused ? "clock" : "calendar")
+    + '</span><div><p class="eyebrow">' + (b.publications_paused ? "ПУБЛИКАЦИИ НА ПАУЗЕ" : "СЛЕДУЮЩАЯ ПУБЛИКАЦИЯ")
+    + '</p><strong>' + safe(upcoming?.text.split("\n")[0] || "В расписании пока пусто") + '</strong><p>'
+    + (upcoming ? safe(formatDate(upcoming.scheduled_at)) + ' · ' + safe(b.timezone)
+      : 'Выберите время и согласуйте готовый черновик.') + '</p></div>'
+    + (upcoming ? button("Открыть", "open-post", "secondary", "", 'data-id="' + safe(upcoming.id) + '"')
+      : '<button class="text-button" data-view="content">К постам ' + icon("arrow") + '</button>') + '</section>'
+    + '<section class="recent-section"><div class="section-top"><div><p class="eyebrow">РЕДАКЦИЯ</p><h2>Последние посты</h2></div>'
+    + '<button class="text-button" data-view="content">Все посты ' + icon("arrow") + '</button></div>'
+    + (state.posts.length ? '<div class="editorial-grid">' + state.posts.slice(0, 3).map(post =>
+      '<button class="editorial-card panel" data-action="open-post" data-id="' + safe(post.id) + '">'
+      + postArt(post) + '<div class="editorial-copy">' + statusLabel(post.status) + '<h3>'
+      + safe(post.text.split("\n")[0].slice(0, 95)) + '</h3><p>'
+      + safe(formatDate(post.scheduled_at || post.created_at)) + '</p></div></button>').join("") + '</div>'
+      : '<div class="empty">Здесь появятся тексты и изображения, подготовленные по вашим материалам.</div>') + '</section>'
+    + '<section class="assistant-strip panel"><span class="press-badge">' + icon("telegram") + '</span><div>'
+    + '<strong>Можно просто написать в Telegram</strong><p>Поставьте задачу своими словами. AI учитывает профиль компании и историю диалога.</p>'
+    + '</div><button class="text-button" data-view="work">Задачи ' + icon("arrow") + '</button></section></div>';
+}
+const jobLabels = {pending: "В очереди", running: "Готовится", done: "Готово", failed: "Ошибка", cancelled: "Отменено"};
+const stageLabels = {queued: "Ожидает запуска", plan: "Контент-план", text: "Текст публикации", image: "Создание изображения",
+  saving: "Сохранение", done: "Материалы готовы", failed: "Нужна проверка", cancelled: "Отменено"};
+function conversationView() {
+  return conversation.length ? conversation.map(turn => '<div class="chat-message user"><span class="chat-speaker">Вы</span>'
+    + safe(turn.user_text) + '</div><div class="chat-message assistant"><span class="chat-speaker">Тираж AI</span>'
+    + safe(turn.assistant_text || 'Поручение принято.') + '</div>').join('')
+    : '<p class="chat-empty">Спросите о компании или поручите подготовить пост. Уточняйте задачу в следующих сообщениях — AI сохранит контекст.</p>';
+}
+function workView() {
+  const b = controls.business || state.business;
+  const usage = controls.usage || {};
+  const jobs = controls.jobs || [];
+  return headline("Управление", "Задачи и расписание", "Регулярная подготовка, очередь и история работы AI.",
+    button("Обновить", "refresh", "secondary", "refresh"))
+    + '<section class="chat-panel panel"><h2>Диалог с маркетологом</h2><p>Пишите обычным языком. История хранится отдельно для «' + safe(state.business.name) + '».</p>'
+    + '<div class="conversation" aria-live="polite">' + conversationView() + '</div>'
+    + '<form class="chat-form" data-chat><textarea name="text" maxlength="4000" required aria-label="Сообщение AI-маркетологу" placeholder="Что мы уже подготовили для компании?"></textarea>'
+    + '<button type="submit" class="button primary" aria-label="Отправить сообщение">' + icon("arrow") + '</button></form>'
+    + '<p class="form-error" id="chat-error" role="alert"></p></section>'
+    + '<div class="control-grid"><section class="panel business-panel"><p class="eyebrow">АВТОНОМНАЯ РАБОТА</p><h2>Автоподготовка</h2><p>'
+    + (b.automation_enabled ? 'Каждые ' + b.interval_hours + ' ч · следующий запуск ' + safe(formatDate(b.next_generation_at))
+      : 'AI может сам готовить материалы по расписанию. Публикация остаётся за вами.') + '</p>'
+    + '<span class="status ' + (b.automation_enabled ? 'published' : 'rejected') + '">'
+    + (b.automation_enabled ? 'Включена' : 'Выключена') + '</span><div>'
+    + button("Настроить", "automation", "secondary", "clock") + '</div></section>'
+    + '<section class="panel business-panel"><p class="eyebrow">КОНТРОЛЬ ОТПРАВКИ</p><h2>'
+    + (b.publications_paused ? 'Публикации на паузе' : 'Публикации разрешены') + '</h2><p>'
+    + (b.publications_paused ? 'Согласованные материалы не отправляются. Автоподготовка управляется отдельно.'
+      : 'В канал отправляются только согласованные версии в назначенное время.') + '</p>'
+    + button(b.publications_paused ? "Возобновить" : "Поставить на паузу", "toggle-pause", "secondary", "clock") + '</section></div>'
+    + '<section class="usage-strip panel"><span>' + icon("spark") + '<strong>' + (usage.used_today || 0) + ' / '
+    + (usage.daily_limit || '—') + '</strong> AI-операций за сегодня</span><small>Общий лимит оператора · сутки UTC. Это число операций, не сумма расходов.</small></section>'
+    + '<section class="recent-section"><div class="section-top"><h2>Очередь подготовки</h2>'
+    + button("Новое задание", "new-post", "secondary", "plus") + '</div>'
+    + (jobs.length ? '<div class="task-list">' + jobs.map(job => '<article class="task-card panel"><div class="task-main"><span class="status '
+      + (job.status === 'done' ? 'published' : job.status === 'failed' ? 'failed' : 'review') + '">' + safe(jobLabels[job.status] || job.status)
+      + '</span><h3>' + safe(job.request) + '</h3><p>' + safe(stageLabels[job.stage] || job.stage || '')
+      + (job.total ? ' · ' + job.processed + '/' + job.total : '') + ' · ' + safe(formatDate(job.created_at)) + '</p>'
+      + (job.error ? '<p class="form-error">' + safe(job.error) + '</p>' : '') + '</div>'
+      + (job.status === 'pending' ? button("Отменить", "cancel-job", "secondary", "close", 'data-id="' + safe(job.id) + '"') : '')
+      + '</article>').join('') + '</div>' : '<div class="empty">Очередь пуста. Создайте задание или включите автоподготовку.</div>') + '</section>'
+    + '<details class="panel report-detail activity-panel"><summary>История операций AI</summary>'
+    + ((controls.operations || []).length ? '<ol class="activity-list">' + controls.operations.map(op =>
+      '<li><strong>' + safe(({interpret: 'Разбор запроса', profile: 'Анализ компании', plan: 'Контент-план', text: 'Подготовка текста', image: 'Подготовка изображения', revise_text: 'Правка текста', revise_image: 'Правка изображения'})[op.kind] || op.kind)
+      + '</strong><span>' + safe(jobLabels[op.status] || op.status) + ' · ' + safe(formatDate(op.created_at)) + '</span></li>').join('') + '</ol>'
+      : '<p class="dialog-desc">Операции этой компании появятся после обращения к AI.</p>') + '</details>'
+    + ((controls.failed_notifications || []).length ? '<div class="notice">Есть недоставленные уведомления: '
+      + controls.failed_notifications.length + '. Откройте раздел уведомлений в Telegram-боте для повтора.</div>' : '');
 }
 function contentView() {
-  const filters = [["", "Все"], ["review", "На согласовании"], ["approved", "Запланированы"], ["published", "Опубликованы"]];
+  const filters = [["", "Все"], ["review", "На согласовании"], ["approved", "Запланированы"], ["published", "Опубликованы"], ["failed", "Ошибки"], ["rejected", "Отклонены"], ["delivery_unknown", "Проверить доставку"]];
   return headline("Редакция", "Посты", "Выберите черновик или проверьте расписание.",
     button("Создать", "new-post", "primary", "plus"))
     + '<div class="filters" aria-label="Статус постов">' + filters.map(([value, label]) =>
@@ -413,10 +521,10 @@ function businessView() {
       + (profile.facts || []).map((fact) => '<li>' + safe(fact.text) + '</li>').join("") + '</ul>' : "")
     + button("Собрать профиль", "analyze", "secondary", "spark")
     + (profile && !b.profile_confirmed ? button("Подтвердить", "confirm-profile", "primary", "check") : "")
-    + '</section><div><section class="panel business-panel"><h2>Источники</h2><p>Текст или публичная страница сайта. '
-    + 'PDF можно загрузить через чат бота.</p><ul>'
+    + '</section><div><section class="panel business-panel"><h2>Источники</h2><p>Описание, публичная страница сайта или PDF с текстовым слоем.</p><ul>'
     + state.sources.map((s) => '<li>' + safe(s.name) + '</li>').join("") + '</ul>'
     + button("Добавить источник", "add-source", "secondary", "plus")
+    + button("Загрузить PDF", "upload-pdf", "secondary", "posts")
     + '</section><section class="panel business-panel"><h2>Канал</h2><p>'
     + safe(b.channel_title || b.channel_id || "Канал пока не подключён.") + '</p>'
     + button(b.channel_id ? "Изменить канал" : "Подключить канал", "channel", "secondary", "telegram")
@@ -442,7 +550,7 @@ function render() {
       + '<div class="empty">Понадобятся описание бизнеса и канал Telegram.<br>'
       + button("Создать бизнес", "new-business", "primary", "plus") + '</div>';
   } else {
-    root.innerHTML = {overview, content: contentView, reports: reportView, business: businessView}[view]();
+    root.innerHTML = {overview, content: contentView, work: workView, reports: reportView, business: businessView}[view]();
   }
   if (screenChanged && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
     root.animate?.([{opacity: .65, transform: "translateY(5px)"}, {opacity: 1, transform: "none"}],
@@ -460,6 +568,12 @@ async function loadPage() {
     if (epoch !== pageRequest) return;
     content = {...result, page: 0};
   }
+  if (view === "work") {
+    const [result, history] = await Promise.all([api("/business/" + path(id) + "/control"), api("/business/" + path(id) + "/history")]);
+    if (epoch !== pageRequest) return;
+    controls = result;
+    conversation = history.items;
+  }
   if (view === "reports") {
     const result = await api("/business/" + path(id) + "/report");
     if (epoch !== pageRequest) return;
@@ -472,6 +586,10 @@ async function refresh() {
   const result = await api("/state" + (businessId ? "?business=" + path(businessId) : ""));
   if (epoch !== stateRequest) return;
   state = result;
+  if (!demo && state.runtime_mode === "demo") {
+    const banner = $("#mode-banner"); banner.hidden = false;
+    banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовый backend. AI и публикации имитируются; данные сохраняются.</span>';
+  }
   businessId = state.business?.id || "";
   await loadPage();
 }
@@ -507,24 +625,40 @@ function openForm(action, title, detail, fields, submit, id = businessId, revisi
     + button("Отмена", "close", "secondary") + '</div></form>');
 }
 function showPost(post) {
+  if (post.business_id !== businessId) { notify("Пост относится к другой компании. Переключитесь на неё, чтобы продолжить."); return; }
   const attrs = 'data-id="' + safe(post.id) + '" data-revision="' + post.revision + '"';
-  const canApprove = post.status === "review" && post.scheduled_at && new Date(post.scheduled_at) > new Date();
+  const staleProfile = post.profile_version !== state.business.profile_version;
+  const staleChannel = post.channel_id !== state.business.channel_id;
+  const canApprove = post.status === "review" && post.scheduled_at && new Date(post.scheduled_at) > new Date()
+    && !staleProfile && !staleChannel;
   let actions = "";
   if (editable.has(post.status)) {
-    if (canApprove) actions += button("Согласовать версию " + post.revision, "approve", "primary", "check", attrs);
+    if (canApprove) actions += button("Согласовать версию " + post.revision, "approve", "primary", "check", attrs + (demo ? "" : ' disabled data-requires-image'));
     actions += button("Текст и время", "edit-post", "secondary", "calendar", attrs);
+    actions += button("Правка текста AI", "revise-text", "secondary", "spark", attrs);
+    actions += button("Правка изображения", "revise-image", "secondary", "image", attrs);
+    if (staleProfile) actions += button("Проверил по новому профилю", "refresh-context", "secondary", "check", attrs);
     if (["review", "approved"].includes(post.status)) actions += button("Отклонить", "reject", "secondary danger", "", attrs);
   }
-  const text = canApprove ? "Проверьте текст, изображение и время перед согласованием."
-    : post.status === "review" ? "Выберите будущее время, чтобы согласовать эту версию." : "";
+  const text = canApprove ? "Согласование относится к этой версии: тексту, изображению, каналу и времени."
+    : post.status === "review" ? "Выберите будущее время и проверьте материал перед согласованием." : "Любая правка снимает прежнее согласование.";
   const link = /^https:\/\/t\.me\//.test(post.message_url || "")
     ? '<a class="text-button" target="_blank" rel="noopener noreferrer" href="' + safe(post.message_url)
       + '">Открыть публикацию ' + icon("arrow") + '</a>' : "";
-  showDialog(dialogHeading("Предпросмотр поста") + postArt(post, "preview-art") + '<div class="post-details">'
-    + statusLabel(post.status) + '<span class="date">Версия ' + post.revision + ' · '
-    + safe(formatDate(post.scheduled_at)) + '</span></div><p class="post-text">' + safe(post.text)
-    + '</p><p class="dialog-desc">' + safe(post.last_error || text) + '</p>' + link
-    + '<p class="form-error" id="form-error" role="alert"></p><div class="dialog-actions">' + actions + '</div>');
+  showDialog(dialogHeading("Проверка публикации") + '<div class="publication-target">' + icon("telegram") + '<div><strong>Telegram · '
+    + safe(post.channel_id || 'Канал не выбран') + '</strong><span>' + safe(formatDate(post.scheduled_at)) + ' · '
+    + safe(state.business.timezone) + '</span></div></div>' + postArt(post, "preview-art") + '<div class="post-details">'
+    + statusLabel(post.status) + '<span class="date">Версия ' + post.revision + ' · Профиль v' + (post.profile_version ?? '—')
+    + '</span></div><p class="post-text">' + safe(post.text) + '</p>'
+    + (staleProfile ? '<div class="notice approval-warning">Профиль бизнеса изменился. Проверьте факты и обновите контекст перед согласованием.</div>' : '')
+    + (staleChannel ? '<div class="notice approval-warning">Подключён другой канал. Проверьте назначение поста в Telegram-боте.</div>' : '')
+    + ((post.warnings || []).length ? '<div class="notice approval-warning"><strong>Перед публикацией</strong><ul>'
+      + post.warnings.map(w => '<li>' + safe(w) + '</li>').join('') + '</ul></div>' : '')
+    + '<details class="post-sources"><summary>Источники фактов · ' + (post.used_source_ids || []).length + '</summary><ul>'
+    + (post.used_source_ids || []).map(id => '<li>' + safe(state.sources.find(s => s.id === id)?.name || id) + '</li>').join('') + '</ul></details>'
+    + '<p class="dialog-desc">' + safe(post.last_error || text) + '</p>'
+    + (post.status === 'delivery_unknown' ? '<div class="notice">Сначала проверьте канал и уточните доставку в Telegram-боте. Автоматического повтора нет.</div>' : '')
+    + link + '<p class="form-error" id="form-error" role="alert"></p><div class="dialog-actions">' + actions + '</div>');
 }
 function editableDate(value) {
   if (!value) return "";
@@ -576,7 +710,37 @@ document.addEventListener("click", async (event) => {
   }
   control.disabled = true;
   try {
-    if (action === "new-post") {
+    if (action === "refresh") {
+      await refresh(); notify("Данные обновлены.");
+    } else if (action === "automation") {
+      const b = state.business;
+      openForm("automation", "Автоподготовка", "AI готовит материалы по расписанию. Каждый готовый пост ждёт отдельного согласования.",
+        '<label class="checkbox-row"><input type="checkbox" name="enabled" ' + (b.automation_enabled ? 'checked' : '') + '> Включить автоподготовку</label>'
+        + '<label class="form-row"><span>Поручение</span><textarea name="request" required maxlength="4000">'
+        + safe(b.automation_request || 'Подготовь один полезный пост о бизнесе') + '</textarea></label>'
+        + formField("Интервал, часов", "interval_hours", "number", 'min="1" max="720" value="' + (b.interval_hours || 24) + '"')
+        + '<label class="form-row"><span>Первый запуск (часовой пояс устройства)</span><input name="first_run_at" type="datetime-local" value="'
+        + editableDate(b.next_generation_at && new Date(b.next_generation_at) > new Date() ? b.next_generation_at : sampleDate(0, 1)) + '"></label>', "Сохранить расписание");
+    } else if (action === "toggle-pause") {
+      await api("/business/" + path(businessId) + "/pause", {paused: !state.business.publications_paused});
+      await refresh(); notify(state.business.publications_paused ? "Отправка публикаций приостановлена." : "Публикации возобновлены.");
+    } else if (action === "cancel-job") {
+      await api("/job/" + path(id) + "/cancel", {}); await refresh(); notify("Задание отменено.");
+    } else if (action === "upload-pdf") {
+      openForm("pdf", "Загрузить PDF", "Используйте PDF с текстовым слоем, до 10 МБ. После загрузки соберите и подтвердите профиль.",
+        formField("Документ", "file", "file", 'accept="application/pdf,.pdf"'), "Загрузить");
+    } else if (action === "revise-text" || action === "revise-image") {
+      openForm(action, action === "revise-text" ? "Доработать текст с AI" : "Доработать изображение",
+        "Опишите изменения. Прежнее согласование сразу снимается; результат появится в новой версии.",
+        formField("Комментарий для AI", "feedback", "textarea", 'maxlength="4000" placeholder="Например: сделай тон спокойнее, сохрани факты"'),
+        "Подготовить новую версию", id, Number(revision));
+    } else if (action === "refresh-context") {
+      showPost(await api("/post/" + path(id) + "/refresh-context", {revision: Number(revision)}));
+      await refresh();
+    } else if (action === "new-post") {
+      if (!state.business.profile_confirmed || !state.business.channel_id) {
+        await navigate("business"); notify("Подтвердите профиль и подключите канал, чтобы создать первый пост."); return;
+      }
       openForm("prepare", "Новый черновик", "Опишите тему, формат и количество постов.",
         formField("Задание для AI", "request", "textarea", 'maxlength="4000" placeholder="Например: два поста про завтраки на этой неделе"'),
         "Поставить в очередь");
@@ -592,8 +756,9 @@ document.addEventListener("click", async (event) => {
       openForm("channel", "Подключить канал", "Добавьте бота администратором канала с правом публикации.",
         formField("Канал", "value", "text", 'maxlength="128" placeholder="@channel или -100…"'), "Проверить канал");
     } else if (action === "analyze" || action === "confirm-profile") {
+      if (action === "analyze") notify("AI изучает материалы. Это может занять до двух минут.");
       await api("/business/" + path(businessId) + "/profile/" + (action === "analyze" ? "analyze" : "confirm"),
-        action === "analyze" ? {} : {revision: state.business.profile_version});
+        action === "analyze" ? {request_id: crypto.randomUUID()} : {revision: state.business.profile_version});
       await refresh();
       notify(action === "analyze" ? "Профиль готов к проверке." : "Профиль подтверждён.");
     } else if (action === "filter") {
@@ -607,7 +772,9 @@ document.addEventListener("click", async (event) => {
       content = {items: content.items.concat(result.items), more: result.more, page: next};
       render();
     } else if (action === "open-post") {
-      showPost(await api("/post/" + path(id)));
+      const epoch = ++postRequest;
+      const post = await api("/post/" + path(id));
+      if (epoch === postRequest && post.business_id === businessId) showPost(post);
     } else if (action === "edit-post") {
       const post = await api("/post/" + path(id));
       openForm("edit", "Текст и время", "Время указывается в часовом поясе вашего устройства. Правка создаёт новую версию.",
@@ -631,10 +798,32 @@ dialog.addEventListener("submit", async (event) => {
   const submit = form.querySelector('[type="submit"]');
   if (submit.disabled) return;
   submit.disabled = true;
+  const submitLabel = submit.textContent;
+  submit.textContent = "Выполняется…";
   const values = Object.fromEntries(new FormData(form));
   const {form: action, id, revision} = form.dataset;
   try {
-    if (action === "business") {
+    if (action === "automation") {
+      const payload = {enabled: values.enabled === "on", interval_hours: Number(values.interval_hours), request: values.request};
+      if (values.first_run_at) payload.first_run_at = new Date(values.first_run_at).toISOString();
+      await api("/business/" + path(id) + "/automation", payload); dialog.close(); await refresh(); notify("Расписание сохранено.");
+    } else if (action === "revise-text" || action === "revise-image") {
+      const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
+      const post = await api("/post/" + path(id) + "/" + action, {revision: Number(revision), feedback: values.feedback, request_id: requestId});
+      showPost(post); await refresh(); notify("Новая версия готова. Проверьте и согласуйте её отдельно.");
+    } else if (action === "pdf") {
+      const file = values.file;
+      if (!file?.size || file.size > 10000000) throw new Error("Выберите PDF размером до 10 МБ.");
+      if (demo) {
+        demoWorkspaces.find(w => w.business.id === id).sources.push({id: crypto.randomUUID(), name: file.name, kind: "pdf"});
+        demoWorkspaces.find(w => w.business.id === id).business.profile_confirmed = false;
+      } else {
+        const data = new FormData(); data.append("file", file);
+        const response = await fetch("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
+        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось загрузить документ.");
+      }
+      dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
+    } else if (action === "business") {
       const business = await api("/business", values);
       businessId = business.id;
       view = "business";
@@ -651,7 +840,7 @@ dialog.addEventListener("submit", async (event) => {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
       const job = await api("/business/" + path(id) + "/prepare", {...values, request_id: requestId});
       dialog.close();
-      notify(job.status === "done" ? "Демонстрационный черновик создан." : "Задание в очереди.");
+      notify(demo ? "Демонстрационный черновик создан." : "Задание в очереди.");
       void watchJob(job, id);
     } else {
       await api("/business/" + path(id) + "/" + action, values);
@@ -660,9 +849,41 @@ dialog.addEventListener("submit", async (event) => {
       notify(action === "channel" ? "Канал подключён." : "Источник добавлен.");
     }
   } catch (error) { announceError(error); }
-  finally { submit.disabled = false; }
+  finally { submit.disabled = false; submit.textContent = submitLabel; }
+});
+root.addEventListener("submit", async (event) => {
+  const form = event.target;
+  if (!form.matches("[data-chat]")) return;
+  event.preventDefault();
+  const submit = form.querySelector("button");
+  if (submit.disabled) return;
+  const text = form.elements.text.value.trim();
+  if (!text) return;
+  const id = businessId;
+  submit.disabled = true; form.elements.text.disabled = true;
+  const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
+  const errorNode = $("#chat-error"); errorNode.textContent = "";
+  try {
+    const result = await api("/business/" + path(id) + "/chat", {text, request_id: requestId});
+    if (id !== businessId) return;
+    await refresh();
+    const scroll = $(".conversation"); if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    if (result.job) { notify("Задание создано. Готовые материалы придут на согласование."); void watchJob(result.job, id); }
+    if (result.report) showDialog(dialogHeading("Отчёт по компании") + '<pre class="chat-report">' + safe(result.report) + '</pre>');
+    if (["revise_text", "revise_image"].includes(result.intent?.action)) {
+      if (result.intent.post_id) showPost(await api("/post/" + path(result.intent.post_id)));
+      notify("Откройте нужный пост и подтвердите правку отдельной кнопкой.");
+    }
+  } catch (error) { if (errorNode.isConnected) errorNode.textContent = error.message; else announceError(error); }
+  finally { submit.disabled = false; form.elements.text.disabled = false; }
+});
+document.addEventListener("input", event => {
+  const form = event.target.closest("form");
+  if (form && !form.querySelector('button[type="submit"]')?.disabled) delete form.dataset.requestId;
 });
 workspace.addEventListener("change", async () => {
+  ++postRequest;
+  dialog.close();
   businessId = workspace.value;
   try { await refresh(); } catch (error) { announceError(error); }
 });
@@ -684,6 +905,10 @@ if (insideTelegram) {
       else void navigate("overview").catch(announceError);
     });
   }
+}
+if (demo) {
+  const banner = $("#mode-banner"); banner.hidden = false;
+  banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовые данные. AI, отправка постов и расписание здесь имитируются.</span>';
 }
 useTheme();
 void refresh().catch((error) => {

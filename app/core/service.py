@@ -123,6 +123,7 @@ class BackendService:
         operation: Callable[[], Awaitable],
         *,
         request_id: str | None = None,
+        dialogue_text: str | None = None,
     ):
         """Reserve one durable logical provider operation before creating its coroutine.
 
@@ -156,7 +157,9 @@ class BackendService:
         log.info("AI operation started id=%s kind=%s", operation_id, kind)
         try:
             result = self._provider_result(model, await operation())
-            self.repo.finish_ai_operation(operation_id, result.model_dump(mode="json"), self.now())
+            self.repo.finish_ai_operation(
+                operation_id, result.model_dump(mode="json"), self.now(), dialogue_text=dialogue_text
+            )
             log.info("AI operation completed id=%s kind=%s", operation_id, kind)
             return result
         except BaseException as exc:
@@ -412,6 +415,60 @@ class BackendService:
         if not business.channel_id:
             raise Conflict("Сначала подключите канал.")
 
+    def conversation_history(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
+        self._business(actor_id, business_id)
+        return self.repo.conversation_history(business_id, limit)
+
+    def _conversation_context(self, business: Business, post_id: str | None) -> dict:
+        """Only this company's bounded data can reach the language model.
+
+        Conversation entries are evidence of a dialogue, never authority to
+        approve/publish. Live job/post state overrides past assistant prose.
+        """
+        profile = business.profile
+        history = self.repo.conversation_history(business.id, limit=8)
+        posts = sorted(self.repo.list_posts(business.id), key=lambda p: (p.updated_at, p.id), reverse=True)
+        jobs = sorted(self.repo.list_jobs(business.id), key=lambda j: (j.created_at, j.id), reverse=True)
+        selected = next((post for post in posts if post.id == post_id), None)
+        return {
+            "business_id": business.id,
+            "business_name": business.name,
+            "timezone": business.timezone,
+            "now": self.now().isoformat(),
+            "profile_confirmed": business.profile_confirmed,
+            "profile_version": business.profile_version,
+            "profile": None if profile is None else {
+                "name": profile.name,
+                "description": profile.description[:2000],
+                "products": [item[:250] for item in profile.products[:10]],
+                "audience": profile.audience[:500],
+                "tone": profile.tone[:500],
+                "constraints": [item[:400] for item in profile.constraints[:10]],
+                "facts": [{"text": fact.text[:700], "source_ids": fact.source_ids[:5]}
+                          for fact in profile.facts[:12]],
+                "questions": [item[:300] for item in profile.questions[:5]],
+            },
+            "history": [
+                {"user_text": item["user_text"][:1200], "assistant_text": item["assistant_text"][:1200],
+                 "action": item["action"], "created_at": item["created_at"]}
+                for item in history
+            ],
+            "recent_jobs": [
+                {"id": job.id, "request": job.request[:800], "status": job.status, "stage": job.stage,
+                 "created_at": job.created_at.isoformat()}
+                for job in jobs[:4]
+            ],
+            "recent_posts": [
+                {"id": post.id, "text": post.text, "status": post.status.value, "revision": post.revision,
+                 "scheduled_at": post.scheduled_at.isoformat() if post.scheduled_at else None,
+                 "published_at": post.published_at.isoformat() if post.published_at else None,
+                 "message_url": post.message_url, "is_demo": post.is_demo}
+                for post in posts[:4]
+            ],
+            "selected_post_id": post_id,
+            "selected_post": selected.model_dump(mode="json") if selected else None,
+        }
+
     async def interpret_request(
         self,
         actor_id: int,
@@ -431,11 +488,15 @@ class BackendService:
             intent = self._provider_result(
                 TaskIntent,
                 await self._external(
-                    self.ai.interpret_request(text, {"business_id": business.id, "selected_post_id": post_id})
+                    self.ai.interpret_request(text, self._conversation_context(business, post_id))
                 ),
             )
             if intent.post_id and intent.post_id != post_id:
                 raise InvalidInput("Выберите пост явно перед изменением.")
+            if intent.action == "answer" and not intent.answer.strip():
+                raise ProviderUnavailable("AI вернул пустой ответ. Уточните вопрос.")
+            if any(not question.strip() or len(question) > 1000 for question in intent.questions):
+                raise ProviderUnavailable("AI вернул некорректные уточняющие вопросы.")
             return intent
 
         return await self._ai_operation(
@@ -445,6 +506,7 @@ class BackendService:
             TaskIntent,
             interpret,
             request_id=request_id,
+            dialogue_text=text,
         )
 
     def request_preparation(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
