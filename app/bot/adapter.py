@@ -4,6 +4,7 @@ from contextlib import suppress
 
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 from aiogram.utils.token import TokenValidationError
 
 from app.bot.router import build_router, menu
@@ -42,7 +43,7 @@ class UpdateLifecycle(BaseMiddleware):
 
 
 class TelegramBotAdapter:
-    def __init__(self, service: BackendService, token: str):
+    def __init__(self, service: BackendService, token: str, mini_app_url: str | None = None):
         try:
             self.bot = Bot(token)
         except TokenValidationError as exc:
@@ -51,6 +52,8 @@ class TelegramBotAdapter:
         self.updates = UpdateLifecycle()
         self.dispatcher.update.outer_middleware(self.updates)
         self.dispatcher.include_router(build_router(service))
+        self.owner_id = service.settings.owner_id
+        self.mini_app_url = mini_app_url
 
     async def run(self, stop_event: asyncio.Event) -> None:
         if stop_event.is_set():
@@ -65,6 +68,15 @@ class TelegramBotAdapter:
             raise InvalidInput(
                 "У этого бота настроен webhook. Для polling нужен отдельный токен или отключение webhook."
             )
+        if self.mini_app_url:
+            try:
+                await self.bot.set_chat_menu_button(
+                    chat_id=self.owner_id,
+                    menu_button=MenuButtonWebApp(text="Открыть Тираж", web_app=WebAppInfo(url=self.mini_app_url)),
+                    request_timeout=15,
+                )
+            except TelegramAPIError:
+                log.warning("Telegram не установил меню Mini App. Проверьте HTTPS-адрес и личный чат владельца.")
         log.info("Telegram bot @%s connected", me.username)
         polling = asyncio.create_task(
             self.dispatcher.start_polling(
@@ -107,4 +119,4 @@ class TelegramBotAdapter:
 def build_bot(service: BackendService, settings: Settings) -> TelegramBotAdapter:
     if not settings.telegram_bot_token:
         raise InvalidInput("Укажите TELEGRAM_BOT_TOKEN.")
-    return TelegramBotAdapter(service, settings.telegram_bot_token.get_secret_value())
+    return TelegramBotAdapter(service, settings.telegram_bot_token.get_secret_value(), settings.mini_app_url)

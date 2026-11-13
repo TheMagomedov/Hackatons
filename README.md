@@ -82,6 +82,9 @@ python3 -m venv .venv
 
 ## Подключение реальных модулей
 
+Мини-приложение «Тираж» можно посмотреть локально через `python -m app miniapp-preview`.
+Подключение кнопки и HTTPS описано в [инструкции Mini App](docs/MINI_APP.md).
+
 Сначала каждый участник читает [передачу модулей по ролям](docs/ROLE_HANDOFF.md). Для роли 3 есть отдельное [руководство Telegram-интеграции](docs/TELEGRAM_INTEGRATION.md).
 
 1. Скопируйте `.env.live.example` в `.env` один раз. `.env.example` предназначен для demo и оставляет `BOT_FACTORY` пустым.

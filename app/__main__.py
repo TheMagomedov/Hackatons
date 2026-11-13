@@ -14,11 +14,16 @@ from app.config import Settings
 from app.core.demo import run_demo
 from app.core.instance_lock import InstanceLock
 from app.core.runtime import build_runtime, run_application
+from app.miniapp.server import create_app as create_mini_app
+from app.miniapp.server import serve as serve_mini_app
 from app.shared.errors import AppError, InvalidInput, NotFound
 from app.storage import Repository
 
 
 async def execute(args) -> None:
+    if args.command == "miniapp-preview":
+        await serve_mini_app(create_mini_app(), args.port, asyncio.Event())
+        return
     if args.command in {"backup", "verify-backup", "restore"}:
         from app.ops.backup import backup_data, restore_data, verify_backup
 
@@ -104,9 +109,11 @@ def main() -> int:
             "backup",
             "verify-backup",
             "restore",
+            "miniapp-preview",
         ),
         default="demo",
     )
+    parser.add_argument("--port", type=int, default=8765, help="Локальный порт miniapp-preview")
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--output", help="Новый каталог резервной копии для backup")
@@ -125,6 +132,8 @@ def main() -> int:
         parser.error("--backup-dir используется только с verify-backup/restore")
     if args.data_dir and args.command == "verify-backup":
         parser.error("Для verify-backup используется --backup-dir")
+    if args.command == "miniapp-preview" and not 1024 <= args.port <= 65535:
+        parser.error("--port должен быть от 1024 до 65535")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
