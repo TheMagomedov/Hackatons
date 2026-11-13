@@ -99,7 +99,7 @@ async function stopFixture(child) {
   await page.locator('input[name="value"]').fill('@qa_channel');
   await page.getByRole('button',{name:'Проверить канал',exact:true}).click();
   await page.locator('.dock [data-view="content"]').click();
-  await page.getByRole('button',{name:'С AI',exact:true}).click();
+  await page.getByRole('button',{name:'Сгенерировать с AI',exact:true}).click();
   await page.locator('textarea[name="request"]').fill('Один пост о компании');
   await page.getByRole('button',{name:'Поставить в очередь',exact:true}).click();
   await page.locator('.post-card').first().waitFor({timeout:15000});
@@ -209,7 +209,7 @@ async function stopFixture(child) {
   await page.getByRole('button',{name:'Проверить канал',exact:true}).click();
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness);
   await page.locator('.dock [data-view="content"]').click();
-  await page.getByRole('button',{name:'Создать',exact:true}).click();
+  await page.getByRole('button',{name:'Создать вручную',exact:true}).click();
   await page.locator('textarea[name="text"]').fill('Ручной пост с настоящим сохранением изображения');
   const manualImage={name:'manual.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAO0lEQVR4nO3RQREAMAjEwKNiK6ty0FUJ4cMvK+CYCdXvZtNZXY8HBvwBMhEyETIRMhEyETIRMhEyUcgHP4UCCnaFLHEAAAAASUVORK5CYII=','base64')};
   await page.locator('input[name="image"]').setInputFiles(manualImage);
@@ -220,7 +220,7 @@ async function stopFixture(child) {
   await page.getByRole('button',{name:'Сохранить черновик',exact:true}).click();
   assert.equal(await page.locator('input[name="image"]').isDisabled(),true,'Cannot change selected image during upload');
   await page.getByRole('button',{name:'Закрыть',exact:true}).click();
-  await page.getByRole('button',{name:'Создать',exact:true}).click();
+  await page.getByRole('button',{name:'Создать вручную',exact:true}).click();
   await page.locator('textarea[name="text"]').fill('Новый открытый редактор');
   releaseUpload();
   const manualPost=await(await savedDraft).json();
@@ -343,7 +343,8 @@ async function stopFixture(child) {
   releasePosts();await (await delayedPosts).finished();
   await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness,'Old page cannot revert workspace selection while the new state is pending');
-  assert.equal(await page.locator('#main').getAttribute('data-screen'),'overview','Old page cannot render during another company selection');
+  assert.equal(await page.locator('#main').getAttribute('data-screen'),'loading','Loading stays visible while the next company state is pending');
+  assert.equal(await page.locator('#main').getAttribute('data-business'),'','Old company content must not remain actionable during the switch');
   releaseNextState();
   await page.locator('.post-card[data-id="'+manualPost.id+'"]').waitFor();
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness);
@@ -371,13 +372,14 @@ async function stopFixture(child) {
    assert.equal(retryPosts,1,'Failed content GET is not retried automatically');
    assert.equal(await retryPage.locator('#main').getAttribute('data-business')||'','','No business content has rendered yet');
    await retryPage.getByRole('button',{name:'Повторить загрузку',exact:true}).click();
+   await retryPage.locator('#main[data-screen="content"][aria-busy="false"]').waitFor();
    await retryPage.getByRole('heading',{name:'Посты',exact:true}).waitFor();
    assert.equal(retryStates.length,2,'Explicit retry refreshes the selected business');
    assert.equal(retryPosts,2,'Explicit retry reloads the failed content exactly once');
    assert.equal(retryStates[1],retryStates[0]);
    assert.equal(await retryPage.locator('#main').getAttribute('data-business'),retryStates[0]);
    assert.equal(await retryPage.locator('#workspace').inputValue(),retryStates[0]);
-  } finally {await retryPage.close();}
+  } finally {await retryPage.unrouteAll({behavior:'ignoreErrors'});await retryPage.close();}
   // A saved company whose state failed to load is reused when the creation form is submitted again.
   const creationRetryPage=await browser.newPage({viewport:{width:390,height:844},reducedMotion:'reduce'});
   try {
@@ -407,7 +409,7 @@ async function stopFixture(child) {
    assert.equal(await creationRetryPage.locator('#workspace').inputValue(),savedBusiness);
    assert.equal(creationPosts,1,'Retrying a saved company refreshes its state without creating a duplicate');
    assert.equal(creationStateAttempts,2,'Only the explicit retry requests the company state again');
-  } finally {await creationRetryPage.close();}
+  } finally {await creationRetryPage.unrouteAll({behavior:'ignoreErrors'});await creationRetryPage.close();}
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}

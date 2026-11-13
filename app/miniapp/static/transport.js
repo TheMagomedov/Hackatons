@@ -4,7 +4,8 @@
 window.TirazhHTTP = Object.freeze({
   async request(url, options = {}) {
     const {timeoutMs, signal, ...init} = options;
-    const delay = timeoutMs ?? ((init.method || "GET").toUpperCase() === "GET" ? 20000 : 150000);
+    const readOnly = ["GET", "HEAD"].includes((init.method || "GET").toUpperCase());
+    const delay = timeoutMs ?? (readOnly ? 20000 : 150000);
     if (!Number.isFinite(delay) || delay <= 0 || delay > 180000) throw new TypeError("Invalid request timeout");
     const controller = new AbortController();
     let timedOut = false;
@@ -21,6 +22,7 @@ window.TirazhHTTP = Object.freeze({
       });
     } catch (error) {
       if (timedOut) {
+        if (readOnly) throw new Error("Время ожидания вышло. Данные не загрузились. Проверьте соединение и повторите загрузку.");
         throw new Error("Время ожидания вышло. Проверьте статус задания или поста перед повтором: действие могло сохраниться.");
       }
       if (signal?.aborted) throw error;

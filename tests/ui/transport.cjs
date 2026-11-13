@@ -36,7 +36,7 @@ function client(fetch, online = true) {
 
   await assert.rejects(client(async (url, {signal}) => new Response(new ReadableStream({
     start(controller) {signal.addEventListener('abort', () => controller.error(new Error('body stalled')));},
-  }))).request('/api/asset', {timeoutMs:10}), /Время ожидания вышло/);
+  }))).request('/api/asset', {timeoutMs:10}), error => /Данные не загрузились/.test(error.message) && !/действие могло сохраниться/.test(error.message));
 
   await assert.rejects(client(async () => {throw new TypeError('Failed to fetch');}, false).request('/api'), /Нет подключения/);
   await assert.rejects(client(async () => {throw new TypeError('Failed to fetch');}).request('/api'), /Не удалось связаться/);

@@ -64,15 +64,26 @@ STAGES = {
     "cancelled": "Задание отменено",
 }
 INPUTS = {
-    "name": "Введите название бизнеса.",
-    "notes": "Пришлите сведения о бизнесе и пожелания к стилю.",
-    "url": "Пришлите конечный публичный адрес страницы.",
+    "name": "Введите название компании — так она будет называться в списке.",
+    "notes": (
+        "Пришлите описание компании: что она делает, для кого и какие факты можно использовать в постах. "
+        "Это материал для профиля, а не готовый пост."
+    ),
+    "url": "Пришлите публичную ссылку на страницу с информацией о компании или её продуктах.",
     "pdf": "Прикрепите текстовый PDF до 8 МиБ и 24 страниц.",
     "channel": "Добавьте бота администратором канала с правом публиковать и пришлите @имя или ID канала.",
-    "request": "Опишите задачу, например «Подготовь три поста о стекле для современной архитектуры».",
-    "auto": "Введите интервал в часах и задачу, например «24 Пост о применении стекла в архитектуре».",
-    "text": "Что изменить в тексте?",
-    "image": "Что изменить на изображении?",
+    "request": (
+        "Задайте вопрос AI-маркетологу или опишите пост: тема, аудитория и количество. "
+        "Например: «Подготовь один пост о стекле для архитекторов». "
+        "AI создаст черновик; перед отправкой его нужно согласовать."
+    ),
+    "auto": (
+        "Укажите, как часто AI должен готовить новые черновики: интервал в часах и тему. "
+        "Например: «24 Пост о применении стекла в архитектуре». "
+        "Каждый пост потребует отдельного согласования."
+    ),
+    "text": "Опишите, как AI должен изменить текст этой версии. Например: «Сделай короче и убери призыв к покупке».",
+    "image": "Опишите, как AI должен изменить изображение этой версии. Например: «Добавь больше дневного света».",
     "time": "Пришлите дату со смещением, например 2026-12-15 10:30+03:00.",
     "found": "Перешлите опубликованное сообщение с фото и текстом напрямую из канала.",
     "profile-tone": "Укажите новый стиль общения.",
@@ -288,13 +299,19 @@ def build_router(service: BackendService) -> Router:
         rows = [[(b.name[:50], f"business:{b.id}")] for b in businesses[-15:]]
         viewer = service.access_role(actor) == "reviewer"
         if not viewer:
-            rows.append([("Создать бизнес", "input:name")])
+            rows.append([("Добавить компанию", "input:name")])
         await reply(
             message,
-            STUDIO_TITLE + ("\n\nНаблюдатель · только просмотр. Выберите бизнес." if viewer
-                            else "\n\nОператор · выберите бизнес или создайте карточку.")
-            + (" В студии можно заполнить профиль, написать пост и загрузить своё изображение без нейросети."
-               if service.settings.mini_app_url and not viewer else "")
+            STUDIO_TITLE + (
+                "\n\nНаблюдатель · только просмотр. Выберите компанию, чтобы посмотреть профиль, посты и отчёт."
+                if viewer else "\n\nВыберите компанию ниже. В её меню можно добавить материалы, "
+                "подготовить посты с AI и согласовать отправку в канал."
+            )
+            + (
+                "\n\n«Открыть студию» — редактор постов и расписание. "
+                "Там можно написать пост и загрузить своё изображение без нейросети."
+                if service.settings.mini_app_url and not viewer else ""
+            )
             + ("\n\nЕсли студия не открывается, отправьте /menu и используйте новую кнопку."
                if service.settings.mini_app_url else ""),
             menu(
@@ -317,28 +334,31 @@ def build_router(service: BackendService) -> Router:
     async def business_menu(message: Message, actor: int, business: Business) -> None:
         sources = service.list_sources(actor, business.id)
         profile = business.profile
+        viewer = service.access_role(actor) == "reviewer"
         parts = [
-            business.name,
+            f"Компания: {business.name}",
             f"Канал: {business.channel_title or business.channel_id or 'не подключён'}",
-            f"Источников: {len(sources)}",
+            f"Материалов для профиля: {len(sources)}",
             "Публикации приостановлены"
             if business.publications_paused
             else "Публикации по расписанию включены",
         ]
         rows = [
+            [("Добавить описание компании", f"input:notes:{business.id}")],
             [
-                ("Текст", f"input:notes:{business.id}"),
-                ("Сайт", f"input:url:{business.id}"),
-                ("PDF", f"input:pdf:{business.id}"),
+                ("Добавить сайт", f"input:url:{business.id}"),
+                ("Загрузить PDF", f"input:pdf:{business.id}"),
             ],
-            [("Собрать профиль", f"analyze:{business.id}"), ("Канал", f"input:channel:{business.id}")],
-            [("Подготовить посты", f"input:request:{business.id}"), ("Посты", f"posts:{business.id}")],
-            [("Отчёт за 7 дней", f"report:{business.id}"), ("Автоподготовка", f"input:auto:{business.id}")],
-            [("Задания", f"jobs:{business.id}"), ("Использование AI", f"usage:{business.id}")],
+            [("Собрать профиль с AI", f"analyze:{business.id}")],
+            [("Сменить канал" if business.channel_id else "Подключить канал", f"input:channel:{business.id}")],
+            [("Создать посты с AI", f"input:request:{business.id}"), ("Открыть посты", f"posts:{business.id}")],
+            [("Отчёт за 7 дней", f"report:{business.id}")],
+            [("Настроить автогенерацию", f"input:auto:{business.id}")],
+            [("Задания генерации", f"jobs:{business.id}"), ("Лимиты запросов AI", f"usage:{business.id}")],
             [("Недоставленные уведомления", f"notices:{business.id}")],
             [
                 (
-                    "Возобновить публикации" if business.publications_paused else "Приостановить публикации",
+                    "Возобновить отправку постов" if business.publications_paused else "Приостановить отправку постов",
                     f"resume:{business.id}" if business.publications_paused else f"pause:{business.id}",
                 )
             ],
@@ -348,12 +368,21 @@ def build_router(service: BackendService) -> Router:
                 f"Следующая автоподготовка: {format_time(business.next_generation_at, business.timezone)}"
             )
             rows.append([("Отключить автоподготовку", f"auto-off:{business.id}")])
-        if not sources:
-            parts.append("Начните с описания бизнеса, сайта или PDF.")
+        if viewer:
+            parts.append("Доступен просмотр: откройте посты, задания генерации, историю или отчёт.")
         elif not profile:
-            parts.append("Соберите профиль по добавленным материалам.")
-        elif business.profile_confirmed and not business.channel_id:
-            parts.append("Подключите канал, чтобы подготовить черновики.")
+            parts.append("Следующий шаг: «Собрать профиль с AI» — он использует добавленные материалы."
+                         if sources else "Следующий шаг: «Добавить описание компании», сайт или PDF.")
+        elif not business.profile_confirmed:
+            parts.append("Следующий шаг: проверьте сведения ниже и нажмите «Подтвердить профиль».")
+        elif not business.channel_id:
+            parts.append("Следующий шаг: «Подключить канал» — укажите, куда отправлять согласованные посты.")
+        else:
+            parts.append("Следующий шаг: «Создать посты с AI» или «Открыть посты», чтобы проверить готовые. "
+                         "Отправка начнётся только после согласования версии и выбора времени.")
+        if service.settings.mini_app_url and not viewer:
+            parts.append("Пост вручную: откройте студию, выберите эту компанию, затем «Посты → Создать вручную». "
+                         "Можно написать свой текст и загрузить изображение без AI.")
         if profile:
             parts.extend(
                 [
@@ -373,16 +402,16 @@ def build_router(service: BackendService) -> Router:
                 parts.append(f"• {fact.text}" + (f" ({evidence})" if evidence else ""))
             parts.extend(f"Предположение: {value}" for value in profile.assumptions)
             parts.extend(f"Уточните: {value}" for value in profile.questions)
-            rows.append([("Изменить стиль", f"profile-tone:{business.id}:{business.profile_version}")])
+            rows.append([("Изменить стиль общения", f"profile-tone:{business.id}:{business.profile_version}")])
             if not business.profile_confirmed:
                 rows.append([("Подтвердить профиль", f"confirm:{business.id}:{business.profile_version}")])
         rows.append([("История диалога", f"history:{business.id}")])
-        if service.access_role(actor) == "reviewer":
+        if viewer:
             parts.insert(1, "Наблюдатель · только просмотр")
             rows = [[(label, action) for label, action in row if action.split(":", 1)[0] in READ_CALLBACKS]
                     for row in rows]
             rows = [row for row in rows if row]
-        await reply(message, "\n".join(parts), menu(*rows))
+        await reply(message, "\n".join(parts), menu(*rows, mini_app_url=service.settings.mini_app_url))
 
     async def preview(message: Message, actor: int, post: PostView) -> None:
         business = service.get_business(actor, post.business_id)
@@ -400,9 +429,10 @@ def build_router(service: BackendService) -> Router:
         if post.status in EDITABLE:
             rows.extend(
                 [
-                    [("Изменить текст", f"text:{suffix}"), ("Изменить фото", f"image:{suffix}")],
-                    [("Через 15 мин", f"in15:{suffix}"), ("Через час", f"in60:{suffix}")],
-                    [("Указать время", f"time:{suffix}")],
+                    [("Правка текста с AI", f"text:{suffix}")],
+                    [("Правка изображения с AI", f"image:{suffix}")],
+                    [("Время: через 15 мин", f"in15:{suffix}"), ("Время: через час", f"in60:{suffix}")],
+                    [("Выбрать дату и время", f"time:{suffix}")],
                 ]
             )
             if stale_profile:
@@ -414,7 +444,7 @@ def build_router(service: BackendService) -> Router:
                 and post.scheduled_at
                 and post.scheduled_at > service.now()
             ):
-                rows.append([("Согласовать версию", f"approve:{suffix}")])
+                rows.append([("Согласовать отправку версии", f"approve:{suffix}")])
             if post.status in {PostStatus.REVIEW, PostStatus.APPROVED}:
                 rows.append([("Отклонить", f"reject:{suffix}")])
         if post.status == PostStatus.DELIVERY_UNKNOWN:
@@ -425,7 +455,7 @@ def build_router(service: BackendService) -> Router:
                 ]
             )
         info = (
-            f"Версия {post.revision} · {STATES[post.status]}\nКанал: {post.channel_id}\n"
+            f"Компания: {business.name}\nВерсия {post.revision} · {STATES[post.status]}\nКанал: {post.channel_id}\n"
             f"Время: {format_time(post.scheduled_at, business.timezone)}"
         )
         if stale_profile:
@@ -547,9 +577,18 @@ def build_router(service: BackendService) -> Router:
             menu(*rows),
         )
 
-    async def ask(message: Message, prompt: Prompt) -> None:
+    async def ask(message: Message, actor: int, prompt: Prompt) -> None:
+        business_id = prompt.object_id
+        if prompt.kind in {"text", "image", "time", "found"}:
+            business_id = service.get_post(actor, prompt.object_id).business_id
+        context = f"Компания: {service.get_business(actor, business_id).name}\n\n" if business_id else ""
         state().pending = prompt
-        await reply(message, INPUTS[prompt.kind], menu())
+        rows = [[("Отменить ввод · к компании", f"business:{business_id}")]] if business_id else []
+        await reply(
+            message,
+            context + INPUTS[prompt.kind] + "\n\nЖду ваш ответ. /cancel — отменить ввод и вернуться в меню.",
+            menu(*rows),
+        )
 
     @router.message(Command("start", "menu", "cancel"))
     async def start(message: Message) -> None:
@@ -563,12 +602,15 @@ def build_router(service: BackendService) -> Router:
             return
         await reply(
             message,
-            "Создайте бизнес, добавьте материалы и соберите профиль. "
-            "После подтверждения профиля подключите канал и подготовьте посты. "
-            "Откройте черновик, проверьте предупреждения, выберите время и согласуйте эту версию. "
-            "В меню бизнеса доступны задания, пауза публикаций и использование AI. "
-            "/menu открывает список бизнесов, /cancel отменяет текущий ввод.",
-            menu(),
+            "1. Выберите компанию или нажмите «Добавить компанию».\n"
+            "2. Добавьте описание, сайт или PDF. «Собрать профиль с AI» извлечёт сведения из этих материалов.\n"
+            "3. Проверьте и подтвердите профиль, затем подключите Telegram-канал.\n"
+            "4. «Создать посты с AI» — задайте тему. Для своего текста и изображения: студия → «Посты → Создать вручную».\n"
+            "5. «Открыть посты» — проверьте черновик, выберите время и согласуйте отправку версии.\n\n"
+            "Автогенерация готовит черновики по интервалу; согласование каждого поста остаётся за вами.\n"
+            "/menu — список компаний. /cancel — отменить ожидаемый ответ. "
+            "Название компании указано перед каждым запросом ввода.",
+            menu(mini_app_url=service.settings.mini_app_url),
         )
 
     @router.callback_query()
@@ -606,7 +648,7 @@ def build_router(service: BackendService) -> Router:
                 # A reply to the interpreter's clarification must stay in the
                 # company of this button, even when it came from an older menu.
                 state().selected = business_id
-            await ask(message, Prompt(target, business_id))
+            await ask(message, actor, Prompt(target, business_id))
         elif action == "analyze":
             await reply(message, "Изучаю материалы…")
             await business_menu(
@@ -694,7 +736,7 @@ def build_router(service: BackendService) -> Router:
                 await business_menu(message, actor, service.confirm_profile(actor, target, revision))
             elif action == "profile-tone":
                 service.get_business(actor, target)
-                await ask(message, Prompt(action, target, revision))
+                await ask(message, actor, Prompt(action, target, revision))
             elif action == "approve":
                 post = service.approve_post(actor, target, revision)
                 await reply(message, f"Версия {post.revision} согласована и поставлена в расписание.", menu())
@@ -715,7 +757,7 @@ def build_router(service: BackendService) -> Router:
                 post = service.get_post(actor, target)
                 if post.revision != revision:
                     raise Conflict("Версия изменилась. Откройте актуальный предпросмотр.")
-                await ask(message, Prompt(action, target, revision))
+                await ask(message, actor, Prompt(action, target, revision))
         else:
             raise InvalidInput("Кнопка устарела. Откройте главное меню.")
 

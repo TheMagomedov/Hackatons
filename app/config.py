@@ -52,9 +52,13 @@ class Settings(BaseModel):
         if self.mini_app_url:
             try:
                 url = urlsplit(self.mini_app_url)
+                funnel_host = bool(
+                    url.hostname and url.hostname.endswith(".ts.net") and url.hostname != ".ts.net"
+                )
+                allowed_port = url.port in (None, 443) or (url.port == 8443 and funnel_host)
                 valid = (
                     url.scheme == "https" and url.hostname and url.path == "/mini/"
-                    and url.port in (None, 443) and url.username is None and url.password is None
+                    and allowed_port and url.username is None and url.password is None
                     and not url.query and not url.fragment
                     and not any(char.isspace() for char in self.mini_app_url)
                 )

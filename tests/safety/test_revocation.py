@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import pytest
 
-from app.shared.errors import Conflict, Forbidden, SafetyUnavailable
+from app.shared.errors import Conflict, Forbidden
 from app.shared.models import PostStatus
 from tests.core.test_product_controls import prepare
 from tests.core.test_product_controls import setup as setup
@@ -30,8 +30,9 @@ class SafetyGate:
 
     def wait(self):
         self.entered.set()
-        if not self.release.wait(5):
-            raise SafetyUnavailable()
+        # The test releases this gate in finally, after the access change commits.
+        # A clock deadline would turn slow SQLite writes into a moderation failure.
+        self.release.wait()
 
     def check_text(self, _texts):
         self.wait()
@@ -63,14 +64,16 @@ async def test_manual_write_revoked_during_safety_keeps_saved_state(setup, opera
         service.repo.revoke_access_member(OWNER, OPERATOR, service.now())
         if new_role:
             grant(service, new_role)
+        gate.release.set()
+        with pytest.raises(Forbidden) as error:
+            await asyncio.shield(worker)
+        assert type(error.value) is Forbidden
+        assert service.list_posts(OWNER, business.id) == before_posts
+        assert set(service.files.root.iterdir()) == before_files
+        assert not setup.publisher.calls
     finally:
         gate.release.set()
-    with pytest.raises(Forbidden) as error:
-        await worker
-    assert type(error.value) is Forbidden
-    assert service.list_posts(OWNER, business.id) == before_posts
-    assert set(service.files.root.iterdir()) == before_files
-    assert not setup.publisher.calls
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 @pytest.mark.parametrize("operation", ["analyze", "revise_text", "revise_image", "interpret"])
