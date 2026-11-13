@@ -1,4 +1,4 @@
-"""Local inference cache, explicit local routing and metadata-only traces.
+"""Private inference cache, explicit provider routing and metadata-only traces.
 
 No publication or image request is retried here. Cached values are private,
 bounded, scoped to a company and validated again before returning them.
@@ -125,10 +125,10 @@ class InferenceStore:
         pass  # Connections are short lived; nothing is held across model calls.
 
 
-class LocalInferenceRouter:
+class InferenceRouter:
     def __init__(self, clients, store):
         if not 1 <= len(clients) <= 2:
-            raise ValueError("Use one primary and at most one explicit local fallback")
+            raise ValueError("Use one primary and at most one explicitly configured fallback")
         self.clients = clients
         self.store = store
 
@@ -195,4 +195,8 @@ class LocalInferenceRouter:
                     self._optional_store("put", key, scope["business_id"], result.model_dump(mode="json"),
                                          client.settings.model)
                 return result
-        raise ProviderUnavailable("Локальные модели недоступны. Задача сохранена; облачная замена отключена.")
+        raise ProviderUnavailable("Настроенные модели недоступны. Задача сохранена.")
+
+
+# Preserve the existing local integration import; runtime chooses fallback policy.
+LocalInferenceRouter = InferenceRouter

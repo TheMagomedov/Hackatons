@@ -204,6 +204,10 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
                 "<!-- TELEGRAM_BRIDGE -->",
                 '<script id="telegram-sdk" src="https://telegram.org/js/telegram-web-app.js" async></script>',
             )
+        else:
+            html = html.replace("<!-- PREVIEW_RUNTIME -->",
+                                '<script src="./demo-store.js" defer></script>'
+                                '<script src="./preview-runtime.js" defer></script>')
         return web.Response(text=html, content_type="text/html")
 
     async def health(request):
@@ -214,6 +218,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
 
     async def static_file(request):
         name = request.match_info["name"]
+        if name in {"demo-store.js", "preview-runtime.js"} and SERVICE in request.app:
+            raise web.HTTPNotFound()
         response = web.FileResponse(STATIC / name, headers={"Cache-Control": "no-cache"})
         if name.endswith(".woff2"):
             response.content_type = "font/woff2"
@@ -500,7 +506,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     app.add_routes([
         web.get("/mini/", index),
         web.get("/mini/health", health),
-        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|session\.js|demo-store\.js|transport\.js|access\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
+        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|session\.js|demo-store\.js|preview-runtime\.js|transport\.js|access\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
         web.get("/mini/api/business/{id}/calendar", calendar),

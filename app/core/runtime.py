@@ -7,7 +7,7 @@ import logging
 import signal
 from dataclasses import dataclass
 
-from app.ai.resilience import InferenceStore, LocalInferenceRouter
+from app.ai.resilience import InferenceRouter, InferenceStore
 from app.config import Settings
 from app.core.demo import DemoAI, DemoImages, DemoNotifier, DemoPublisher, DemoReporter
 from app.core.instance_lock import InstanceLock
@@ -129,7 +129,13 @@ async def build_runtime(settings: Settings) -> Runtime:
                         update={"timeout_seconds": selected.timeout_seconds},
                     )
                     clients.append(OllamaJSONClient(selected))
-                ai.client = LocalInferenceRouter(clients, telemetry)
+                ai.client = InferenceRouter(clients, telemetry)
+            elif isinstance(ai, ModelAI):
+                from app.ai.client import ChatJSONClient
+                if isinstance(ai.client, ChatJSONClient):
+                    # One explicitly selected external provider; never silently
+                    # switch to another model, account or local fallback.
+                    ai.client = InferenceRouter([ai.client], telemetry)
             ai = ModeratedAI(ai, safety)
             images = ModeratedImages(images, safety)
             reporter = _provider(settings, settings.report_factory, ("build",), resources)

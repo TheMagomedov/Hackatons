@@ -1,5 +1,8 @@
 # Один запуск после перезагрузки Windows
 
+Для текущего режима [AgentRouter](AGENTROUTER.md) Ollama не требуется: bootstrap пропускает его при `AI_PROVIDER_FACTORY=app.ai.provider:build_provider`. Описанный ниже LOCAL_TEXT относится к альтернативному локальному режиму.
+
+
 `scripts/start-demo.cmd` запускает уже установленную локальную систему: проверяет локальный Ollama, ComfyUI, серверную защиту, переводчик и модератор; при необходимости запускает Ollama и штатный FLUX starter без браузера; затем проверяет или запускает packaged gateway и Windows-хост бота/Mini App.
 
 Это bootstrap существующей установки. Он не устанавливает Ollama, ComfyUI, Python-пакеты, модели, Caddy или Tailscale, не создаёт ключи, не меняет Serve/firewall/планировщик задач и не завершает чужие процессы. Для первого развёртывания нужны окружение проекта, установленная локальная текстовая модель и готовая FLUX-установка. Сохранённый приватный Tailscale Serve path требуется только при выборе API через Tailscale; локальный gateway с `IMAGE_LOCAL_FLUX=1` от него не зависит. ChatGPT и авторизация Codex для локального режима не нужны; настройка текста — [LOCAL_TEXT.md](LOCAL_TEXT.md).

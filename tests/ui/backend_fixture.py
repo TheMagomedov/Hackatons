@@ -86,6 +86,19 @@ async def main(*, role=None, port=0) -> None:
         # Explicit default demo mode and demo factories, no env-file loading.
         runtime = await build_runtime(Settings(mode="demo", owner_id=OWNER, data_dir=Path(destination).resolve()))
         app = create_app(runtime.service, token=TOKEN)
+
+        @web.middleware
+        async def connected_contract(request, handler):
+            # This isolated fixture exercises the live UI contract with fake
+            # providers. Never add this override to the application server.
+            response = await handler(request)
+            if request.path == "/mini/api/state" and response.status == 200:
+                payload = json.loads(response.text)
+                payload["runtime_mode"] = "live"
+                response.text = json.dumps(payload, ensure_ascii=False)
+            return response
+
+        app.middlewares.append(connected_contract)
         selected = ""
         if role:
             actor, selected = await seed_role_preview(runtime.service, role)

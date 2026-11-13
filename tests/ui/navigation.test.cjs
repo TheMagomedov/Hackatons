@@ -174,3 +174,12 @@ test('a slow chat disables repeated submissions and a failure never retries the 
   assert.equal(form.elements.text.disabled,false);
   assert.match(app.nodes.get('#chat-error').textContent,/Локальная модель/);
 });
+
+// A production page must fail visibly if it is accidentally wired to a fake backend.
+test('connected page rejects a demo backend instead of presenting simulated results',async()=>{
+  const app=await application({role:'owner',can_write:true},false,{configure:data=>{data.runtime_mode='demo';data.business.name='Simulated company';}});
+  const html=app.nodes.get('#main').innerHTML;
+  assert.match(html,/не подтвердил режим live/);
+  assert.doesNotMatch(html,/Simulated company/);
+  assert.equal(app.run('state.business'),null);
+});

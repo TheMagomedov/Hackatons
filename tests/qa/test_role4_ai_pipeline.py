@@ -8,7 +8,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from app.ai.client import AISettings, ChatJSONClient
+from app.ai.client import SYSTEM, AISettings, ChatJSONClient
 from app.ai.local import LocalAISettings, OllamaJSONClient
 from app.ai.provider import ModelAI
 from app.config import Settings
@@ -51,14 +51,56 @@ class OllamaModelFixture(ModelFixture):
         })
 
 
-@pytest.mark.parametrize("client_kind", ["chat_completions", "ollama"])
+class ResponsesModelFixture(ModelFixture):
+    """Reuse the synthetic content behind the actual Responses wire contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.requests = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        assert request.method == "POST"
+        assert request.url == "https://text-fixture.invalid/v1/responses"
+        assert request.headers["Authorization"] == "Bearer offline-test-key"
+        payload = json.loads(request.content)
+        assert set(payload) == {
+            "model", "instructions", "input", "text", "max_output_tokens", "store", "reasoning",
+        }
+        assert payload["model"] == "offline-test-model"
+        assert payload["reasoning"] == {"effort": "low"}
+        assert payload["store"] is False
+        assert payload["max_output_tokens"] == 3000
+        assert payload["text"] == {"format": {"type": "json_object"}}
+        assert payload["instructions"].startswith(SYSTEM + "\nЗадание: ")
+        assert len(payload["input"]) == 1 and payload["input"][0]["role"] == "user"
+        assert set(payload["input"][0]) == {"role", "content"}
+        assert "offline-test-key" not in request.content.decode()
+        # Adapt only the fixture input; the real client parses the Responses
+        # envelope below and validates each resulting application model.
+        fixture_request = httpx.Request("POST", request.url, json={"messages": [
+            {"role": "system", "content": payload["instructions"]}, payload["input"][0],
+        ]})
+        content = super().__call__(fixture_request).json()["choices"][0]["message"]["content"]
+        return httpx.Response(200, json={
+            "id": "offline-response", "model": "offline-test-model", "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "message", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": content}]},
+            ],
+        })
+
+
+@pytest.mark.parametrize("client_kind", ["chat_completions", "responses", "ollama"])
 async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort(
     tmp_path, monkeypatch, client_kind,
 ):
     root = tmp_path.resolve()  # Resolve macOS's /var -> /private/var storage alias.
     owner = 51
     now = datetime(2026, 11, 9, 9, tzinfo=UTC)
-    model_http = OllamaModelFixture() if client_kind == "ollama" else ModelFixture()
+    fixtures = {"ollama": OllamaModelFixture, "responses": ResponsesModelFixture}
+    model_http = fixtures.get(client_kind, ModelFixture)()
     network_attempts = []
 
     def deny_network(*args, **kwargs):
@@ -79,8 +121,11 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
             transport=httpx.MockTransport(model_http),
         )
     else:
+        wire_settings = ({"wire_api": "responses", "reasoning_effort": "low",
+                          "base_url": "https://text-fixture.invalid/v1"}
+                         if client_kind == "responses" else {})
         client = ChatJSONClient(
-            AISettings(api_key="offline-test-key", model="offline-test-model", max_retries=0),
+            AISettings(api_key="offline-test-key", model="offline-test-model", max_retries=0, **wire_settings),
             transport=httpx.MockTransport(model_http),
         )
     ai = ModelAI(client)
@@ -123,6 +168,10 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
             assert [(request.method, request.url.path) for request in model_http.requests] == [
                 ("GET", "/api/status"), ("POST", "/api/show"), ("POST", "/api/chat"),
             ] * 3
+        elif client_kind == "responses":
+            assert len(model_http.requests) == 3
+            assert [json.loads(json.loads(request.content)["input"][0]["content"])["schema"]["title"]
+                    for request in model_http.requests] == ["BusinessProfile", "ContentPlan", "TextDraft"]
         generate.assert_awaited_once()
         image_profile, image_text = generate.await_args.args
         assert image_profile == business.profile
