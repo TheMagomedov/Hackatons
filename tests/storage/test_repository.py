@@ -20,7 +20,7 @@ from app.shared.models import (
     PublicationResult,
     Source,
 )
-from app.storage.repository import Repository
+from app.storage.repository import SCHEMA_VERSION, Repository
 
 NOW = datetime(2026, 11, 9, 9, tzinfo=timezone.utc)
 
@@ -75,18 +75,18 @@ class RepositoryTests(unittest.TestCase):
     def test_wal_configuration_and_repeat_initialization(self):
         self.repo.initialize()
         with self.repo._reader() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
 
     def test_future_schema_is_rejected_without_downgrade(self):
         with closing(sqlite3.connect(self.path)) as conn:
-            conn.execute("PRAGMA user_version = 3")
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
         with self.assertRaises(Conflict):
             self.repo.initialize()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION + 1)
 
     def test_profile_version_cas_and_confirmation(self):
         one = self.confirmed_profile()

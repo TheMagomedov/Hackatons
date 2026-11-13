@@ -1,0 +1,338 @@
+/* САЛАВАТСТЕКЛО · brandbook 15.11.2023, pp. 16–26, 30–33.
+   Source logos/patterns remain unchanged; transparent logo canvas is framed
+   with its full artwork and the prescribed clear space, never redrawn. */
+@font-face {
+  font-family:"Avenir Next Cyr";src:url("./brand-avenir-regular.ttf") format("truetype");
+  font-weight:400;font-style:normal;font-display:swap;
+}
+@font-face {
+  font-family:"Avenir Next Cyr";src:url("./brand-avenir-medium.ttf") format("truetype");
+  font-weight:500;font-style:normal;font-display:swap;
+}
+@font-face {
+  font-family:"Avenir Next Cyr";src:url("./brand-avenir-demi.ttf") format("truetype");
+  font-weight:600 900;font-style:normal;font-display:swap;
+}
+@font-face {
+  font-family:"Intro Black";src:url("./brand-intro.ttf") format("truetype");
+  font-weight:900;font-style:normal;font-display:swap;
+}
+:root {
+  --brand-petrol:#196C7F;--brand-deep:#285055;--brand-mist:#C1D0D3;--brand-silver:#DDE1E1;
+  --canvas:#285055;--app:#285055;--surface:#285055;--raised:#224449;
+  --ink:#FFFFFF;--muted:#DDE1E1;--subtle:#C1D0D3;--line:#749498;
+  --accent:#DDE1E1;--on-accent:#285055;--selected:#196C7F;
+  --danger:#DDE1E1;--error-mark:#E5917F;--amber:#DDE1E1;--blue:#C1D0D3;--mint:#FFFFFF;--nav-bg:#285055;
+  font-family:"Avenir Next Cyr","Segoe UI",system-ui,sans-serif;font-size:15px;
+}
+body[data-theme="light"] {
+  --canvas:#DDE1E1;--app:#FFFFFF;--surface:#FFFFFF;--raised:#EEF2F2;
+  --ink:#285055;--muted:#285055;--subtle:#42676B;--line:#C1D0D3;
+  --accent:#196C7F;--on-accent:#FFFFFF;--selected:#DDE1E1;
+  --danger:#285055;--error-mark:#D33835;--amber:#285055;--blue:#196C7F;--mint:#196C7F;--nav-bg:#FFFFFF;
+}
+body {--glass:var(--surface);letter-spacing:0}
+html {scroll-padding-top:calc(128px + var(--safe-top))}
+.shell {border-inline:1px solid var(--line)}
+:where(button,input,select,textarea) {font-family:"Avenir Next Cyr","Segoe UI",system-ui,sans-serif}
+:where(h1,h2),.metric-card strong,.cal-empty strong {
+  font-family:"Intro Black","Avenir Next Cyr",sans-serif;font-weight:900;letter-spacing:0;
+}
+.topbar {min-height:112px;padding:calc(4px + var(--safe-top)) clamp(18px,3.6vw,52px) 4px;gap:22px}
+.brand {gap:4px;min-width:0;flex-shrink:0}
+.brand-logo-window {display:block;position:relative;width:154px;aspect-ratio:1071/639;overflow:hidden;flex:none}
+.brand-logo {
+  position:absolute;max-width:none;width:110.364%;height:auto;left:-9.991%;top:-43.818%;
+  object-fit:contain;filter:none;transform:none;border:0;border-radius:0;box-shadow:none;
+}
+.brand-logo-color {display:none}
+.brand-logo-white {display:block}
+body[data-theme="light"] .brand-logo-color {display:block}
+body[data-theme="light"] .brand-logo-white {display:none}
+.brand-product {font-size:11px;font-weight:500;line-height:1.6;max-width:76px;color:var(--subtle)}
+.desktop-nav {gap:clamp(12px,1.7vw,24px)}
+.desktop-nav button {font-weight:500;font-size:14px;padding-inline:3px;min-width:44px}
+.desktop-nav button[aria-current] {box-shadow:inset 0 -3px var(--accent)}
+.top-actions {gap:10px}
+.workspace {height:46px;border-radius:6px;padding-inline:12px;background:var(--surface)}
+.workspace select {font-size:12px;max-width:168px;font-weight:600}
+.icon-button {border-radius:6px;color:var(--ink)}
+.button {border-radius:6px;font-weight:600;min-height:46px;padding-inline:18px;font-size:14px}
+.button:active,.post-card:active {transform:none}
+.primary:hover {background:var(--brand-deep);color:#FFFFFF}
+body:not([data-theme="light"]) .primary:hover {background:#FFFFFF;color:var(--brand-deep)}
+.secondary {background:var(--surface);border-color:var(--line)}
+.secondary:hover {background:var(--raised);filter:none}
+.text-button {font-size:12px;font-weight:600}
+.mode-banner {display:grid;grid-template-columns:max-content minmax(0,750px) max-content;align-items:center;justify-content:center;background:var(--raised);font-size:12px;padding:8px 24px;gap:10px;border-bottom:0}
+.demo-pill {border-color:var(--subtle);color:var(--ink);border-radius:3px;font-weight:600;letter-spacing:.08em}
+.demo-reset {border-radius:4px;font-size:11px;font-weight:500;min-height:44px}
+#main {width:min(100%,980px);padding:32px 28px calc(110px + var(--safe-bottom))}
+#main[data-screen="overview"] {max-width:1180px;padding:0 44px calc(100px + var(--safe-bottom))}
+.workspace-hero {
+  grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);gap:42px;min-height:340px;
+  padding:46px 0 34px;overflow:visible;border-bottom:1px solid var(--line);align-items:center;
+}
+.workspace-hero h1 {
+  font-family:"Intro Black","Avenir Next Cyr",sans-serif;font-size:clamp(38px,4.4vw,58px);
+  line-height:1.1;font-weight:900;letter-spacing:0;max-width:590px;margin:15px 0 18px;
+}
+.press-kicker,.eyebrow {font-size:10px;letter-spacing:.14em;font-weight:600;line-height:1.5;color:var(--mint)}
+.hero-description {font-size:15px;line-height:1.65;max-width:460px}
+.workspace-hero .press-actions {margin-top:24px;gap:10px}
+.approval-note {font-size:12px;max-width:440px;margin-top:19px;align-items:flex-start;line-height:1.6}
+.approval-note .icon {margin-top:2px;width:16px;height:16px}
+.brand-hero-art {width:100%;height:278px;overflow:hidden;align-self:center;justify-self:end;position:relative;max-width:370px;filter:none;transform:none;opacity:1}
+.brand-hero-art img {display:block;width:100%;height:100%;object-fit:contain;object-position:center;filter:none;transform:none;opacity:1}
+.dashboard-metrics {margin-top:24px;gap:14px}
+.panel,.post-list {border-radius:8px;box-shadow:none;background:var(--surface)}
+.metric-card {padding:22px;position:relative;border-radius:8px}
+.metric-card::before {content:"";width:24px;height:3px;position:absolute;top:-1px;left:22px;background:var(--accent)}
+.metric-heading {font-size:13px;font-weight:500}
+.metric-heading .icon {width:18px;height:18px}
+.metric-card strong {font-size:38px;line-height:1.15;margin:16px 0 9px;letter-spacing:0}
+.metric-link {font-size:11px;font-weight:500}
+.next-publication {padding:20px 22px;margin-top:16px;border-radius:8px;gap:16px}
+.next-publication strong {font-weight:600;font-size:16px;margin-top:5px}
+.press-badge,.press-arrow {background:transparent;border:0;color:var(--mint);width:36px;height:36px}
+.press-badge .icon {width:24px;height:24px}
+.recent-section {margin-top:36px}
+.section-top {margin-bottom:19px}
+.section-top h2 {font-size:24px;letter-spacing:0;line-height:1.2}
+.section-top .eyebrow {margin-bottom:7px}
+.editorial-grid {gap:16px}
+.editorial-card {border-radius:8px;transition:border-color .15s,background .15s}
+.editorial-card:hover {transform:none;background:var(--raised)}
+.editorial-card .post-art {aspect-ratio:16/8.4;background:var(--raised);border-bottom:1px solid var(--line)}
+.brand-post-art>img,.post-art>img.brand-pattern,.post-art>img[data-brand-pattern] {object-fit:contain;padding:14px}
+.editorial-card .brand-post-art {position:relative}
+.editorial-card .brand-post-art>img {position:absolute;inset:0;width:100%;height:100%;object-fit:contain;padding:14px}
+.editorial-copy {padding:18px}
+.editorial-copy h3 {font-size:17px;font-weight:600;letter-spacing:0;line-height:1.4;margin:11px 0}
+.editorial-copy p {font-size:12px}
+.status {font-size:11px;font-weight:600}
+.status.review::before {background:transparent;border:1.5px solid currentColor;width:7px;height:7px}
+.status.approved::before {border-radius:1px;width:7px;height:7px}
+.status.published::before {width:7px;height:7px}
+.status.failed::before,.status.delivery_unknown::before {background:var(--error-mark)}
+.form-error:not(:empty) {border-left:3px solid var(--error-mark);padding-left:10px}
+.assistant-strip {padding:22px;margin-top:25px;background:var(--raised);border:0;border-radius:8px;gap:14px}
+.assistant-strip strong {font-size:15px;font-weight:600}
+.assistant-strip p {font-size:13px;line-height:1.6}
+.assistant-strip>.press-badge {display:grid}
+.page-head {margin-bottom:24px;align-items:flex-end;gap:16px}
+.page-head h1 {font-size:clamp(30px,4.2vw,42px);font-weight:900;letter-spacing:0;line-height:1.12}
+.page-head p:not(.eyebrow) {font-size:14px;line-height:1.6;margin-top:9px}
+.filters {gap:8px;margin-block:14px;padding-block:7px}
+.filter {border-radius:5px;font-weight:500;font-size:12px;padding-inline:13px}
+.filter[aria-pressed=true] {background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.post-list {border-radius:8px}
+.post-card {min-height:82px;padding:13px 16px;gap:14px}
+.post-card .post-art {width:56px;height:56px;border-radius:4px}
+.post-body h3 {font-size:15px;font-weight:600;letter-spacing:0}
+.post-meta {gap:9px;margin-top:7px}
+.date {font-size:11px}
+.business-panel h2,.chat-panel h2,.chart h2 {font-size:23px;letter-spacing:0;line-height:1.25}
+.business-panel,.chat-panel {padding:22px}
+.business-panel p,.business-panel ul,.chat-panel>p {font-size:14px;line-height:1.65}
+.business-panel p+p {margin-top:10px}
+.business-panel .button {margin-top:14px}
+.empty {border-radius:8px;line-height:1.6;padding:20px}
+.chart .created {fill:var(--mint)}
+.chart .sent {fill:transparent;stroke:var(--blue);stroke-width:2;vector-effect:non-scaling-stroke}
+.chart .legend span+span i {background:transparent;border:2px solid var(--blue)}
+.setup-step,.task-card,.chat-message,.chat-form textarea,.publication-target {border-radius:6px}
+.setup-step {padding:14px}
+.setup-step strong {font-size:13px}
+.setup-step small {font-size:11px;line-height:1.5}
+.chat-panel>p {margin-top:10px}
+.chat-speaker {font-size:11px}
+.chat-message {font-size:14px}
+.task-card h3 {font-size:15px;font-weight:600}
+.task-card p {font-size:13px}
+.activity-list {font-size:13px;line-height:1.5}
+.content-search input,.content-layout,.content-layout .button {border-radius:6px}
+.content-search input {font-size:15px}
+.content-layout {padding:3px}
+.cal-panel {padding:24px}
+.cal-header h2 {font-size:23px;letter-spacing:0;font-weight:900}
+.cal-header p {font-size:12px}
+.cal-day {border-radius:5px;min-height:82px;background:var(--surface)}
+.cal-day[aria-pressed=true] {border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);background:var(--raised)}
+.cal-number {font-weight:600}
+.cal-footnote,.cal-legend {font-size:12px}
+.cal-dots .review,.cal-legend .review {background:transparent;border:1.5px solid var(--amber)}
+.cal-dots .approved,.cal-legend .approved {border-radius:1px}
+.cal-empty strong {font-size:21px;line-height:1.3;letter-spacing:0}
+.cal-empty p {font-size:14px}
+.cal-agenda {margin-top:30px}
+.dock {border-radius:9px;background:var(--nav-bg);box-shadow:0 4px 18px #2850551c;border-color:var(--line)}
+.dock button {border-radius:6px;font-size:11px;font-weight:600}
+.dock button[aria-current] {background:var(--selected);color:var(--ink)}
+.dock-icon {border-radius:5px}
+dialog {border-radius:12px;box-shadow:0 20px 75px #28505540}
+dialog::backdrop {background:#285055b8}
+.dialog-inner {padding:26px}
+.dialog-inner h2 {font-family:"Intro Black","Avenir Next Cyr",sans-serif;font-size:25px;letter-spacing:0;line-height:1.18;font-weight:900;min-height:44px}
+.dialog-inner h2+p,.dialog-desc {font-size:14px;line-height:1.6;margin-top:11px}
+.form-row {font-size:14px;font-weight:600;gap:8px}
+.form-row input,.form-row select,.form-row textarea {border-radius:6px;background:var(--surface);padding:11px 12px;font-weight:400}
+.form-row textarea {min-height:110px}
+.manual-image-preview,.manual-image-preview img,.preview-art {border-radius:6px}
+.post-text {font-size:15px;line-height:1.65;margin-top:16px}
+.preview-art .image-error {display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;width:100%;min-height:180px;padding:24px;color:var(--muted);background:var(--raised);font-size:14px;line-height:1.6}
+.preview-art .image-error .button {font-size:13px;min-height:44px}
+.post-details {gap:9px}
+.post-sources {font-size:13px}
+.publication-target strong {font-size:14px}
+.publication-target span {font-size:12px}
+#toast:not(:empty) {border-radius:6px;box-shadow:0 4px 18px #28505522;font-size:14px}
+@media(max-width:1100px) {
+  .brand-product {display:none}
+  .topbar {gap:14px;padding-inline:24px}
+  .desktop-nav {gap:14px}
+  .workspace select {max-width:145px}
+  #main[data-screen="overview"] {padding-inline:30px}
+  .workspace-hero {gap:28px;grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr)}
+  .workspace-hero h1 {font-size:46px}
+  .brand-hero-art {height:250px}
+}
+@media(max-width:850px) {
+  .topbar {min-height:100px;padding-inline:20px}
+  .brand-logo-window {width:142px}
+  .desktop-nav {gap:10px}
+  .desktop-nav button {font-size:12px}
+  .workspace select {max-width:116px}
+  .top-actions {gap:6px}
+}
+@media(max-width:760px) {
+  .topbar {min-height:94px}
+  .brand-product {display:block;max-width:90px;font-size:12px}
+  .workspace select {max-width:180px}
+  #main[data-screen="overview"] {padding-inline:22px}
+  .workspace-hero {gap:20px;padding:32px 0;min-height:300px;grid-template-columns:minmax(0,1.3fr) minmax(0,.7fr)}
+  .workspace-hero h1 {font-size:38px;max-width:none}
+  .hero-description {font-size:14px;max-width:none}
+  .brand-hero-art {height:210px}
+  .workspace-hero .button {font-size:13px;padding-inline:14px;min-height:46px}
+  .approval-note {font-size:11px}
+  .metric-card {padding:19px 16px}.metric-card::before {left:16px}
+  .metric-heading {font-size:12px}.metric-card strong {font-size:34px}
+  .cal-panel {padding:20px}
+}
+@media(max-width:550px) {
+  .topbar {padding:calc(3px + var(--safe-top)) 16px 3px;min-height:88px;gap:10px}
+  .brand-logo-window {width:132px}
+  .brand-product {display:none}
+  .top-actions {gap:8px;flex:1;justify-content:flex-end}
+  .workspace {padding-inline:10px;max-width:170px;min-width:0}
+  .workspace select {font-size:12px;max-width:100%;font-weight:500}
+  .theme-button {width:44px;height:44px;border-radius:6px}
+  .mode-banner {padding:9px 16px;gap:8px;font-size:11px}
+  .mode-banner>span:nth-child(2) {font-size:11px;flex:1 1 210px}
+  .mode-banner>.demo-reset {margin-left:0;font-size:11px;min-height:44px}
+  #main {padding:24px 16px calc(108px + var(--safe-bottom))}
+  #main[data-screen="overview"] {padding:0 16px calc(108px + var(--safe-bottom))}
+  .workspace-hero {display:block;min-height:0;padding:28px 0 26px;overflow:hidden;isolation:isolate}
+  .workspace-hero>div:first-child {z-index:1;position:relative}
+  .workspace-hero h1 {font-size:36px;line-height:1.12;max-width:100%;margin:13px 0 14px}
+  .hero-description {font-size:14px;max-width:none;line-height:1.6}
+  .workspace-hero .press-actions {margin-top:22px;gap:8px}
+  .workspace-hero .button {font-size:13px;min-height:46px;padding-inline:14px}
+  .brand-hero-art {display:none}
+  .press-kicker {font-size:10px;letter-spacing:.15em}
+  .approval-note {font-size:11px;max-width:100%;margin-top:17px}
+  .dashboard-metrics {gap:8px;margin-top:21px}
+  .metric-card {border-radius:6px;padding:15px 11px}
+  .metric-card::before {left:11px;width:20px}
+  .metric-heading {font-size:10px;line-height:1.45;min-height:29px}
+  .metric-heading .icon {display:none}
+  .metric-card strong {font-size:30px;margin:11px 0 9px}
+  .metric-link {font-size:10px}
+  .next-publication {padding:16px;gap:10px;margin-top:12px;flex-wrap:wrap}
+  .next-publication>div {flex:1 1 180px}
+  .next-publication>.press-badge {display:none}
+  .next-publication strong {font-size:15px}
+  .next-publication p:last-child {font-size:12px}
+  .next-publication>.button {margin-left:auto;font-size:12px}
+  .recent-section {margin-top:28px}
+  .section-top {gap:10px;margin-bottom:16px}
+  .section-top h2 {font-size:22px}
+  .section-top .eyebrow {font-size:9px;letter-spacing:.12em}
+  .editorial-grid {gap:11px}
+  .editorial-card {border-radius:6px}
+  .editorial-card .post-art {width:102px;min-height:132px;border-bottom:0;border-right:1px solid var(--line);aspect-ratio:auto}
+  .editorial-card .post-art>img {object-fit:contain;padding:10px}
+  .editorial-copy {padding:14px}
+  .editorial-copy h3 {font-size:15px;margin:9px 0;line-height:1.4}
+  .editorial-copy p {font-size:11px}
+  .status {font-size:10px}
+  .assistant-strip {padding:18px;display:block;margin-top:20px}
+  .assistant-strip>.press-badge {display:none}
+  .assistant-strip strong {font-size:15px}
+  .assistant-strip p {font-size:13px}
+  .assistant-strip>.text-button {font-size:12px;margin-top:7px}
+  .page-head {gap:14px;margin-bottom:20px}
+  .page-head h1 {font-size:32px}
+  .page-head p:not(.eyebrow) {font-size:13px}
+  #main[data-screen="business"] .page-head>div {flex-basis:100%}
+  #main[data-screen="business"] .page-head h1 {font-size:clamp(24px,6.5vw,32px)}
+  #main[data-screen="business"] .page-head>.button {margin-left:auto}
+  .content-create-actions .button {font-size:13px;min-height:46px;padding-inline:14px}
+  .content-toolbar {margin-top:18px;gap:10px}
+  .content-search input {font-size:16px;min-height:46px}
+  .content-search>.button {min-height:46px;font-size:13px}
+  .content-layout>.button {min-height:44px;font-size:13px}
+  .filters {margin-block:12px}.filter {font-size:12px;padding-inline:12px}
+  .post-card {padding:12px;min-height:78px;gap:12px}
+  .post-card .post-art {width:48px;height:48px;border-radius:4px}
+  .post-body h3 {font-size:14px}
+  .post-meta {gap:6px}.date {font-size:10px}
+  .business-panel,.chat-panel {padding:18px}
+  .business-panel h2,.chat-panel h2,.chart h2 {font-size:21px}
+  .business-panel p,.business-panel ul,.chat-panel>p {font-size:13px}
+  .chart svg text {font-size:20px}
+  .cal-panel {padding:17px 11px}
+  .cal-header h2 {font-size:20px}.cal-header p {font-size:11px}
+  .cal-controls {gap:5px}.cal-controls>.button {font-size:11px;padding-inline:9px}
+  .cal-grid,.cal-weekdays {gap:4px}
+  .cal-day {min-height:58px;border-radius:4px;padding:8px 6px}
+  .cal-number {font-size:13px}.cal-count {font-size:10px}
+  .cal-footnote,.cal-legend {font-size:11px}
+  .cal-legend {gap:10px}
+  .cal-empty strong {font-size:20px}.cal-empty p {font-size:13px}
+  .cal-agenda .section-top h2 {font-size:21px}
+  .dock {bottom:calc(8px + var(--safe-bottom));width:calc(100% - 24px);border-radius:9px;padding:5px}
+  .dock button {min-height:48px;font-size:10px}.dock .icon {width:19px;height:19px}
+  dialog {border-radius:14px 14px 0 0}
+  .dialog-inner {padding:28px 18px calc(18px + var(--safe-bottom))}
+  .dialog-inner h2 {font-size:23px;line-height:1.2}
+  .dialog-inner h2+p {font-size:13px}
+  .form-row {font-size:13px}.form-row input,.form-row select,.form-row textarea {font-size:16px}
+  .post-text {font-size:15px;line-height:1.65}
+}
+@media(max-width:430px) {
+  html {scroll-padding-top:calc(174px + var(--safe-top))}
+  .topbar {flex-wrap:wrap;gap:0;padding-bottom:12px}
+  .brand {flex:0 0 100%}
+  .brand-product {display:block;max-width:100px;font-size:12px;padding-left:8px}
+  .top-actions {flex:1 0 100%;justify-content:space-between;padding-top:1px}
+  .workspace {flex:1;max-width:none}
+  .workspace select {max-width:none}
+  .workspace .icon:first-child {display:block}
+  .top-actions .theme-button {margin-left:2px}
+  .workspace-hero h1 {font-size:34px}
+  .mode-banner {gap:7px}
+}
+@media(max-width:345px) {
+  .workspace-hero h1 {font-size:30px}
+  .workspace-hero .button {font-size:12px;padding-inline:12px}
+  .brand-product {font-size:11px}
+  .metric-card {padding-inline:9px}.metric-card::before {left:9px}
+  .metric-heading {font-size:10px}.metric-card strong {font-size:28px}
+  .editorial-card .post-art {width:82px}
+  .editorial-copy {padding:12px}.editorial-copy h3 {font-size:14px}
+  .cal-header>div:first-child {flex-basis:100%}
+  .cal-day {min-height:54px;padding-inline:4px}
+  .dialog-inner h2 {font-size:21px}
+}

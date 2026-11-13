@@ -1,0 +1,14 @@
+{
+  "name": "tirazh-ui-checks",
+  "private": true,
+  "scripts": {
+    "test:ui:unit": "node tests/ui/transport.cjs && node --test tests/ui/demo-store.test.cjs",
+    "test:ui": "node tests/ui/smoke.cjs",
+    "test:ui:a11y": "node tests/ui/a11y.cjs",
+    "test:ui:content": "node tests/ui/content.cjs",
+    "test:ui:backend": "node tests/ui/backend.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

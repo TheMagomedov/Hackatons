@@ -1,0 +1,12 @@
+{$MINI_APP_DOMAIN} {
+    encode zstd gzip
+    handle /mini/* {
+        reverse_proxy marketer:8766
+    }
+    handle / {
+        redir /mini/ 302
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

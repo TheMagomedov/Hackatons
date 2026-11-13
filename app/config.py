@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -23,12 +24,19 @@ class Settings(BaseModel):
     image_factory: str | None = None
     report_factory: str | None = None
     bot_factory: str | None = None
+    mini_app_url: str | None = None
+    mini_app_port: int = Field(default=8766, ge=1024, le=65535)
+    mini_app_host: Literal["127.0.0.1", "0.0.0.0"] = "127.0.0.1"
     provider_timeout_seconds: float = Field(default=120, gt=0, le=600)
     max_upload_bytes: int = Field(default=10_000_000, gt=0, le=20_000_000)
     max_posts_per_job: int = Field(default=3, ge=1, le=5)
     max_pending_jobs: int = Field(default=5, ge=1, le=50)
     max_generation_jobs_per_day: int = Field(default=10, ge=1, le=100)
     max_publish_lateness_seconds: int = Field(default=900, ge=0, le=86400)
+    max_ai_operations_per_day: int = Field(default=100, ge=1, le=10000)
+    max_concurrent_ai_operations: int = Field(default=2, ge=1, le=10)
+    max_sources_per_business: int = Field(default=10, ge=1, le=10)
+    max_source_bytes_total: int = Field(default=20_000_000, ge=1024, le=100_000_000)
 
     @field_validator("timezone")
     @classmethod
@@ -41,6 +49,19 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def live_credentials(self) -> "Settings":
+        if self.mini_app_url:
+            try:
+                url = urlsplit(self.mini_app_url)
+                valid = (
+                    url.scheme == "https" and url.hostname and url.path == "/mini/"
+                    and url.port in (None, 443) and url.username is None and url.password is None
+                    and not url.query and not url.fragment
+                    and not any(char.isspace() for char in self.mini_app_url)
+                )
+            except ValueError:
+                valid = False
+            if not valid or self.mode != "live" or not self.bot_factory:
+                raise InvalidInput("MINI_APP_URL должен быть HTTPS-адресом с путём /mini/ в live-режиме с ботом.")
         if self.mode == "live":
             if "owner_id" not in self.model_fields_set:
                 # A domain error avoids embedding the input mapping (and token)
@@ -65,12 +86,19 @@ class Settings(BaseModel):
             "IMAGE_PROVIDER_FACTORY": "image_factory",
             "REPORT_PROVIDER_FACTORY": "report_factory",
             "BOT_FACTORY": "bot_factory",
+            "MINI_APP_URL": "mini_app_url",
+            "MINI_APP_PORT": "mini_app_port",
+            "MINI_APP_HOST": "mini_app_host",
             "PROVIDER_TIMEOUT_SECONDS": "provider_timeout_seconds",
             "MAX_UPLOAD_BYTES": "max_upload_bytes",
             "MAX_POSTS_PER_JOB": "max_posts_per_job",
             "MAX_PENDING_JOBS": "max_pending_jobs",
             "MAX_GENERATION_JOBS_PER_DAY": "max_generation_jobs_per_day",
             "MAX_PUBLISH_LATENESS_SECONDS": "max_publish_lateness_seconds",
+            "MAX_AI_OPERATIONS_PER_DAY": "max_ai_operations_per_day",
+            "MAX_CONCURRENT_AI_OPERATIONS": "max_concurrent_ai_operations",
+            "MAX_SOURCES_PER_BUSINESS": "max_sources_per_business",
+            "MAX_SOURCE_BYTES_TOTAL": "max_source_bytes_total",
         }
         return cls(
             **{field: os.environ[key] for key, field in names.items() if os.environ.get(key, "").strip()}

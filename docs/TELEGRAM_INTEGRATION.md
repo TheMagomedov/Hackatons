@@ -27,7 +27,7 @@
 
 ## 2. Фабрика и один экземпляр приложения
 
-Зарезервирован путь `app.bot.adapter:build_bot`. Его создаёт участник №3:
+Реализован путь `app.bot.adapter:build_bot`. При расширении сохраняйте контракт:
 
 ```python
 def build_bot(service, settings):
@@ -91,11 +91,11 @@ Backend фиксирует в базе режим и владельца до в�
 часовой пояс; хранение и сравнение backend выполняет в UTC.
 
 ```python
-async def onboard(service, actor_id, name, website, pdf_filename, pdf_bytes):
+async def onboard(service, actor_id, name, website, pdf_filename, pdf_bytes, event_key):
     business = service.create_business(actor_id, name, timezone="Europe/Moscow")
     service.add_url_source(actor_id, business.id, website)
     service.add_pdf_source(actor_id, business.id, pdf_filename, pdf_bytes)
-    business = await service.analyze_business(actor_id, business.id)
+    business = await service.analyze_business(actor_id, business.id, request_id=event_key)
     return business  # Показать business.profile и business.profile_version.
 ```
 
@@ -142,7 +142,8 @@ AI распознаёт намерение, но не исполняет сог�
 
 ```python
 intent = await service.interpret_request(
-    actor_id, business_id, user_text, post_id=explicitly_selected_post_id
+    actor_id, business_id, user_text, post_id=explicitly_selected_post_id,
+    request_id=event_key,
 )
 ```
 
@@ -159,15 +160,21 @@ job = service.request_preparation(
     actor_id,
     business_id,
     request=user_text,
-    request_id=f"telegram_update:{telegram_update_id}",
+    request_id=f"telegram:{bot_id}:{telegram_update_id}",
 )
 ```
 
-Используйте стабильный ID исходного события. Повторная доставка того же update
-должна использовать ту же строку, включая после перезапуска. Не генерируйте UUID
-при каждом вызове. Для callback можно использовать `telegram_callback:{callback_id}`;
-выберите один источник идентификатора для одного действия и не меняйте его при
-повторе. `request_id` должен быть непустым и не длиннее 200 символов.
+Перед маршрутизацией авторизованного сообщения/callback вызывайте
+`accept_telegram_update(actor_id, event_key, digest)`. `event_key` включает ID бота
+и update, `digest` — SHA-256 стабильного содержимого; сырые события не сохраняются.
+`False` означает уже принятое событие: не выполняйте handler повторно. Получение
+фиксируется до выполнения, поэтому после аварии пользователь повторяет действие
+новым сообщением/нажатием. Это предотвращает переход старого текста источника в
+платное распознавание намерения после потери диалогового контекста.
+
+Тот же стабильный `event_key` передавайте как `request_id` в пользовательские
+AI-вызовы. Ключ непустой, не длиннее 200 символов; случайный UUID на каждую попытку
+не подходит. Одно событие нельзя переиспользовать для другого платного действия.
 
 Backend сам добавляет бизнес к ключу дедупликации. Повтор уже принятого действия
 возвращает то же задание, а не запускает дополнительную платную генерацию. Явное
@@ -188,6 +195,11 @@ posts = service.get_job_posts(actor_id, job_id) if job.status == "done" else []
 - `pending` / `running`: подготовка продолжается; обновляйте статус ограниченно.
 - `done`: покажите план и доступные готовые посты.
 - `failed`: покажите `job.error` и предложите новый явный запрос.
+- `cancelled`: задание отменено до начала; платной подготовки не было.
+
+Показывайте `job.stage`, `processed/total` и `updated_at`. `total=0` означает, что
+план ещё не определил количество этапов. `cancel_job(actor_id, job_id)` доступен
+только для pending. Отмена уже выполняемого задания возвращает конфликт.
 
 План может существовать до завершения всего задания, в том числе после последующей
 ошибки генерации изображения. `plan is not None` не означает `job.status == "done"`.
@@ -254,6 +266,7 @@ updated = await service.revise_text(
     post_id,
     expected_revision=shown_revision,
     feedback="Сделай короче и убери эмодзи",
+    request_id=event_key,
 )
 ```
 
@@ -263,6 +276,7 @@ updated = await service.revise_image(
     post_id,
     expected_revision=shown_revision,
     feedback="Светлый фон, чашка на деревянном столе",
+    request_id=event_key,
 )
 ```
 
@@ -282,6 +296,14 @@ updated = await service.revise_image(
 
 После любой успешной правки показывайте новый предпросмотр. Если за время генерации
 расписание устарело, попросите выбрать новое будущее время и согласовать результат.
+
+Предпросмотр также показывает `post.used_source_ids` с именами источников,
+`post.warnings` и `post.profile_version`. Если версия профиля не совпадает с
+актуальной или неизвестна (`None` у legacy-поста), кнопка согласования недоступна.
+После проверки текста владельцем вызовите
+`refresh_post_context(actor_id, post_id, expected_revision)`, покажите возвращённую
+новую ревизию и запросите отдельное согласование. Смена времени или картинки не
+подтверждает устаревший текст автоматически.
 Метода загрузки
 произвольной пользовательской картинки пока нет: не обходите это прямой записью в
 хранилище, согласуйте расширение с участником №2.
@@ -385,6 +407,24 @@ Telegram; не принимайте похожий JSON из обычного с
 Не добавляйте собственный бесконечный цикл повторов. У уведомлений подготовки есть необязательный
 `notification.job_id`: используйте его с `get_job`, `get_plan`, `get_job_posts`.
 У прочих уведомлений поле может быть None; тогда используйте бизнес/пост для навигации.
+
+## Управление и диагностика
+
+- `set_publications_paused(actor_id, business_id, True/False)` управляет новыми
+  отправками, отдельно от `configure_automation`. Пауза не обещает отменить уже
+  начавшийся сетевой запрос; возобновление не меняет допустимое опоздание.
+- `ai_usage(actor_id)` показывает общий лимит владельца по UTC; это количество
+  логических операций, не деньги. По умолчанию 100/сутки и 2 одновременно.
+  `list_ai_operations(actor_id, business_id, limit=20)` возвращает безопасные
+  идентификаторы, статусы, времена и коды причин.
+- `failed_notifications(actor_id, business_id)` и
+  `get_failed_notification(actor_id, notification_id)` возвращают метаданные
+  уведомлений после пяти неудач. `retry_notification(actor_id, business_id,
+  notification_id)` возвращает выбранное уведомление в очередь; генерация и
+  публикация не повторяются.
+
+Руководство оператора и backup/restore: [OPERATIONS.md](OPERATIONS.md).
+Ручная проверка всего живого сценария: [ACCEPTANCE.md](ACCEPTANCE.md).
 
 | Ошибка | Поведение интерфейса |
 | --- | --- |

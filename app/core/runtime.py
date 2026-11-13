@@ -11,6 +11,7 @@ from app.config import Settings
 from app.core.demo import DemoAI, DemoImages, DemoNotifier, DemoPublisher, DemoReporter
 from app.core.instance_lock import InstanceLock
 from app.core.service import BackendService
+from app.miniapp.server import run_live as run_mini_app
 from app.publishing import TelegramNotifier, TelegramPublisher
 from app.scheduler import Scheduler
 from app.shared.errors import InvalidInput
@@ -165,6 +166,8 @@ async def run_application(settings: Settings, *, once: bool = False) -> None:
                 tasks.append(asyncio.create_task(Scheduler(service).run(stop), name="scheduler"))
                 if runtime.bot:
                     tasks.append(asyncio.create_task(runtime.bot.run(stop), name="telegram-ui"))
+                if settings.mini_app_url:
+                    tasks.append(asyncio.create_task(run_mini_app(service, settings, stop), name="mini-app"))
                 done, _ = await asyncio.wait([*tasks, stopped], return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     if task is not stopped:

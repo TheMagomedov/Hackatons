@@ -1,14 +1,19 @@
 """Role 2's application boundary. Adapters never approve or publish directly."""
 
 import asyncio
+import hashlib
+import io
 import ipaddress
+import json
 import logging
-from collections.abc import Callable
+import warnings
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from app.config import Settings
@@ -27,6 +32,7 @@ from app.shared.models import (
     BusinessProfile,
     ChannelInfo,
     ContentPlan,
+    Fact,
     Job,
     MetricSnapshot,
     Notification,
@@ -112,6 +118,77 @@ class BackendService:
                 "Внешний сервис вернул ответ, не соответствующий общему контракту."
             ) from None
 
+    async def _ai_operation(
+        self,
+        business: Business,
+        kind: str,
+        payload: dict,
+        model,
+        operation: Callable[[], Awaitable],
+        *,
+        request_id: str | None = None,
+        dialogue_text: str | None = None,
+    ):
+        """Reserve one durable logical provider operation before creating its coroutine.
+
+        Retries inside an adapter are bounded separately. This is an operation
+        quota, not a currency or token estimate. Terminal failed/interrupted
+        operations are never paid again for the same incoming event.
+        """
+        if request_id is not None:
+            self._plain_text(request_id, 200, "Некорректный идентификатор действия.")
+        key = request_id if request_id is not None else f"action:{uuid4()}"
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        entry = self.repo.begin_ai_operation(
+            business.owner_id,
+            business.id,
+            kind,
+            key,
+            fingerprint,
+            self.now(),
+            daily_limit=self.settings.max_ai_operations_per_day,
+            max_parallel=self.settings.max_concurrent_ai_operations,
+        )
+        if not entry["created"]:
+            if entry["status"] == "done":
+                return self._provider_result(model, entry["result"])
+            raise Conflict(
+                f"Действие {entry['id']} уже выполняется или завершилось с ошибкой. "
+                "Проверьте состояние; повторная платная обработка этого события отключена."
+            )
+        operation_id = entry["id"]
+        log.info("AI operation started id=%s kind=%s", operation_id, kind)
+        try:
+            result = self._provider_result(model, await operation())
+            self.repo.finish_ai_operation(
+                operation_id, result.model_dump(mode="json"), self.now(), dialogue_text=dialogue_text
+            )
+            log.info("AI operation completed id=%s kind=%s", operation_id, kind)
+            return result
+        except BaseException as exc:
+            code = (
+                "cancelled"
+                if isinstance(exc, asyncio.CancelledError)
+                else (exc.code if isinstance(exc, AppError) else "operation_failed")
+            )
+            try:
+                self.repo.fail_ai_operation(operation_id, code, self.now())
+            except Exception as persist_error:
+                log.warning(
+                    "AI operation persistence failed id=%s code=%s",
+                    operation_id,
+                    type(persist_error).__name__,
+                )
+            log.warning("AI operation failed id=%s kind=%s code=%s", operation_id, kind, code)
+            if isinstance(exc, (AppError, asyncio.CancelledError)):
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            raise ProviderUnavailable(
+                f"Не удалось завершить AI-действие. Код операции: {operation_id}."
+            ) from None
+
     def _notification(
         self, business: Business, kind: str, text: str, post_id: str | None = None, job_id: str | None = None
     ) -> Notification:
@@ -166,6 +243,36 @@ class BackendService:
         self._owner(actor_id)
         return [b for b in self.repo.list_businesses() if b.owner_id == actor_id]
 
+    def capabilities(self, actor_id: int) -> dict:
+        """Loaded configuration only; credentials, balance and provider access are never probed."""
+        self._owner(actor_id)
+        from app.ai.provider import UnconfiguredAI
+        from app.media.runtime import UnconfiguredImages
+
+        def state(provider, unconfigured):
+            if provider is None or isinstance(provider, unconfigured):
+                return "unconfigured"
+            return "demo" if getattr(provider, "is_demo", False) else "configured_unverified"
+
+        return {
+            "manual_profile": True, "manual_drafts": True,
+            "text_generation": state(self.ai, UnconfiguredAI),
+            "image_generation": state(self.images, UnconfiguredImages),
+            "external_access_checked": False,
+            "image_upload": {"formats": ["image/png", "image/jpeg"],
+                             "max_bytes": min(self.settings.max_upload_bytes, 10_000_000),
+                             "max_dimension": 4096, "max_pixels": 16_777_216},
+        }
+
+    def accept_telegram_update(self, actor_id: int, event_key: str, digest: str) -> bool:
+        """Persist a receipt before routing, including for non-AI user actions.
+
+        This is at-most-once admission, separate from AI quota. After a process
+        interruption the owner can inspect state and send a new explicit action.
+        """
+        self._owner(actor_id)
+        return self.repo.claim_inbound_event(actor_id, event_key, digest, self.now())
+
     async def connect_channel(self, actor_id: int, business_id: str, channel_id: str) -> Business:
         business = self._business(actor_id, business_id)
         channel = self._provider_result(
@@ -186,6 +293,7 @@ class BackendService:
         self._business(actor_id, business_id)
         if not text.strip() or len(text.encode("utf-8")) > self.settings.max_upload_bytes:
             raise InvalidInput("Пустой или слишком большой источник.")
+        self._check_source_limits(business_id, extra_bytes=len(text.encode("utf-8")))
         source = Source(
             id=str(uuid4()),
             business_id=business_id,
@@ -201,6 +309,7 @@ class BackendService:
         self._business(actor_id, business_id)
         if not content.startswith(b"%PDF-"):
             raise InvalidInput("Ожидается PDF. Извлечение текста выполняет AI-модуль.")
+        self._check_source_limits(business_id, extra_bytes=len(content))
         asset = self.files.write(business_id, filename, content, "application/pdf", self.now())
         self.repo.add_asset(asset)
         source = Source(
@@ -244,6 +353,7 @@ class BackendService:
             raise InvalidInput(
                 "Укажите публичную HTTP(S)-страницу без пароля и нестандартного порта."
             ) from None
+        self._check_source_limits(business_id, extra_bytes=len(url.encode("utf-8")))
         source = Source(
             id=str(uuid4()), business_id=business_id, kind="url", name=url, url=url, created_at=self.now()
         )
@@ -254,9 +364,44 @@ class BackendService:
         self._business(actor_id, business_id)
         return self.repo.list_sources(business_id)
 
-    async def analyze_business(self, actor_id: int, business_id: str) -> Business:
-        business = self._business(actor_id, business_id)
+    def _check_source_limits(self, business_id: str, *, extra_bytes: int | None = None) -> list[Source]:
         sources = self.repo.list_sources(business_id)
+        count = len(sources) + int(extra_bytes is not None)
+        if count > self.settings.max_sources_per_business:
+            raise InvalidInput(
+                f"Для бизнеса допускается до {self.settings.max_sources_per_business} источников."
+            )
+        # Inspect stored sizes before loading PDF bodies into memory.
+        total = extra_bytes or 0
+        for source in sources:
+            total += (
+                self.repo.get_asset(source.asset_id).size
+                if source.asset_id
+                else len((source.text or source.url or "").encode("utf-8"))
+            )
+            if total > self.settings.max_source_bytes_total:
+                raise InvalidInput("Суммарный объём источников превышает лимит бизнеса.")
+        if total > self.settings.max_source_bytes_total:
+            raise InvalidInput("Суммарный объём источников превышает лимит бизнеса.")
+        return sources
+
+    async def analyze_business(
+        self, actor_id: int, business_id: str, *, request_id: str | None = None
+    ) -> Business:
+        business = self._business(actor_id, business_id)
+        await self._ai_operation(
+            business,
+            "analyze",
+            {"business_id": business_id},
+            Business,
+            lambda: self._analyze_business(actor_id, business_id),
+            request_id=request_id,
+        )
+        return self._business(actor_id, business_id)
+
+    async def _analyze_business(self, actor_id: int, business_id: str) -> Business:
+        business = self._business(actor_id, business_id)
+        sources = self._check_source_limits(business_id)
         if not sources:
             raise InvalidInput("Добавьте хотя бы один источник о бизнесе.")
         inputs = [
@@ -289,30 +434,147 @@ class BackendService:
         self._business(actor_id, business_id)
         return self.repo.confirm_profile(business_id, expected_version, self.now())
 
+    def save_manual_profile(
+        self, actor_id: int, business_id: str, expected_version: int, *, description: str,
+        products: list[str] | None = None, audience: str = "", tone: str = "Дружелюбный, конкретный",
+        constraints: list[str] | None = None,
+    ) -> Business:
+        business = self._business(actor_id, business_id)
+        if type(expected_version) is not int or expected_version < 0:
+            raise InvalidInput("Укажите актуальную версию профиля.")
+        if business.profile_version != expected_version:
+            raise Conflict("Версия профиля изменилась. Откройте актуальный профиль.")
+        description = self._plain_text(description, 2000, "Опишите бизнес: от 1 до 2000 символов.").strip()
+        products = [] if products is None else products
+        constraints = [] if constraints is None else constraints
+        for items, maximum in ((products, 19), (constraints, 20)):
+            if not isinstance(items, list) or len(items) > maximum:
+                raise InvalidInput("Допускается до 19 продуктов и до 20 правил бренда.")
+            for value in items:
+                self._plain_text(value, 500, "Каждый пункт должен содержать от 1 до 500 символов.")
+        if not isinstance(audience, str) or len(audience) > 1000:
+            raise InvalidInput("Описание аудитории должно быть до 1000 символов.")
+        self._plain_text(tone, 400, "Опишите стиль: от 1 до 400 символов.")
+        payload = {"description": description, "products": products, "audience": audience,
+                   "tone": tone, "constraints": constraints}
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        try:
+            size = len(encoded.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise InvalidInput("Проверьте текст профиля.") from None
+        if size > self.settings.max_upload_bytes:
+            raise InvalidInput("Профиль превышает допустимый размер источника.")
+        self._check_source_limits(business.id, extra_bytes=size)
+        now = self.now()
+        source = Source(id=str(uuid4()), business_id=business.id, kind="text",
+                        name=f"Сведения владельца · профиль {expected_version + 1}", text=encoded, created_at=now)
+        profile = BusinessProfile(
+            name=business.name, description=description, products=products, audience=audience, tone=tone,
+            constraints=constraints,
+            facts=[Fact(text=description, source_ids=[source.id]),
+                   *[Fact(text=item, source_ids=[source.id]) for item in products]],
+        )
+        return self.repo.set_manual_profile(business.id, expected_version, profile, source, actor_id, now)
+
     def _ready(self, business: Business) -> None:
         if not business.profile or not business.profile_confirmed:
             raise Conflict("Сначала подтвердите актуальный профиль бизнеса.")
         if not business.channel_id:
             raise Conflict("Сначала подключите канал.")
 
+    def conversation_history(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
+        self._business(actor_id, business_id)
+        return self.repo.conversation_history(business_id, limit)
+
+    def _conversation_context(self, business: Business, post_id: str | None) -> dict:
+        """Only this company's bounded data can reach the language model.
+
+        Conversation entries are evidence of a dialogue, never authority to
+        approve/publish. Live job/post state overrides past assistant prose.
+        """
+        profile = business.profile
+        history = self.repo.conversation_history(business.id, limit=8)
+        posts = sorted(self.repo.list_posts(business.id), key=lambda p: (p.updated_at, p.id), reverse=True)
+        jobs = sorted(self.repo.list_jobs(business.id), key=lambda j: (j.created_at, j.id), reverse=True)
+        selected = next((post for post in posts if post.id == post_id), None)
+        return {
+            "business_id": business.id,
+            "business_name": business.name,
+            "timezone": business.timezone,
+            "now": self.now().isoformat(),
+            "profile_confirmed": business.profile_confirmed,
+            "profile_version": business.profile_version,
+            "profile": None if profile is None else {
+                "name": profile.name,
+                "description": profile.description[:2000],
+                "products": [item[:250] for item in profile.products[:10]],
+                "audience": profile.audience[:500],
+                "tone": profile.tone[:500],
+                "constraints": [item[:400] for item in profile.constraints[:10]],
+                "facts": [{"text": fact.text[:700], "source_ids": fact.source_ids[:5]}
+                          for fact in profile.facts[:12]],
+                "questions": [item[:300] for item in profile.questions[:5]],
+            },
+            "history": [
+                {"user_text": item["user_text"][:1200], "assistant_text": item["assistant_text"][:1200],
+                 "action": item["action"], "created_at": item["created_at"]}
+                for item in history
+            ],
+            "recent_jobs": [
+                {"id": job.id, "request": job.request[:800], "status": job.status, "stage": job.stage,
+                 "created_at": job.created_at.isoformat()}
+                for job in jobs[:4]
+            ],
+            "recent_posts": [
+                {"id": post.id, "text": post.text, "status": post.status.value, "revision": post.revision,
+                 "scheduled_at": post.scheduled_at.isoformat() if post.scheduled_at else None,
+                 "published_at": post.published_at.isoformat() if post.published_at else None,
+                 "message_url": post.message_url, "is_demo": post.is_demo}
+                for post in posts[:4]
+            ],
+            "selected_post_id": post_id,
+            "selected_post": selected.model_dump(mode="json") if selected else None,
+        }
+
     async def interpret_request(
-        self, actor_id: int, business_id: str, text: str, post_id: str | None = None
+        self,
+        actor_id: int,
+        business_id: str,
+        text: str,
+        post_id: str | None = None,
+        *,
+        request_id: str | None = None,
     ) -> TaskIntent:
         business = self._business(actor_id, business_id)
-        if not text.strip() or len(text) > 4000:
-            raise InvalidInput("Запрос должен содержать от 1 до 4000 символов.")
+        self._plain_text(text, 4000, "Запрос должен содержать от 1 до 4000 символов.")
         if post_id and self._post(actor_id, post_id).business_id != business_id:
             raise Forbidden("Пост относится к другому бизнесу.")
+
         # Intent is a suggestion only; there is deliberately no 'approve/publish' model action.
-        intent = self._provider_result(
+        async def interpret():
+            intent = self._provider_result(
+                TaskIntent,
+                await self._external(
+                    self.ai.interpret_request(text, self._conversation_context(business, post_id))
+                ),
+            )
+            if intent.post_id and intent.post_id != post_id:
+                raise InvalidInput("Выберите пост явно перед изменением.")
+            if intent.action == "answer" and not intent.answer.strip():
+                raise ProviderUnavailable("AI вернул пустой ответ. Уточните вопрос.")
+            if any(not question.strip() or len(question) > 1000 for question in intent.questions):
+                raise ProviderUnavailable("AI вернул некорректные уточняющие вопросы.")
+            return intent
+
+        return await self._ai_operation(
+            business,
+            "interpret",
+            {"text": text, "post_id": post_id},
             TaskIntent,
-            await self._external(
-                self.ai.interpret_request(text, {"business_id": business.id, "selected_post_id": post_id})
-            ),
+            interpret,
+            request_id=request_id,
+            dialogue_text=text,
         )
-        if intent.post_id and intent.post_id != post_id:
-            raise InvalidInput("Выберите пост явно перед изменением.")
-        return intent
 
     def request_preparation(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
         business = self._business(actor_id, business_id)
@@ -342,6 +604,54 @@ class BackendService:
         self._business(actor_id, job.business_id)
         return job
 
+    def list_jobs(self, actor_id: int, business_id: str) -> list[Job]:
+        self._business(actor_id, business_id)
+        return self.repo.list_jobs(business_id)
+
+    def cancel_job(self, actor_id: int, job_id: str) -> Job:
+        self.get_job(actor_id, job_id)
+        return self.repo.cancel_job(job_id, self.now())
+
+    def set_publications_paused(self, actor_id: int, business_id: str, paused: bool) -> Business:
+        self._business(actor_id, business_id)
+        if type(paused) is not bool:
+            raise InvalidInput("Признак паузы должен быть логическим значением.")
+        return self.repo.set_publications_paused(business_id, paused, self.now())
+
+    def ai_usage(self, actor_id: int) -> dict:
+        self._owner(actor_id)
+        return {
+            **self.repo.ai_usage(actor_id, self.now()),
+            "daily_limit": self.settings.max_ai_operations_per_day,
+            "parallel_limit": self.settings.max_concurrent_ai_operations,
+            "period_timezone": "UTC",
+        }
+
+    def list_ai_operations(
+        self,
+        actor_id: int,
+        business_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        self._owner(actor_id)
+        if business_id is not None:
+            self._business(actor_id, business_id)
+        return self.repo.list_ai_operations(actor_id, business_id, limit)
+
+    def failed_notifications(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
+        self._business(actor_id, business_id)
+        return self.repo.list_failed_notifications(business_id, limit=limit)
+
+    def get_failed_notification(self, actor_id: int, notification_id: str) -> dict:
+        self._owner(actor_id)
+        notification = self.repo.get_failed_notification(notification_id)
+        self._business(actor_id, notification["business_id"])
+        return notification
+
+    def retry_notification(self, actor_id: int, business_id: str, notification_id: str) -> Notification:
+        self._business(actor_id, business_id)
+        return self.repo.retry_notification(notification_id, business_id, self.now())
+
     def get_plan(self, actor_id: int, job_id: str) -> ContentPlan | None:
         self.get_job(actor_id, job_id)
         return self.repo.get_plan_for_job(job_id)
@@ -362,6 +672,71 @@ class BackendService:
         asset = self.repo.get_asset(asset_id)
         self._business(actor_id, asset.business_id)
         return asset, self.files.read(asset)
+
+    def upload_post_image(self, actor_id: int, business_id: str, filename: str, content: bytes) -> Asset:
+        self._business(actor_id, business_id)
+        maximum = min(self.settings.max_upload_bytes, 10_000_000)
+        if not isinstance(content, bytes) or not 1 <= len(content) <= maximum:
+            raise InvalidInput("Изображение пустое или превышает лимит загрузки.")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(content), formats=["PNG", "JPEG"]) as picture:
+                    width, height = picture.size
+                    image_format = picture.format
+                    if (image_format not in {"PNG", "JPEG"} or not 1 <= width <= 4096 or not 1 <= height <= 4096
+                            or width * height > 16_777_216 or max(width, height) > 20 * min(width, height)
+                            or getattr(picture, "n_frames", 1) != 1):
+                        raise InvalidInput("Нужно статичное изображение до 4096×4096 с отношением сторон не более 20:1.")
+                    picture.verify()
+                with Image.open(io.BytesIO(content), formats=["PNG", "JPEG"]) as picture:
+                    picture.load()
+        except (UnidentifiedImageError, OSError, ValueError, SyntaxError,
+                Image.DecompressionBombError, Image.DecompressionBombWarning):
+            raise InvalidInput("Файл должен быть исправным PNG или JPEG.") from None
+        mime_type = "image/png" if image_format == "PNG" else "image/jpeg"
+        asset = self.files.write(business_id, filename, content, mime_type, self.now(),
+                                 is_demo=self.settings.mode == "demo")
+        self.repo.add_asset(asset)
+        return asset
+
+    def create_manual_draft(
+        self, actor_id: int, business_id: str, text: str, image_asset_id: str, request_id: str,
+        *, scheduled_at: datetime | None = None, source_ids: list[str] | None = None,
+    ) -> PostView:
+        business = self._business(actor_id, business_id)
+        text = self._validate_caption(text)
+        self._plain_text(request_id, 100, "Укажите идентификатор черновика до 100 символов.")
+        self._plain_text(image_asset_id, 100, "Загрузите изображение для поста.")
+        source_ids = [] if source_ids is None else source_ids
+        if (not isinstance(source_ids, list) or len(source_ids) > 100
+                or any(not isinstance(item, str) or not item or len(item) > 200 for item in source_ids)):
+            raise InvalidInput("Проверьте выбранные источники поста.")
+        scheduled_at = as_utc(scheduled_at) if scheduled_at is not None else None
+        payload = {"text": text, "image_asset_id": image_asset_id, "source_ids": sorted(set(source_ids)),
+                   "scheduled_at": scheduled_at.isoformat() if scheduled_at else None}
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        existing = self.repo.find_manual_post(business_id, request_id, digest)
+        if existing is not None:
+            return existing
+        self._ready(business)
+        if scheduled_at is not None and scheduled_at <= self.now():
+            raise InvalidInput("Выберите время публикации в будущем.")
+        asset = self.repo.get_asset(image_asset_id)
+        if asset.business_id != business_id or asset.mime_type not in {"image/png", "image/jpeg"}:
+            raise InvalidInput("Изображение должно принадлежать этому бизнесу.")
+        if self.settings.mode == "live" and asset.is_demo:
+            raise InvalidInput("Демонстрационное изображение нельзя использовать в live-режиме.")
+        self.files.read(asset)
+        return self.repo.create_posts(
+            business_id, [{"text": text, "image_asset_id": asset.id, "channel_id": business.channel_id,
+                           "scheduled_at": scheduled_at, "profile_version": business.profile_version,
+                           "is_demo": self.settings.mode == "demo", "used_source_ids": source_ids,
+                           "warnings": ["Создано вручную: AI не проверял текст и изображение."]}], self.now(),
+            expected_profile_version=business.profile_version, expected_channel_id=business.channel_id,
+            manual_request_id=request_id, manual_payload_hash=digest, manual_actor_id=actor_id,
+            notification=self._notification(business, "draft_ready", "Ручной пост сохранён и ожидает согласования."),
+        )[0]
 
     def _store_image(self, business_id: str, image) -> Asset:
         from app.shared.models import GeneratedImage
@@ -406,12 +781,21 @@ class BackendService:
         business = self._business(actor_id, post.business_id)
         changes = {}
         if text is not None:
+            self._ready(business)
             changes["text"] = self._validate_caption(text)
             changes["is_demo"] = post.is_demo or self.settings.mode == "demo"
+            changes["profile_version"] = business.profile_version
+            changes["warnings"] = list(
+                dict.fromkeys(
+                    [*post.warnings, "Текст изменён вручную: проверьте соответствие указанным источникам."]
+                )
+            )
         if image_asset_id is not None:
             asset = self.repo.get_asset(image_asset_id)
             if asset.business_id != post.business_id or asset.mime_type not in {"image/png", "image/jpeg"}:
                 raise InvalidInput("Изображение должно принадлежать этому бизнесу.")
+            if self.settings.mode == "live" and asset.is_demo:
+                raise InvalidInput("Демонстрационное изображение нельзя использовать в live-режиме.")
             self.files.read(asset)
             changes["image_asset_id"] = asset.id
             changes["is_demo"] = post.is_demo or asset.is_demo or self.settings.mode == "demo"
@@ -427,6 +811,18 @@ class BackendService:
         if not changes:
             raise InvalidInput("Нет изменений.")
         return self.repo.revise_post(post_id, expected_revision, changes, self.now())
+
+    def refresh_post_context(self, actor_id: int, post_id: str, expected_revision: int) -> PostView:
+        """Explicit human review against the current profile; never an approval."""
+        post = self._post(actor_id, post_id)
+        business = self._business(actor_id, post.business_id)
+        self._ready(business)
+        return self.repo.revise_post(
+            post_id,
+            expected_revision,
+            {"profile_version": business.profile_version},
+            self.now(),
+        )
 
     def _reserve_edit(
         self, actor_id: int, post_id: str, expected_revision: int, feedback: str
@@ -469,7 +865,32 @@ class BackendService:
         return None
 
     async def revise_text(
-        self, actor_id: int, post_id: str, expected_revision: int, feedback: str
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
+        *,
+        request_id: str | None = None,
+    ) -> PostView:
+        post = self._post(actor_id, post_id)
+        self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        await self._ai_operation(
+            self._business(actor_id, post.business_id),
+            "revise_text",
+            {"post_id": post_id, "revision": expected_revision, "feedback": feedback},
+            PostView,
+            lambda: self._revise_text(actor_id, post_id, expected_revision, feedback),
+            request_id=request_id,
+        )
+        return self._post(actor_id, post_id)
+
+    async def _revise_text(
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
     ) -> PostView:
         business, editing = self._reserve_edit(actor_id, post_id, expected_revision, feedback)
         try:
@@ -485,7 +906,13 @@ class BackendService:
             return self.repo.complete_edit(
                 editing.id,
                 editing.revision,
-                {"text": text, "is_demo": editing.is_demo or self.settings.mode == "demo"},
+                {
+                    "text": text,
+                    "is_demo": editing.is_demo or self.settings.mode == "demo",
+                    "profile_version": business.profile_version,
+                    "used_source_ids": draft.used_source_ids,
+                    "warnings": draft.warnings,
+                },
                 self.now(),
                 expected_profile_version=business.profile_version,
                 expected_channel_id=business.channel_id,
@@ -507,7 +934,32 @@ class BackendService:
             raise ProviderUnavailable("Не удалось завершить правку текста.") from None
 
     async def revise_image(
-        self, actor_id: int, post_id: str, expected_revision: int, feedback: str
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
+        *,
+        request_id: str | None = None,
+    ) -> PostView:
+        post = self._post(actor_id, post_id)
+        self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
+        await self._ai_operation(
+            self._business(actor_id, post.business_id),
+            "revise_image",
+            {"post_id": post_id, "revision": expected_revision, "feedback": feedback},
+            PostView,
+            lambda: self._revise_image(actor_id, post_id, expected_revision, feedback),
+            request_id=request_id,
+        )
+        return self._post(actor_id, post_id)
+
+    async def _revise_image(
+        self,
+        actor_id: int,
+        post_id: str,
+        expected_revision: int,
+        feedback: str,
     ) -> PostView:
         business, editing = self._reserve_edit(actor_id, post_id, expected_revision, feedback)
         try:
@@ -589,15 +1041,29 @@ class BackendService:
         )
 
     async def prepare_next_job(self) -> bool:
+        usage = self.repo.ai_usage(self.settings.owner_id, self.now())
+        if (
+            usage["running"] >= self.settings.max_concurrent_ai_operations
+            or usage["used_today"] >= self.settings.max_ai_operations_per_day
+        ):
+            # Leave queued jobs pending while the owner has no capacity. The
+            # transactional operation reservation remains the final race guard.
+            return False
         job = self.repo.claim_job(self.now())
         if job is None:
             return False
         business = self.repo.get_business(job.business_id)
         try:
             self._ready(business)
+            self.repo.set_job_progress(job.id, "plan", 0, 0, self.now())
             request = f"{job.request}\nПодготовь не более {self.settings.max_posts_per_job} публикаций."
-            plan = self._provider_result(
-                ContentPlan, await self._external(self.ai.make_plan(business.profile, request))
+            plan = await self._ai_operation(
+                business,
+                "plan",
+                {"request": request, "profile_version": business.profile_version},
+                ContentPlan,
+                lambda: self._external(self.ai.make_plan(business.profile, request)),
+                request_id=f"job:{job.id}:plan",
             )
             self._current_context(business)
             if len(plan.items) > self.settings.max_posts_per_job:
@@ -605,18 +1071,38 @@ class BackendService:
             self.repo.save_plan(business.id, job.id, plan, self.now())
             drafts = []
             source_ids = {source.id for source in self.repo.list_sources(business.id)}
-            for item in plan.items:
+            total = 1 + 2 * len(plan.items)
+            for index, item in enumerate(plan.items):
                 self._current_context(business)
-                text = self._provider_result(
-                    TextDraft, await self._external(self.ai.write_post(business.profile, item))
+                self.repo.set_job_progress(job.id, "text", 1 + 2 * index, total, self.now())
+                text = await self._ai_operation(
+                    business,
+                    "text",
+                    {"item": item.model_dump(mode="json"), "profile_version": business.profile_version},
+                    TextDraft,
+                    lambda: self._external(self.ai.write_post(business.profile, item)),
+                    request_id=f"job:{job.id}:text:{index}",
                 )
                 self._current_context(business)
                 self._validate_caption(text.text)
                 if set(text.used_source_ids) - source_ids:
                     raise InvalidInput("Текст ссылается на неизвестные источники.")
-                generated = await self._external(self.images.generate(business.profile, text))
+                self.repo.set_job_progress(job.id, "image", 2 + 2 * index, total, self.now())
+
+                async def generate_image():
+                    generated = await self._external(self.images.generate(business.profile, text))
+                    self._current_context(business)
+                    return self._store_image(business.id, generated)
+
+                asset = await self._ai_operation(
+                    business,
+                    "image",
+                    {"text": text.model_dump(mode="json"), "profile_version": business.profile_version},
+                    Asset,
+                    generate_image,
+                    request_id=f"job:{job.id}:image:{index}",
+                )
                 self._current_context(business)
-                asset = self._store_image(business.id, generated)
                 proposed = as_utc(item.suggested_at) if item.suggested_at else None
                 drafts.append(
                     {
@@ -625,8 +1111,12 @@ class BackendService:
                         "channel_id": business.channel_id,
                         "scheduled_at": proposed if proposed and proposed > self.now() else None,
                         "is_demo": asset.is_demo or self.settings.mode == "demo",
+                        "profile_version": business.profile_version,
+                        "used_source_ids": text.used_source_ids,
+                        "warnings": text.warnings,
                     }
                 )
+            self.repo.set_job_progress(job.id, "saving", total, total, self.now())
             self.repo.create_posts(
                 business.id,
                 drafts,
@@ -652,12 +1142,13 @@ class BackendService:
                 log.warning("Generation cancellation persistence failed: %s", type(exc).__name__)
             raise
         except Exception as exc:
-            log.warning("Preparation failed: %s", type(exc).__name__)
+            code = exc.code if isinstance(exc, AppError) else "preparation_failed"
+            log.warning("Preparation failed job_id=%s code=%s", job.id, code)
             self._fail_preparation(
                 business,
                 job,
-                str(exc) if isinstance(exc, AppError)
-                else "Не удалось подготовить материалы. Проверьте профиль и доступность провайдеров.",
+                f"Не удалось подготовить материалы. Код: {code}. Задание: {job.id}. "
+                "Проверьте профиль, лимиты и доступность провайдеров.",
             )
             return True
         return True
@@ -665,7 +1156,7 @@ class BackendService:
     def _fail_preparation(self, business: Business, job: Job, message: str) -> None:
         current = self.repo.get_job(job.id)
         # A transaction may have committed before the caller saw an exception.
-        if current.status in {"done", "failed"}:
+        if current.status in {"done", "failed", "cancelled"}:
             return
         self.repo.fail_job(
             job.id,
