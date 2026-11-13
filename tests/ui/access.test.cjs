@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
+const {application} = require('./app-host.cjs');
 const staticDir = path.join(__dirname, '../../app/miniapp/static');
 const source = fs.readFileSync(path.join(staticDir, 'access.js'), 'utf8');
 const reviewer = {role:'reviewer', can_write:false};
@@ -76,44 +77,6 @@ test('DOM pass hides dynamic mutations and form fields while preserving read con
   assert.equal(chat.hidden,false); assert.equal(input.disabled,false);
   assert.equal(approve.disabled,true,'Image-dependent approval stays disabled until the image loads');
 });
-
-// Run the actual application in a minimal DOM host. No browser or network is used.
-async function application(access = reviewer, preview = false) {
-  const listeners = new Map();
-  const nodes = new Map();
-  function node(name) {
-    if (!nodes.has(name)) nodes.set(name, Object.assign(element(), {
-      innerHTML:'', textContent:'', dataset:{}, isConnected:true, value:'',
-      addEventListener:(kind, handler) => listeners.set(name+':'+kind,handler),
-      querySelector:() => null, replaceChildren() {}, append() {}, focus() {},
-      close() { this.open=false; }, showModal() { this.open=true; },
-    }));
-    return nodes.get(name);
-  }
-  const document = {
-    body:Object.assign(node('body'), {dataset:{mode:preview?'preview':'live'}}),
-    querySelector:node, querySelectorAll:() => [],
-    addEventListener:(kind,handler) => listeners.set('document:'+kind,handler),
-  };
-  const data = {access, businesses:[{id:'one',name:'Компания'}], business:{id:'one',name:'Компания',
-    timezone:'Europe/Moscow',profile_version:1,profile_confirmed:true,channel_id:'@example'},
-    counts:{},sources:[],posts:[]};
-  const requests = [];
-  const window = {addEventListener() {},scrollTo() {},
-    Telegram:{WebApp:{initData:'test-only',ready() {},expand() {},onEvent() {},isVersionAtLeast:() => false}},
-    TirazhDemoStore:{read:() => ({data:null}),write:() => true},
-    TirazhHTTP:{request:async (url,options) => { requests.push({url,options}); return {ok:true,json:async()=>data}; }},
-  };
-  const context = vm.createContext({window,document,location:{hash:''},history:{replaceState() {}},
-    structuredClone,URLSearchParams,URL,crypto:{randomUUID:() => 'test-id'},Option:function(text,value) { return {text,value}; },
-    getComputedStyle:() => ({getPropertyValue:() => '#ffffff'}),matchMedia:() => ({matches:true}),
-    setTimeout:() => 1,clearTimeout() {},
-  });
-  vm.runInContext(source,context);
-  vm.runInContext(fs.readFileSync(path.join(staticDir,'app.js'),'utf8'),context);
-  await new Promise(resolve => setImmediate(resolve));
-  return {context,nodes,listeners,requests,run:code => vm.runInContext(code,context)};
-}
 
 test('actual app renders reviewer badge/read navigation and rejects crafted mutation events before transport', async () => {
   const app = await application();

@@ -195,6 +195,50 @@ async def harness(tmp_path):
     await runtime.close()
 
 
+async def test_business_menu_explains_setup_generation_and_material_buttons(harness):
+    h = harness
+    business = h.service.create_business(OWNER, "Стекольная компания")
+    await h.send(button=f"business:{business.id}")
+    assert h.last_text.startswith("Компания: Стекольная компания")
+    assert "Следующий шаг: «Добавить описание компании»" in h.last_text
+    labels = {
+        button.callback_data: button.text
+        for row in h.messages[-1].reply_markup.inline_keyboard for button in row
+    }
+    assert labels[f"input:notes:{business.id}"] == "Добавить описание компании"
+    assert labels[f"input:request:{business.id}"] == "Создать посты с AI"
+    assert labels[f"posts:{business.id}"] == "Открыть посты"
+    assert labels[f"input:channel:{business.id}"] == "Подключить канал"
+    await h.send(button=f"input:notes:{business.id}")
+    assert "Компания: Стекольная компания" in h.last_text
+    assert "материал для профиля, а не готовый пост" in h.last_text
+    await h.send(text="Производим архитектурное стекло.")
+    assert "Следующий шаг: «Собрать профиль с AI»" in h.last_text
+    await h.send(button=f"analyze:{business.id}")
+    assert "Следующий шаг: проверьте сведения" in h.last_text
+    business = h.service.get_business(OWNER, business.id)
+    await h.send(button=f"confirm:{business.id}:{business.profile_version}")
+    assert "Следующий шаг: «Подключить канал»" in h.last_text
+
+
+async def test_prompt_names_target_company_and_cancel_returns_to_it_without_saving(harness):
+    h = harness
+    business = await h.ready_business()
+    other = h.service.create_business(OWNER, "Другая компания")
+    await h.send(button=f"business:{other.id}")
+    before = h.service.list_sources(OWNER, business.id)
+    await h.send(button=f"input:notes:{business.id}")
+    assert h.last_text.startswith(f"Компания: {business.name}")
+    assert "/cancel — отменить ввод" in h.last_text
+    assert f"business:{business.id}" in h.buttons
+    await h.send(button=f"business:{business.id}")
+    assert h.last_text.startswith(f"Компания: {business.name}")
+    assert "Следующий шаг: «Создать посты с AI»" in h.last_text
+    await h.send(text="Что ты умеешь?")
+    assert h.ai.calls["intent"] == 1
+    assert h.service.list_sources(OWNER, business.id) == before
+
+
 async def test_complete_bot_workflow_sources_edit_pause_publish_and_report(harness):
     h = harness
     business = await h.ready_business(pdf=True)

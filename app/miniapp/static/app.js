@@ -17,6 +17,7 @@ const labels = {
 };
 const editable = new Set(["review", "approved", "failed", "rejected"]);
 const views = new Set(["overview", "content", "work", "reports", "business"]);
+const viewTitles = {overview: "Главная", content: "Посты", work: "AI-диалог", reports: "Отчёты", business: "Бизнес"};
 const icon = (name) => '<svg class="icon" aria-hidden="true"><use href="#i-' + name + '"></use></svg>';
 const safe = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -322,7 +323,7 @@ async function api(url, body) {
     const error = await response.json().catch(() => ({}));
     throw new Error(error.error || "Сервис временно недоступен.");
   }
-  return response.json();
+  return response.json().catch(() => { throw new Error("Приложение вернуло неожиданный ответ. Возможно, ссылка на студию устарела."); });
 }
 function postArt(post, additionalClass = "") {
   const localImage = demo && demoAssets.get(post.image_asset_id);
@@ -457,13 +458,19 @@ function setupProgress() {
     [Boolean(b.channel_id), "Канал", "channel", "Подключите тестовый Telegram-канал"],
   ];
   const done = steps.filter(s => s[0]).length;
+  const next = steps.find(step => !step[0]);
+  const nextDetail = next?.[1] === "Канал" ? "Подключите тестовый Telegram-канал, чтобы создавать посты. В AI-диалоге уже можно задавать вопросы о компании."
+    : next?.[1] === "Профиль" ? "Проверьте сведения о компании и подтвердите профиль перед подготовкой постов."
+      : "Добавьте описание, страницу сайта или PDF. На их основе AI подготовит профиль компании.";
   return '<section class="setup-panel panel"><div class="section-top"><div><p class="eyebrow">НАСТРОЙКА КОМПАНИИ</p>'
     + '<h2>' + (done === 3 ? "Всё готово к работе" : "Ещё " + (3 - done) + (done === 2 ? " шаг" : " шага") + " до первого поста")
-    + '</h2></div><span class="setup-count">' + done + '/3</span></div><div class="setup-steps">'
-    + steps.map(([complete, title, action, detail], i) => '<button class="setup-step ' + (complete ? "complete" : "")
-      + '" data-action="' + action + '"><span class="setup-number">' + (complete ? icon("check") : i + 1)
+    + '</h2></div><span class="setup-count">' + done + '/3</span></div>'
+    + (next ? '<p class="setup-next-step"><strong>Следующий шаг: ' + safe(next[1].toLocaleLowerCase("ru")) + '.</strong> ' + nextDetail + '</p>' : '')
+    + '<div class="setup-steps">'
+    + steps.map(([complete, title, action, detail], i) => '<' + (complete ? 'div' : 'button type="button"') + ' class="setup-step ' + (complete ? "complete" : "")
+      + '"' + (complete ? '' : ' data-action="' + action + '"') + '><span class="setup-number">' + (complete ? icon("check") : i + 1)
       + '</span><span><strong>' + title + '</strong><small>' + (complete ? "Готово" : detail) + '</small></span>'
-      + icon("next") + '</button>').join("") + '</div></section>';
+      + (complete ? '' : icon("next")) + '</' + (complete ? 'div' : 'button') + '>').join("") + '</div></section>';
 }
 function overview() {
   const b = state.business;
@@ -472,8 +479,8 @@ function overview() {
   return '<div class="workspace-home"><section class="workspace-hero"><div><p class="press-kicker">КОНТЕНТ-СТУДИЯ</p>'
     + '<h1>От идеи к публикации.</h1><p class="hero-description">' + safe(b.name) + ' · '
     + (ready ? "Всё для контента в одном пространстве." : "Давайте настроим пространство компании.") + '</p>'
-    + '<div class="press-actions">' + button("Создать пост", "manual-post", "primary", "plus")
-    + button("Автоподготовка", "automation", "secondary", "spark") + '</div>'
+    + '<div class="press-actions">' + button("Сгенерировать с AI", "new-post", "primary", "spark")
+    + button("Создать вручную", "manual-post", "secondary", "plus") + '</div>'
     + '<p class="approval-note">' + icon("check") + 'Каждый пост выходит только после вашего согласования.</p></div>'
     + pressArt("draft", "workspace-illustration") + '</section>'
     + (!ready && canWrite() ? setupProgress() : '')
@@ -498,7 +505,7 @@ function overview() {
       : '<div class="empty">Здесь появятся тексты и изображения, подготовленные по вашим материалам.</div>') + '</section>'
     + '<section class="assistant-strip panel"><span class="press-badge">' + icon("telegram") + '</span><div>'
     + '<strong>Можно просто написать в Telegram</strong><p>Поставьте задачу своими словами. AI учитывает профиль компании и историю диалога.</p>'
-    + '</div><button class="text-button" data-view="work">Задачи ' + icon("arrow") + '</button></section></div>';
+    + '</div><button class="text-button" data-view="work">AI-диалог ' + icon("arrow") + '</button></section></div>';
 }
 const jobLabels = {pending: "В очереди", running: "Готовится", done: "Готово", failed: "Ошибка", cancelled: "Отменено"};
 const stageLabels = {queued: "Ожидает запуска", plan: "Контент-план", text: "Текст публикации", image: "Создание изображения",
@@ -515,7 +522,7 @@ function workView() {
   const b = controls.business || state.business;
   const usage = controls.usage || {};
   const jobs = controls.jobs || [];
-  return headline("Управление", "Задачи и расписание", "Регулярная подготовка, очередь и история работы AI.",
+  return headline("AI-маркетолог", "Диалог и задачи", "Задавайте вопросы о компании или поручайте подготовить пост. Ниже — очередь и расписание.",
     button("Обновить", "refresh", "secondary", "refresh"))
     + '<section class="chat-panel panel"><h2>Диалог с маркетологом</h2><p>Пишите обычным языком. История хранится отдельно для «' + safe(state.business.name) + '».</p>'
     + '<div class="conversation" aria-live="polite">' + conversationView() + '</div>'
@@ -604,7 +611,7 @@ function calendarView() {
     + '<div class="cal-legend"><span><i class="approved"></i>Согласовано</span><span><i class="review"></i>На проверке</span><span><i class="published"></i>Опубликовано</span></div>'
     + '<p class="cal-footnote">Без даты: ' + (calendarData.unscheduled_count || 0) + '. Такие посты доступны в списке. Время показано в часовом поясе компании.</p></section>'
     + '<section class="cal-agenda" aria-live="polite"><div class="section-top"><div><p class="eyebrow">ВЫБРАННЫЙ ДЕНЬ</p><h2>' + safe(selectedLabel) + '</h2></div>'
-    + button("Добавить пост", "manual-post", "secondary", "plus") + '</div>'
+    + button("Добавить вручную", "manual-post", "secondary", "plus") + '</div>'
     + (selectedPosts.length ? postCards(selectedPosts) : '<div class="cal-empty panel">' + icon("calendar")
       + '<strong>' + (searchQuery || statusFilter ? 'Нет постов с такими условиями' : 'Этот день свободен') + '</strong><p>'
       + (searchQuery || statusFilter ? 'Измените запрос или сбросьте фильтры.' : 'Создайте пост и укажите время, чтобы он появился в календаре.') + '</p>'
@@ -613,7 +620,7 @@ function calendarView() {
 function contentView() {
   const filters = [["", "Все"], ["review", "На согласовании"], ["approved", "Запланированы"], ["published", "Опубликованы"], ["failed", "Ошибки"], ["rejected", "Отклонены"], ["delivery_unknown", "Проверить доставку"]];
   return headline("Редакция", "Посты", "Ваши материалы и календарь публикаций.",
-    '<div class="content-create-actions">' + button("Создать", "manual-post", "primary", "plus") + button("С AI", "new-post", "secondary", "spark") + '</div>')
+    '<div class="content-create-actions">' + button("Сгенерировать с AI", "new-post", "primary", "spark") + button("Создать вручную", "manual-post", "secondary", "plus") + '</div>')
     + '<div class="content-toolbar"><form class="content-search" data-search><input name="search" type="search" maxlength="200" value="' + safe(searchQuery)
     + '" aria-label="Поиск по тексту постов" placeholder="Найти пост по тексту…"><button type="submit" class="button secondary">Найти</button></form>'
     + '<div class="content-layout" aria-label="Отображение постов">'
@@ -628,7 +635,7 @@ function contentView() {
       + (content.items.length ? postCards(content.items) : '<div class="cal-empty panel">' + icon("posts") + '<strong>'
         + (searchQuery || statusFilter ? 'Посты не найдены' : 'Начните с первого поста') + '</strong><p>'
         + (searchQuery || statusFilter ? 'Попробуйте другой текст или сбросьте фильтры.' : 'Напишите текст и загрузите изображение — AI для этого не нужен.') + '</p>'
-        + button(searchQuery || statusFilter ? "Сбросить фильтры" : "Создать пост", searchQuery || statusFilter ? "clear-search" : "manual-post", "secondary", "plus") + '</div>')
+        + button(searchQuery || statusFilter ? "Сбросить фильтры" : "Добавить первый пост вручную", searchQuery || statusFilter ? "clear-search" : "manual-post", "secondary", "plus") + '</div>')
       + (content.more ? '<div class="pager">' + button("Показать ещё", "more", "secondary") + '</div>' : ""));
 }
 function reportView() {
@@ -675,18 +682,38 @@ function businessView() {
     + button(b.channel_id ? "Изменить канал" : "Подключить канал", "channel", "secondary", "telegram")
     + '</section></div></div>';
 }
+function updateNavigation() {
+  document.querySelectorAll("nav [data-view]").forEach((button) => {
+    if (button.dataset.view === view) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  });
+  syncBackButton();
+}
+function showPageState(error = null) {
+  updateNavigation();
+  root.setAttribute("aria-busy", error ? "false" : "true");
+  root.dataset.screen = error ? "error" : "loading";
+  root.dataset.business = "";
+  root.dataset.requestedScreen = view;
+  const company = state.businesses.find(entry => entry.id === businessId)?.name || "Контент-студия";
+  const message = error ? '<section class="notice navigation-error" role="alert"><h2>Раздел не загрузился</h2><p>'
+    + safe(error.message) + '</p>' + (!demo ? '<p>Если связь не восстанавливается, закройте студию, отправьте боту <strong>/menu</strong> и откройте её по новой кнопке. Старая ссылка могла перестать работать.</p>' : '')
+    + button("Повторить загрузку", "refresh", "primary", "refresh") + '</section>'
+    : '<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>Загружаем раздел…</div>'
+      + '<p class="loading-hint">Можно перейти в другой раздел, пока идёт загрузка.</p>';
+  root.innerHTML = headline(company, viewTitles[view], error ? "" : "Получаем актуальные данные компании.") + message;
+  applyAccess();
+}
 function render() {
   const b = state.business;
   workspace.replaceChildren(...state.businesses.map((entry) => new Option(entry.name, entry.id)));
   workspace.disabled = !b;
   if (!b) workspace.append(new Option("Нет бизнеса", ""));
   else workspace.value = b.id;
-  document.querySelectorAll("nav [data-view]").forEach((button) => {
-    if (button.dataset.view === view) button.setAttribute("aria-current", "page");
-    else button.removeAttribute("aria-current");
-  });
+  updateNavigation();
   root.setAttribute("aria-busy", "false");
   root.dataset.business = b?.id || "";
+  delete root.dataset.requestedScreen;
   const nextScreen = b ? view : "empty";
   const screenChanged = root.dataset.screen !== nextScreen;
   root.dataset.screen = nextScreen;
@@ -709,11 +736,12 @@ function render() {
 function postQuery(page) {
   return new URLSearchParams({page: String(page), ...(statusFilter ? {status: statusFilter} : {}), ...(searchQuery ? {search: searchQuery} : {})});
 }
-async function loadPage() {
+async function loadPage({transition = false} = {}) {
   const epoch = ++pageRequest;
   const id = businessId;
   const screen = view;
   const current = () => epoch === pageRequest && id === businessId && screen === view;
+  if (transition) showPageState();
   if (!id) { render(); return true; }
   try {
     if (screen === "content") {
@@ -743,15 +771,17 @@ async function loadPage() {
     if (!current()) return false;
     render();
     return true;
-  } catch (error) { if (!current()) return false; throw error; }
+  } catch (error) { if (!current()) return false; if (transition) showPageState(error); throw error; }
 }
-async function refresh() {
+async function refresh({transition = false} = {}) {
   const epoch = ++stateRequest;
   // Invalidate page responses immediately, including while the new state is in flight.
   ++pageRequest;
+  if (transition) showPageState();
   try {
     const result = await api("/state" + (businessId ? "?business=" + path(businessId) : ""));
     if (epoch !== stateRequest) return false;
+    if (!Array.isArray(result?.businesses)) throw new Error("Не удалось прочитать данные приложения. Откройте студию по новой кнопке в меню бота.");
     state = result;
     applyAccess();
     if (!demo && state.runtime_mode === "demo") {
@@ -761,7 +791,7 @@ async function refresh() {
     businessId = state.business?.id || "";
     persistDemo();
     return await loadPage();
-  } catch (error) { if (epoch !== stateRequest) return false; throw error; }
+  } catch (error) { if (epoch !== stateRequest) return false; if (transition) showPageState(error); throw error; }
 }
 async function navigate(next, filter = "") {
   if (!views.has(next)) return;
@@ -769,9 +799,9 @@ async function navigate(next, filter = "") {
   statusFilter = filter;
   selectionFeedback();
   history.replaceState(null, "", "#" + next);
-  if (!await refresh()) return;
   root.focus({preventScroll: true});
   window.scrollTo({top: 0, behavior: "instant"});
+  if (!await refresh({transition: true})) return;
 }
 function showDialog(html) {
   dialogBody.innerHTML = html;
@@ -891,7 +921,7 @@ document.addEventListener("click", async (event) => {
     if (action === "content-layout") {
       contentLayout = control.dataset.layout;
       if (contentLayout === "calendar" && !calendarMonth) { selectedDay = dayKey(new Date()); calendarMonth = selectedDay.slice(0, 7); }
-      await loadPage();
+      await loadPage({transition: true});
     } else if (action === "calendar-day") {
       selectedDay = control.dataset.date; render();
       root.querySelector('[data-date="' + selectedDay + '"]')?.focus({preventScroll:true});
@@ -902,9 +932,9 @@ document.addEventListener("click", async (event) => {
         const next = new Date(Date.UTC(year, month - 1 + (action === "calendar-next" ? 1 : -1), 1));
         calendarMonth = next.toISOString().slice(0, 7); selectedDay = calendarMonth + "-01";
       }
-      await loadPage();
+      await loadPage({transition: true});
     } else if (action === "clear-search") {
-      searchQuery = ""; statusFilter = ""; await loadPage();
+      searchQuery = ""; statusFilter = ""; await loadPage({transition: true});
     } else if (action === "reset-demo") {
       showDialog(dialogHeading("Сбросить демо?", "Созданные в этом браузере тестовые компании, посты, изображения и диалоги будут удалены. Откроются исходные примеры.")
         + '<div class="dialog-actions">' + button("Сбросить тестовые данные", "confirm-reset-demo", "primary") + button("Отмена", "close", "secondary") + '</div>');
@@ -937,7 +967,7 @@ document.addEventListener("click", async (event) => {
         + '<label class="form-row"><span>Дата и время (необязательно)</span><input name="scheduled_at" type="datetime-local"></label>'
         + '<p class="manual-hint">Ввод в часовом поясе устройства. Календарь покажет время в ' + safe(state.business.timezone) + '.</p>', "Сохранить черновик");
     } else if (action === "refresh") {
-      if (await refresh()) notify("Данные обновлены.");
+      if (await refresh({transition: true})) notify("Данные обновлены.");
     } else if (action === "retry-image") {
       const node = control.closest("[data-asset]");
       imageUrls.delete(node.dataset.asset);
@@ -1131,7 +1161,7 @@ root.addEventListener("submit", async (event) => {
   const form = event.target;
   if (form.matches("[data-search]")) {
     event.preventDefault(); searchQuery = form.elements.search.value.trim();
-    try { await loadPage(); } catch (error) { announceError(error); }
+    try { await loadPage({transition: true}); } catch (error) { announceError(error); }
     return;
   }
   if (!form.matches("[data-chat]")) return;
@@ -1238,7 +1268,7 @@ root.addEventListener("keydown", async event => {
   event.preventDefault();
   const next = new Date(day.dataset.date + 'T12:00:00Z'); next.setUTCDate(next.getUTCDate() + shifts[event.key]);
   selectedDay = next.toISOString().slice(0,10);
-  if (!selectedDay.startsWith(calendarMonth)) { calendarMonth = selectedDay.slice(0,7); await loadPage(); } else render();
+  if (!selectedDay.startsWith(calendarMonth)) { calendarMonth = selectedDay.slice(0,7); await loadPage({transition: true}); } else render();
   root.querySelector('[data-date="' + selectedDay + '"]')?.focus({preventScroll:true});
 });
 document.addEventListener("input", event => {
@@ -1251,7 +1281,7 @@ workspace.addEventListener("change", async () => {
   dialog.close();
   businessId = workspace.value;
   searchQuery = ""; calendarMonth = ""; selectedDay = ""; persistDemo();
-  try { await refresh(); } catch (error) { announceError(error); }
+  try { await refresh({transition: true}); } catch (error) { announceError(error); }
 });
 window.addEventListener("pagehide", () => {
   for (const pending of imageUrls.values()) void pending.then((url) => { if (url) URL.revokeObjectURL(url); });
@@ -1279,9 +1309,4 @@ if (demo) {
   if (restoredDemo.issue) notify(restoredDemo.issue);
 }
 useTheme();
-void refresh().catch((error) => {
-  root.setAttribute("aria-busy", "false");
-  root.innerHTML = headline("САЛАВАТСТЕКЛО", "Контент-студия", "Telegram Mini App")
-    + '<div class="notice" role="alert">' + safe(error.message) + '</div>'
-    + button("Повторить загрузку", "refresh", "primary");
-});
+void refresh({transition: true}).catch(() => {}); // Persistent recovery is rendered by refresh.

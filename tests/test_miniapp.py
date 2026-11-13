@@ -46,6 +46,14 @@ def test_init_data_must_be_recent_and_untampered():
 @pytest.mark.parametrize("url", [
     "http://pulse.example/mini/", "https://user@pulse.example/mini/",
     "https://pulse.example/mini/?foo=bar", "https://pulse.example/other/",
+    "https://pulse.example:8443/mini/", "https://127.0.0.1:8443/mini/",
+    "https://ts.net:8443/mini/", "https://.ts.net:8443/mini/",
+    "https://demo.ts.net.attacker.example:8443/mini/", "https://notts.net:8443/mini/",
+    "http://demo.tailtest.ts.net:8443/mini/", "https://demo.tailtest.ts.net:10000/mini/",
+    "https://user:password@demo.tailtest.ts.net:8443/mini/",
+    "https://demo.tailtest.ts.net:8443/other/", "https://demo.tailtest.ts.net:8443/mini",
+    "https://demo.tailtest.ts.net:8443/mini/?foo=bar",
+    "https://demo.tailtest.ts.net:8443/mini/#content", "https://demo.tailtest.ts.net:8443/mini/\n",
 ])
 def test_live_url_requires_https_and_exact_path(url):
     with pytest.raises(InvalidInput, match="MINI_APP_URL"):
@@ -53,6 +61,19 @@ def test_live_url_requires_https_and_exact_path(url):
             mode="live", owner_id=OWNER, telegram_bot_token=TOKEN, ai_factory="app.test:ai",
             image_factory="app.test:image", bot_factory="app.bot.adapter:build_bot", mini_app_url=url,
         )
+
+
+@pytest.mark.parametrize("url", [
+    "https://pulse.example/mini/", "https://pulse.example:443/mini/",
+    "https://demo.tailtest.ts.net/mini/", "https://demo.tailtest.ts.net:443/mini/",
+    "https://demo.tailtest.ts.net:8443/mini/", "https://DEMO.TAILTEST.TS.NET:8443/mini/",
+])
+def test_live_url_accepts_standard_https_and_separate_tailscale_funnel_port(url):
+    settings = Settings(
+        mode="live", owner_id=OWNER, telegram_bot_token=TOKEN, ai_factory="app.test:ai",
+        image_factory="app.test:image", bot_factory="app.bot.adapter:build_bot", mini_app_url=url,
+    )
+    assert settings.mini_app_url == url
 
 
 async def test_demo_preview_never_exposes_the_live_api():

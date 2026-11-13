@@ -85,7 +85,7 @@ def configuration():
     if not path.is_file() or path.is_symlink():
         raise RuntimeError("Создайте локальный .env по .env.live.example.")
     load_dotenv(path, override=False, interpolate=False)
-    os.environ["MINI_APP_URL"] = "https://pending.localhost.run/mini/"
+    os.environ["MINI_APP_URL"] = os.environ.get("WINDOWS_PUBLIC_URL", "").strip() or "https://pending.localhost.run/mini/"
     settings = Settings.from_env(path)
     if settings.mode != "live" or settings.mini_app_host != "127.0.0.1":
         raise RuntimeError("Для этого запуска нужны APP_MODE=live и MINI_APP_HOST=127.0.0.1.")
@@ -157,8 +157,9 @@ async def supervise(settings):
     from app.core.instance_lock import InstanceLock
     from app.core.runtime import run_application
 
-    ssh = shutil.which("ssh")
-    if not ssh:
+    fixed_url = os.environ.get("WINDOWS_PUBLIC_URL", "").strip()
+    ssh = shutil.which("ssh") if not fixed_url else None
+    if not fixed_url and not ssh:
         raise RuntimeError("Установите Windows OpenSSH Client.")
     STATE.mkdir(parents=True, exist_ok=True)
     with InstanceLock(STATE / "supervisor.lock"):
@@ -183,6 +184,29 @@ async def supervise(settings):
         next_probe = 0
         watchdog = TunnelWatchdog()
         try:
+            if fixed_url:
+                # The configured HTTPS proxy owns reconnection. Keep the runtime and
+                # in-flight work alive when the public network is temporarily unavailable.
+                url = settings.mini_app_url
+                save_state(url, "starting")
+                app = asyncio.create_task(run_application(settings), name="windows-demo-app")
+                print("Mini App (постоянный адрес): " + url, flush=True)
+                while not stop.is_set():
+                    if stop_file.exists():
+                        stop.set()
+                        break
+                    if app.done():
+                        app.result()
+                        raise RuntimeError("Бот завершился. Проверьте журнал; автоматического повторного запуска отправок нет.")
+                    if loop.time() >= next_probe:
+                        local_ok, public_ok = await asyncio.gather(
+                            asyncio.to_thread(healthy_endpoint, f"http://127.0.0.1:{settings.mini_app_port}/mini/health", local=True),
+                            asyncio.to_thread(healthy_endpoint, url + "health"),
+                        )
+                        next_probe = loop.time() + HEALTH_INTERVAL
+                        save_state(url, "ready" if local_ok and public_ok else "degraded")
+                    await asyncio.sleep(1)
+                return
             while not stop.is_set():
                 job = WindowsJob()
                 # Gate before SSH startup so the owner exiting cannot leave a tunnel behind.

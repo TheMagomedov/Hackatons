@@ -12,7 +12,7 @@ const upload = {name:'manual.png',mimeType:'image/png',buffer:png};
   await page.goto(url); assert.equal(await page.locator('body').getAttribute('data-mode'),'preview');
   const nav=name=>page.locator(`.dock [data-view="${name}"]`).click();
   await nav('content');
-  await page.getByRole('button',{name:'Создать',exact:true}).click();
+  await page.getByRole('button',{name:'Создать вручную',exact:true}).click();
   await page.locator('textarea[name="text"]').fill('Ручной материал о стеклянных перегородках');
   await page.locator('input[name="image"]').setInputFiles(upload);
   await page.locator('.manual-image-preview img').waitFor();

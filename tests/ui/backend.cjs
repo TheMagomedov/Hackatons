@@ -99,7 +99,7 @@ async function stopFixture(child) {
   await page.locator('input[name="value"]').fill('@qa_channel');
   await page.getByRole('button',{name:'Проверить канал',exact:true}).click();
   await page.locator('.dock [data-view="content"]').click();
-  await page.getByRole('button',{name:'С AI',exact:true}).click();
+  await page.getByRole('button',{name:'Сгенерировать с AI',exact:true}).click();
   await page.locator('textarea[name="request"]').fill('Один пост о компании');
   await page.getByRole('button',{name:'Поставить в очередь',exact:true}).click();
   await page.locator('.post-card').first().waitFor({timeout:15000});
@@ -199,7 +199,7 @@ async function stopFixture(child) {
   await page.getByRole('button',{name:'Проверить канал',exact:true}).click();
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness);
   await page.locator('.dock [data-view="content"]').click();
-  await page.getByRole('button',{name:'Создать',exact:true}).click();
+  await page.getByRole('button',{name:'Создать вручную',exact:true}).click();
   await page.locator('textarea[name="text"]').fill('Ручной пост с настоящим сохранением изображения');
   const manualImage={name:'manual.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAO0lEQVR4nO3RQREAMAjEwKNiK6ty0FUJ4cMvK+CYCdXvZtNZXY8HBvwBMhEyETIRMhEyETIRMhEyUcgHP4UCCnaFLHEAAAAASUVORK5CYII=','base64')};
   await page.locator('input[name="image"]').setInputFiles(manualImage);
@@ -210,7 +210,7 @@ async function stopFixture(child) {
   await page.getByRole('button',{name:'Сохранить черновик',exact:true}).click();
   assert.equal(await page.locator('input[name="image"]').isDisabled(),true,'Cannot change selected image during upload');
   await page.getByRole('button',{name:'Закрыть',exact:true}).click();
-  await page.getByRole('button',{name:'Создать',exact:true}).click();
+  await page.getByRole('button',{name:'Создать вручную',exact:true}).click();
   await page.locator('textarea[name="text"]').fill('Новый открытый редактор');
   releaseUpload();
   const manualPost=await(await savedDraft).json();
@@ -331,7 +331,8 @@ async function stopFixture(child) {
   releasePosts();await (await delayedPosts).finished();
   await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness,'Old page cannot revert workspace selection while the new state is pending');
-  assert.equal(await page.locator('#main').getAttribute('data-screen'),'overview','Old page cannot render during another company selection');
+  assert.equal(await page.locator('#main').getAttribute('data-screen'),'loading','Loading stays visible while the next company state is pending');
+  assert.equal(await page.locator('#main').getAttribute('data-business'),'','Old company content must not remain actionable during the switch');
   releaseNextState();
   await page.locator('.post-card[data-id="'+manualPost.id+'"]').waitFor();
   assert.equal(await page.locator('#workspace').inputValue(),manualBusiness);
