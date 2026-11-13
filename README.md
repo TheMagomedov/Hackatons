@@ -1,6 +1,6 @@
 # САЛАВАТСТЕКЛО · Контент-студия
 
-Передача интерфейса следующему разработчику: [карта файлов, режимы, API и подключение модели](docs/FRONTEND_HANDOFF.md).
+Передача следующему разработчику: [получение проекта и перенос рабочего окружения](docs/DEVELOPER_TRANSFER.md), [карта интерфейса, режимы, API и подключение модели](docs/FRONTEND_HANDOFF.md).
 
 Прототип автономного AI-маркетолога для хакатона «Кибер 102»: Telegram-бот и Mini App, знания компании → диалог с памятью → текст и изображение → согласование конкретной версии → публикация по расписанию → отчёт.
 
@@ -10,7 +10,7 @@
 
 Для команды: [соответствие 12 критериям и ограничения](docs/BRIEF_COMPLIANCE.md), [сценарий защиты](docs/DEMO_SCRIPT.md), [месячные расходы](docs/COSTS.md), [Mini App и HTTPS](docs/MINI_APP.md), [локальный запуск бота и студии](docs/LOCAL_RUN.md).
 
-[Проверки интегрированной версии](docs/VALIDATION.md): 521 тест, 199 подтестов, браузерные сценарии и Docker. Ручной цикл отдельно проверен без подключённой нейросети. Настоящий бот открывает Mini App через HTTPS; в Telegram проверены создание компании и сохранение профиля владельцем. Канал не подключён, реальная публикация и постоянный серверный запуск ещё не проверены.
+[Проверки интегрированной версии](docs/VALIDATION.md): 521 тест, 199 подтестов, браузерные сценарии и Docker. Ручной цикл отдельно проверен без подключённой нейросети. Настоящий бот открывает Mini App через HTTPS; в Telegram проверены создание компании, подтверждение профиля и подключение приватного тестового канала с правом бота публиковать. Через рабочий API сохранены изображение и ручной черновик. Реальная публикация и постоянный серверный запуск ещё не проверены.
 
 ![Демонстрационный интерфейс контент-студии САЛАВАТСТЕКЛО](docs/screenshots/miniapp-desktop.png)
 
@@ -38,12 +38,12 @@
 
 ## Быстрый запуск без ключей
 
-Нужны Git и Python 3.11+. До принятия изменений используйте ветку `codex/task-aligned-miniapp`.
+Нужны Git и Python 3.11+.
 
 ### Windows / PowerShell
 
 ```powershell
-git clone --branch codex/task-aligned-miniapp https://github.com/TheMagomedov/Hackatons.git
+git clone https://github.com/TheMagomedov/Hackatons.git
 cd Hackatons
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
@@ -53,7 +53,7 @@ python -m venv .venv
 ### Linux / macOS
 
 ```bash
-git clone --branch codex/task-aligned-miniapp https://github.com/TheMagomedov/Hackatons.git
+git clone https://github.com/TheMagomedov/Hackatons.git
 cd Hackatons
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
