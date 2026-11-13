@@ -66,7 +66,9 @@ async def test_bot_owner_onboarding_queue_preview_and_stale_approval(tmp_path, m
                 await dispatcher.feed_update(bot, Update.model_validate({"update_id": uid, **event}))
 
             await send(text="/start", actor=77)
-            assert "владелец" in session.requests[-1].text
+            assert "приглашение команды" in session.requests[-1].text
+            assert session.requests[-1].reply_markup is None
+            assert service.access_role(77) is None
             await send(text="/start")
             assert "САЛАВАТСТЕКЛО · Контент-студия" in session.requests[-1].text
             await send(button="input:name")

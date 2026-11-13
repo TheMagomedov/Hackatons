@@ -22,6 +22,7 @@ from app.core import runtime as runtime_module
 from app.core.demo import run_demo
 from app.core.instance_lock import InstanceLock
 from app.core.runtime import Runtime, build_runtime, load_factory, run_application
+from app.safety import ModeratedAI, ModeratedImages
 from app.shared.errors import Conflict, InvalidInput
 from app.storage import Repository
 
@@ -142,8 +143,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.module.images.assert_called_once_with(settings)
         self.module.reporter.assert_called_once_with(settings)
         self.module.bot.assert_called_once_with(runtime.service, settings)
-        self.assertIs(runtime.service.ai, self.ai)
-        self.assertIs(runtime.service.images, self.images)
+        self.assertIsInstance(runtime.service.ai, ModeratedAI)
+        self.assertIsInstance(runtime.service.images, ModeratedImages)
+        self.assertIs(runtime.service.ai.provider, self.ai)
+        self.assertIs(runtime.service.images.provider, self.images)
+        self.assertIs(runtime.service.ai.policy, runtime.service.safety)
+        self.assertIs(runtime.service.images.policy, runtime.service.safety)
         self.assertIs(runtime.service.reporter, self.reporter)
         self.assertIs(runtime.bot, self.bot)
         self.assertIs(runtime.service.notifier, self.bot)

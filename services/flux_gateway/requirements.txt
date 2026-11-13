@@ -1,0 +1,2 @@
+# Gateway dependency only; ComfyUI, translator and moderation are separate services.
+Pillow==13.0.0

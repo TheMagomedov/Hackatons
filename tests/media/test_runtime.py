@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch, sentinel
 
 from app.config import Settings
+from app.media.branding import SalavatBrandingProvider
 from app.media.demo import DemoImageProvider
 from app.media.provider import build_provider as configured_provider
 from app.media.runtime import UnconfiguredImages, build_provider
@@ -81,7 +82,9 @@ class RuntimeImageConfigurationTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, environment, clear=True), patch(
             "app.media.runtime.configured_provider", return_value=sentinel.images
         ) as constructor:
-            self.assertIs(build_provider(settings), sentinel.images)
+            images = build_provider(settings)
+            self.assertIsInstance(images, SalavatBrandingProvider)
+            self.assertIs(images._provider, sentinel.images)
             constructor.assert_called_once_with(
                 settings, api_key=environment["IMAGE_API_KEY"], model=environment["IMAGE_MODEL"],
                 endpoint="https://images.example.invalid/custom/v1/images/generations",

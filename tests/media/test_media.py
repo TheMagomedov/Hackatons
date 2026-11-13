@@ -4,12 +4,13 @@ import binascii
 import io
 import json
 import socket
+import ssl
 import struct
 import threading
 import unittest
 import urllib.error
 import urllib.request
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pydantic import ValidationError
 
@@ -485,6 +486,59 @@ class ConfigurationAndValidationTests(unittest.TestCase):
                         b"abc",
                     )
                 self.assertEqual(opener.calls, 1)
+
+    def test_private_endpoints_bypass_proxy_without_weakening_tls_or_redirects(self):
+        endpoints = (
+            "https://lsrx.tail33164d.ts.net/flux-api/v1/images/generations",
+            "https://LSRX.TAIL33164D.TS.NET./flux-api/v1/images/generations",
+            "https://localhost/images/generations",
+            "https://localhost./images/generations",
+            "https://127.0.0.1/images/generations",
+            "https://127.15.16.17/images/generations",
+            "https://[::1]/images/generations",
+        )
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                response = io.BytesIO(b"ok")
+                response.status = 200
+                response.headers = {}
+                opener = Mock()
+                opener.open.return_value = response
+                with patch("app.media.openai.urllib.request.build_opener", return_value=opener) as build:
+                    request = urllib.request.Request(endpoint, headers={"Authorization": "Bearer test-key"})
+                    self.assertEqual(UrllibImageTransport().send(request, 3, 10), b"ok")
+                handlers = build.call_args.args
+                proxies = [handler for handler in handlers if isinstance(handler, urllib.request.ProxyHandler)]
+                self.assertEqual(len(proxies), 1)
+                self.assertEqual(proxies[0].proxies, {})
+                self.assertTrue(any(isinstance(handler, _NoRedirects) for handler in handlers))
+                tls = next(handler for handler in handlers if isinstance(handler, urllib.request.HTTPSHandler))
+                self.assertTrue(tls._context.check_hostname)
+                self.assertEqual(tls._context.verify_mode, ssl.CERT_REQUIRED)
+                opener.open.assert_called_once_with(request, timeout=3)
+                self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+
+    def test_other_endpoints_retain_default_proxy_settings(self):
+        endpoints = (
+            "https://api.openai.com/v1/images/generations",
+            "https://lsrx.tail33164d.ts.net.attacker.example/images/generations",
+            "https://localhost.attacker.example/images/generations",
+            "https://notlocalhost/images/generations",
+            "https://192.168.1.1/images/generations",
+            "https://[2001:db8::1]/images/generations",
+        )
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                response = io.BytesIO(b"ok")
+                response.status = 200
+                response.headers = {}
+                opener = Mock()
+                opener.open.return_value = response
+                with patch("app.media.openai.urllib.request.build_opener", return_value=opener) as build:
+                    UrllibImageTransport().send(urllib.request.Request(endpoint), 3, 10)
+                self.assertFalse(any(
+                    isinstance(handler, urllib.request.ProxyHandler) for handler in build.call_args.args
+                ))
 
 
 if __name__ == "__main__":

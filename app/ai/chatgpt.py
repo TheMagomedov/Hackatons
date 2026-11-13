@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import signal
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -46,15 +48,26 @@ class ChatGPTClient:
         self.timeout = timeout
         self.env = {key: value for key, value in os.environ.items() if key in _ENV_KEYS}
         self._processes: set[asyncio.subprocess.Process] = set()
+        self._jobs = {}
+        self._closed = False
 
     async def close(self):
+        self._closed = True
         for process in tuple(self._processes):
             await self._stop(process)
 
-    @staticmethod
-    async def _stop(process):
-        """Stop the private process group, including the npm launcher's native child."""
-        if process.returncode is None:
+    async def _stop(self, process):
+        """Stop the owned process tree, including children after their launcher exits."""
+        if os.name == "nt":
+            job = self._jobs.pop(process, None)
+            if job is not None:
+                job.close()
+            if process.returncode is None:
+                try:
+                    process.kill()  # Also covers a runner whose job assignment failed.
+                except ProcessLookupError:
+                    pass
+        elif process.returncode is None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -65,19 +78,39 @@ class ChatGPTClient:
             raise ProviderUnavailable("Не удалось завершить локальный процесс ChatGPT CLI.") from None
 
     async def _run(self, arguments, *, cwd=None, prompt=None, capture=False):
-        if os.name != "posix":
-            raise InvalidInput("ChatGPT через Codex CLI пока поддерживается на Linux/macOS. На Windows используйте API.")
-        process = await asyncio.create_subprocess_exec(
-            self.executable, *arguments, cwd=cwd, env=self.env,
-            start_new_session=True,
-            stdin=asyncio.subprocess.PIPE if prompt is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.STDOUT if capture else asyncio.subprocess.DEVNULL,
-        )
+        if self._closed:
+            raise ProviderUnavailable("Локальный процесс ChatGPT CLI остановлен.")
+        command = [self.executable, *arguments]
+        options = {"start_new_session": True}
+        input_bytes = prompt.encode("utf-8") if prompt is not None else None
+        if input_bytes is not None and len(input_bytes) > 700_000:
+            raise InvalidInput("Слишком много данных для одного запроса.")
+        job = None
+        if os.name == "nt":
+            from app.ai._windows_process import WindowsJob
+
+            job = WindowsJob()
+            command = [sys.executable, str(Path(__file__).with_name("_windows_process.py")), *command]
+            options = {"creationflags": subprocess.CREATE_NO_WINDOW}
+            input_bytes = b"\0" + (input_bytes or b"")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, cwd=cwd, env=self.env, **options,
+                stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.STDOUT if capture else asyncio.subprocess.DEVNULL,
+            )
+        except BaseException:
+            if job is not None:
+                job.close()
+            raise
         self._processes.add(process)
         try:
-            output, _ = await process.communicate(prompt.encode() if prompt is not None else None)
-            if process.returncode:
+            if job is not None:
+                self._jobs[process] = job
+                job.assign(process.pid)
+            output, _ = await process.communicate(input_bytes)
+            if self._closed or process.returncode:
                 raise ProviderUnavailable("ChatGPT CLI не выполнил запрос. Проверьте вход, лимит и версию Codex.")
             return (output or b"")[:4096].decode("utf-8", errors="replace")
         finally:
@@ -107,7 +140,7 @@ class ChatGPTClient:
                     shape, result = root / "schema.json", root / "result.json"
                     shape.write_text(json.dumps(strict_schema(schema.model_json_schema())), encoding="utf-8")
                     args = [
-                        "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
+                        "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check",
                         "--sandbox", "read-only", "-c", 'web_search="disabled"',
                         "-c", "project_doc_max_bytes=0", "--enable", "skip_host_skill_discovery",
                     ]
@@ -133,9 +166,10 @@ class ChatGPTClient:
 
 def build_provider(settings: Settings) -> ModelAI:
     """No credentials are read and no process is started during construction."""
-    executable = shutil.which("codex")
+    executable = shutil.which("codex.exe" if os.name == "nt" else "codex")
     if executable is None:
-        raise InvalidInput("Для ChatGPT-режима установите официальный Codex CLI и выполните codex login.")
-    if os.name != "posix":
-        raise InvalidInput("ChatGPT через Codex CLI пока поддерживается на Linux/macOS. На Windows используйте API.")
+        raise InvalidInput(
+            "Для ChatGPT-режима нужен официальный Codex CLI и вход через ChatGPT. "
+            "На Windows добавьте каталог с нативным codex.exe в PATH (.cmd/.ps1 не подходят)."
+        )
     return ModelAI(ChatGPTClient(executable, settings.provider_timeout_seconds), max_posts=settings.max_posts_per_job)

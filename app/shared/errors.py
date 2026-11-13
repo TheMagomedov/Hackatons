@@ -25,6 +25,20 @@ class ProviderUnavailable(AppError):
     code = "provider_unavailable"
 
 
+class SafetyBlocked(AppError):
+    code = "content_blocked"
+
+    def __init__(self):
+        super().__init__("Материал не прошёл проверку безопасности. Измените текст или изображение.")
+
+
+class SafetyUnavailable(AppError):
+    code = "safety_unavailable"
+
+    def __init__(self):
+        super().__init__("Проверка безопасности недоступна. Материал не будет отправлен; повторите позже.")
+
+
 class DeliveryRejected(AppError):
     """Telegram explicitly rejected the request; no message was accepted."""
 

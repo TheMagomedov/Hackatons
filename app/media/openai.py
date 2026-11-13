@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import binascii
+import ipaddress
 import json
 import math
 import socket
@@ -50,7 +51,18 @@ class UrllibImageTransport:
         # hostname/certificate verification to make image generation work.
         context = ssl.create_default_context()
         context.load_verify_locations(cafile=certifi.where())
-        opener = urllib.request.build_opener(_NoRedirects(), urllib.request.HTTPSHandler(context=context))
+        hostname = (urllib.parse.urlsplit(request.full_url).hostname or "").rstrip(".").lower()
+        direct = hostname == "localhost" or hostname.endswith(".ts.net")
+        if not direct:
+            try:
+                direct = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+        handlers = [_NoRedirects(), urllib.request.HTTPSHandler(context=context)]
+        if direct:
+            # Private Tailscale/loopback routes must not go through a VPN's HTTP proxy.
+            handlers.insert(0, urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(*handlers)
         with opener.open(request, timeout=timeout_seconds) as response:
             if response.status != 200:
                 raise InvalidImageResponseError("The image service returned an unexpected status.")

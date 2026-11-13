@@ -12,6 +12,7 @@ from app.ai.client import ChatJSONClient
 from app.config import Settings
 from app.media.openai import UrllibImageTransport
 from app.publishing.telegram import TelegramPublisher
+from app.safety.client import UrllibSafetyTransport
 from app.shared.models import PostStatus
 from tests.ai.test_integration import ModelFixture
 from tests.qa.test_role4_integration import InlineImageTransport
@@ -22,7 +23,7 @@ async def test_all_live_adapters_bot_to_publication_report_and_restart(tmp_path,
     owner, channel = 42, -1001234567890
     now = [datetime(2026, 11, 9, 12, tzinfo=UTC)]
     fixture = ModelFixture()
-    model_requests, telegram_requests = [], []
+    model_requests, telegram_requests, safety_requests = [], [], []
     image_transport = InlineImageTransport()
     publisher_clients = []
 
@@ -68,10 +69,24 @@ async def test_all_live_adapters_bot_to_publication_report_and_restart(tmp_path,
         publisher_clients.append(client)
         return TelegramPublisher(token, client=client)
 
+    def safety_http(_transport, request, timeout):
+        # Keep the real configured live policy and verdict parser; replace network I/O only.
+        assert request.get_header("Authorization") == "Bearer fixture-safety-key"
+        assert request.method == "POST"
+        base = "https://moderator.example.test/v1/safety/"
+        assert request.full_url in (base + "check-text", base + "check-image")
+        is_image = request.full_url.endswith("check-image")
+        assert request.get_header("Content-type") == ("image/png" if is_image else "application/json")
+        assert timeout == (30 if is_image else 90)
+        safety_requests.append((request.full_url, request.data))
+        return b'{"allowed":true,"reason":"","category":"safe"}'
+
     monkeypatch.setenv("AI_API_KEY", "fixture-ai-key")
     monkeypatch.setenv("AI_MODEL", "fixture-text-model")
     monkeypatch.setenv("IMAGE_API_KEY", "fixture-image-key")
     monkeypatch.setenv("IMAGE_MODEL", "fixture-image-model")
+    monkeypatch.setenv("MODERATION_API_BASE", "https://moderator.example.test/v1")
+    monkeypatch.setenv("MODERATION_API_KEY", "fixture-safety-key")
     monkeypatch.setattr(
         ai_module,
         "ChatJSONClient",
@@ -81,6 +96,7 @@ async def test_all_live_adapters_bot_to_publication_report_and_restart(tmp_path,
         ),
     )
     monkeypatch.setattr(UrllibImageTransport, "send", lambda _, *args: image_transport.send(*args))
+    monkeypatch.setattr(UrllibSafetyTransport, "send", safety_http)
     monkeypatch.setattr(runtime_module, "TelegramPublisher", publisher_factory)
     settings = Settings(
         mode="live",
@@ -128,6 +144,7 @@ async def test_all_live_adapters_bot_to_publication_report_and_restart(tmp_path,
         await send(button=f"input:notes:{business.id}")
         await send(text="В меню сырники, тосты и фильтр-кофе.")
         await send(button=f"analyze:{business.id}")
+        assert not safety_requests  # Internal source/profile analysis is not an outgoing post.
         business = service.get_business(owner, business.id)
         assert business.profile is not None
         await send(button=f"confirm:{business.id}:{business.profile_version}")
@@ -143,6 +160,9 @@ async def test_all_live_adapters_bot_to_publication_report_and_restart(tmp_path,
         post = service.list_posts(owner, business.id)[0]
         assert not post.is_demo and post.warnings and post.used_source_ids
         assert len(image_transport.requests) == 1
+        text_batches = [json.loads(body)["texts"] for url, body in safety_requests if url.endswith("check-text")]
+        assert any(post.text in batch for batch in text_batches)
+        assert sum(url.endswith("check-image") for url, _ in safety_requests) == 1
         await send(button=f"post:{post.id}")
         assert any(post.warnings[0] in (getattr(request, "text", "") or "") for request in session.requests)
         await send(button=f"text:{post.id}:{post.revision}")
@@ -160,7 +180,15 @@ async def test_all_live_adapters_bot_to_publication_report_and_restart(tmp_path,
         now[0] += timedelta(minutes=2)
         assert not await service.publish_due_once()
         await send(button=f"resume:{business.id}")
+        safety_before_send = len(safety_requests)
         assert await service.publish_due_once()
+        assert len(safety_requests) == safety_before_send + 2
+        assert safety_requests[-2][0].endswith("/check-text")
+        assert json.loads(safety_requests[-2][1]) == {"texts": [timed.text]}
+        asset, exact_image = service.read_asset(owner, timed.image_asset_id)
+        assert asset.mime_type == "image/png"
+        assert safety_requests[-1][0].endswith("/check-image")
+        assert safety_requests[-1][1] == exact_image
         assert not await service.publish_due_once()
         published = service.get_post(owner, post.id)
         assert published.message_id == 81 and published.status == PostStatus.PUBLISHED

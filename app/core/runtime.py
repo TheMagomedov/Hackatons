@@ -13,6 +13,7 @@ from app.core.instance_lock import InstanceLock
 from app.core.service import BackendService
 from app.miniapp.server import run_live as run_mini_app
 from app.publishing import TelegramNotifier, TelegramPublisher
+from app.safety import ModeratedAI, ModeratedImages, NoopSafety, from_environment
 from app.scheduler import Scheduler
 from app.shared.errors import InvalidInput
 from app.storage import FileStore, Repository
@@ -88,10 +89,12 @@ async def build_runtime(settings: Settings) -> Runtime:
         repository.bind_runtime(settings.mode, settings.owner_id)
         files = FileStore(settings.data_dir / "assets", max_bytes=settings.max_upload_bytes)
         if settings.mode == "demo":
+            safety = NoopSafety()
             ai, images = DemoAI(), DemoImages()
             publisher, notifier, reporter = DemoPublisher(), DemoNotifier(), DemoReporter()
             resources.extend([ai, images, publisher, notifier, reporter])
         else:
+            safety = from_environment()
             ai = _provider(
                 settings,
                 settings.ai_factory,
@@ -99,13 +102,15 @@ async def build_runtime(settings: Settings) -> Runtime:
                 resources,
             )
             images = _provider(settings, settings.image_factory, ("generate",), resources)
+            ai = ModeratedAI(ai, safety)
+            images = ModeratedImages(images, safety)
             reporter = _provider(settings, settings.report_factory, ("build",), resources)
             publisher = TelegramPublisher(settings.telegram_bot_token.get_secret_value())
             resources.append(publisher)
             notifier = TelegramNotifier(settings.telegram_bot_token.get_secret_value())
             resources.append(notifier)
         runtime.service = BackendService(
-            repository, files, settings, ai, images, publisher, notifier, reporter
+            repository, files, settings, ai, images, publisher, notifier, reporter, safety=safety
         )
         if settings.bot_factory:
             if settings.mode != "live":

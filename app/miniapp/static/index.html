@@ -13,6 +13,7 @@
   <!-- TELEGRAM_BRIDGE -->
   <script src="./demo-store.js" defer></script>
   <script src="./transport.js" defer></script>
+  <script src="./access.js" defer></script>
   <script src="./app.js" defer></script>
 </head>
 <body data-mode="preview">
@@ -66,6 +67,10 @@
       </div>
     </header>
     <div id="mode-banner" class="mode-banner" hidden></div>
+    <aside id="access-banner" class="access-banner" role="status" hidden>
+      <strong id="access-label">Просмотр для жюри</strong>
+      <span>Можно смотреть материалы, календарь и историю. Изменения и публикации доступны команде.</span>
+    </aside>
     <main id="main" aria-busy="true" tabindex="-1">
       <div class="loading"><span class="spinner"></span> Загружаем пространство…</div>
     </main>

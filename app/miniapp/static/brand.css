@@ -336,3 +336,9 @@ dialog::backdrop {background:#285055b8}
   .cal-day {min-height:54px;padding-inline:4px}
   .dialog-inner h2 {font-size:21px}
 }
+
+.access-banner {display:flex;align-items:center;gap:12px;margin:16px 0 0;padding:12px 16px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--muted);font-size:13px;line-height:1.5}
+.access-banner strong {flex-shrink:0;color:var(--ink);font-weight:600}
+.access-banner[hidden],[data-write][hidden] {display:none!important}
+.access-note {color:var(--muted);font-size:13px;line-height:1.6}
+@media(max-width:640px) {.access-banner {align-items:flex-start;flex-direction:column;gap:3px;margin-top:12px;font-size:12px}}
