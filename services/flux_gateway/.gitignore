@@ -1,0 +1,12 @@
+api_key.txt
+**/api_key.txt
+*.env
+.env
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+vendor/
+models/
+generated/
+!config.example.env

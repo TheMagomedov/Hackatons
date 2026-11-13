@@ -32,7 +32,7 @@ async def test_chatgpt_keeps_api_credentials_out_and_validates_structured_output
         calls.append((args, kwargs))
         if args == ["login", "status"]:
             return "Logged in using ChatGPT"
-        assert "--ignore-user-config" in args and "--ephemeral" in args
+        assert all(flag in args for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral"))
         assert args[args.index("--sandbox") + 1] == "read-only"
         assert args[args.index("project_doc_max_bytes=0") - 1] == "-c"
         assert args[args.index("skip_host_skill_discovery") - 1] == "--enable"
@@ -112,8 +112,7 @@ async def test_cancellation_kills_cli_and_does_not_leave_background_generation(m
     assert process.killed and not client._processes
 
 
-@pytest.mark.skipif(os.name != "posix", reason="ChatGPT CLI process groups require Linux/macOS")
-@pytest.mark.parametrize("operation", ["cancel", "close"])
+@pytest.mark.parametrize("operation", ["cancel", "close", "timeout"])
 async def test_real_launcher_child_stops_with_parent_without_network(tmp_path, operation):
     """An npm-style launcher spawns a native child; neither may outlive cleanup."""
     child_code = (
@@ -136,28 +135,39 @@ async def test_real_launcher_child_stops_with_parent_without_network(tmp_path, o
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        else:
+        elif operation == "close":
             await client.close()
             with pytest.raises(ProviderUnavailable):
                 await task
+        else:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(task, timeout=0.05)
         await asyncio.sleep(0.6)
         assert not (tmp_path / "continued").exists(), "Native child continued after launcher was stopped"
         assert not client._processes
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        if (tmp_path / "launcher.pid").exists():
+        await client.close()
+        if os.name == "posix" and (tmp_path / "launcher.pid").exists():
             try:
                 os.killpg(int((tmp_path / "launcher.pid").read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
 
 
-def test_windows_adapter_is_rejected_before_launching_a_process(monkeypatch):
-    monkeypatch.setattr("app.ai.chatgpt.shutil.which", lambda _: "codex.cmd")
+def test_windows_adapter_selects_native_executable_without_shell(monkeypatch):
+    looked_up = []
+
+    def which(name):
+        looked_up.append(name)
+        return "C:/Codex/codex.exe"
+
+    monkeypatch.setattr("app.ai.chatgpt.shutil.which", which)
     monkeypatch.setattr("app.ai.chatgpt.os.name", "nt")
-    with pytest.raises(InvalidInput, match="Linux/macOS"):
-        build_provider(Settings())
+    provider = build_provider(Settings())
+    assert provider.client.executable == "C:/Codex/codex.exe"
+    assert looked_up == ["codex.exe"]
 
 
 def test_missing_cli_is_explicit_configuration_error(monkeypatch):
@@ -171,3 +181,52 @@ def test_schema_normalizes_nested_definitions_without_mutating_input():
     transformed = strict_schema(original)
     assert transformed["$defs"]["X"]["required"] == ["x"]
     assert "default" in original["$defs"]["X"]["properties"]["x"]
+
+
+async def test_real_runner_preserves_unicode_stdin_and_filters_private_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "private-bot-token")
+    monkeypatch.setenv("IMAGE_API_KEY", "private-image-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "private-api-key")
+    monkeypatch.setenv("CODEX_API_KEY", "private-codex-key")
+    client = ChatGPTClient(sys.executable, 10)
+    payload = "Стекло, кавычки ' \" и $() & |\nвторая строка"
+    code = (
+        "import json,os,sys; print(json.dumps({'input':sys.stdin.buffer.read().decode('utf-8'),"
+        "'cwd':os.getcwd(),'secret_keys':[k for k in os.environ if k in "
+        "('TELEGRAM_BOT_TOKEN','IMAGE_API_KEY','OPENAI_API_KEY','CODEX_API_KEY')]}))"
+    )
+    result = json.loads(await client._run(["-c", code], cwd=tmp_path, prompt=payload, capture=True))
+    assert result == {"input": payload, "cwd": str(tmp_path), "secret_keys": []}
+    assert not client._processes and not client._jobs
+
+
+async def test_oversized_stdin_never_starts_process(monkeypatch):
+    create = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    with pytest.raises(InvalidInput):
+        await ChatGPTClient(sys.executable, 10)._run(["-c", "pass"], prompt="я" * 350_001)
+    create.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object contract")
+async def test_failed_job_assignment_never_starts_native_child(monkeypatch, tmp_path):
+    def reject(_job, _pid):
+        raise OSError("Job assignment denied")
+
+    monkeypatch.setattr("app.ai._windows_process.WindowsJob.assign", reject)
+    client = ChatGPTClient(sys.executable, 10)
+    with pytest.raises(OSError):
+        await client._run(["-c", "from pathlib import Path; Path('started').touch()"], cwd=tmp_path)
+    assert not (tmp_path / "started").exists()
+    assert not client._processes and not client._jobs
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object contract")
+async def test_job_closes_remaining_child_after_launcher_exits(tmp_path):
+    client = ChatGPTClient(sys.executable, 10)
+    child = "import time; from pathlib import Path; time.sleep(0.7); Path('continued').touch()"
+    launcher = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}])"
+    await client._run(["-c", launcher], cwd=tmp_path)
+    await asyncio.sleep(0.9)
+    assert not (tmp_path / "continued").exists()
+    assert not client._processes and not client._jobs

@@ -36,8 +36,9 @@ from app.shared.models import (
     Source,
     TaskIntent,
 )
+from app.storage.access import AccessRepository
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
@@ -59,7 +60,7 @@ def _new_id() -> str:
     return str(uuid4())
 
 
-class Repository:
+class Repository(AccessRepository):
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
         self._uri = self.db_path == ":memory:"
@@ -135,6 +136,9 @@ class Repository:
                 version = 3
             if version == 3:
                 self._migrate_v3_to_v4(conn)
+                version = 4
+            if version == 4:
+                self._migrate_v4_to_v5(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if version != 0:
@@ -166,6 +170,7 @@ class Repository:
             self._migrate_v1_to_v2(conn)
             self._migrate_v2_to_v3(conn)
             self._migrate_v3_to_v4(conn)
+            self._migrate_v4_to_v5(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -589,7 +594,7 @@ class Repository:
         """The owner's source and unconfirmed profile are one revision and one transaction."""
         with self._transaction() as conn:
             old = self._business(conn, business_id)
-            if old.owner_id != actor_id:
+            if not self._may_operate(conn, old.owner_id, actor_id):
                 raise Forbidden("Нет доступа к этому бизнесу")
             if old.profile_version != expected_version:
                 raise Conflict("Версия профиля изменилась. Откройте актуальный профиль.")
@@ -834,7 +839,7 @@ class Repository:
             business = self._business(conn, business_id)
             manual = any(value is not None for value in (manual_request_id, manual_payload_hash, manual_actor_id))
             if manual:
-                if (job_id is not None or len(items) != 1 or manual_actor_id != business.owner_id
+                if (job_id is not None or len(items) != 1 or not self._may_operate(conn, business.owner_id, manual_actor_id)
                         or not isinstance(manual_request_id, str) or not 1 <= len(manual_request_id) <= 100
                         or not isinstance(manual_payload_hash, str)
                         or re.fullmatch(r"[0-9a-f]{64}", manual_payload_hash) is None):
@@ -1148,8 +1153,8 @@ class Repository:
             post = self._post(conn, post_id)
             self._check_revision(post, expected_revision)
             business = self._business(conn, post.business_id)
-            if actor_id != business.owner_id:
-                raise Forbidden("Согласовывать публикации может только владелец")
+            if not self._may_operate(conn, business.owner_id, actor_id):
+                raise Forbidden("Согласовывать публикации может только владелец или оператор")
             if post.channel_id != business.channel_id:
                 raise Conflict("Канал бизнеса изменился; обновите предпросмотр")
             if post.profile_version != business.profile_version:
@@ -1158,9 +1163,10 @@ class Repository:
                 )
             if business.profile is not None and not business.profile_confirmed:
                 raise Conflict("Подтвердите актуальный профиль бизнеса")
-            if post.status == PostStatus.APPROVED and post.approved_revision == post.revision:
+            if (post.status == PostStatus.APPROVED and post.approved_revision == post.revision
+                    and self._approval_allowed(conn, business.owner_id, post)):
                 return post
-            if post.status != PostStatus.REVIEW:
+            if post.status not in {PostStatus.REVIEW, PostStatus.APPROVED}:
                 raise Conflict("Согласование возможно только из состояния предпросмотра")
             if post.scheduled_at is None or post.scheduled_at <= now:
                 raise InvalidInput("Для согласования выберите время в будущем")
@@ -1210,7 +1216,7 @@ class Repository:
                     continue
                 if (
                     post.approved_revision != post.revision
-                    or post.approved_by != business.owner_id
+                    or not self._approval_allowed(conn, business.owner_id, post)
                     or post.channel_id != business.channel_id
                     or post.profile_version != business.profile_version
                     or (business.profile is not None and not business.profile_confirmed)

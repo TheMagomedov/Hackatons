@@ -7,6 +7,7 @@ const dialogBody = $("#dialog-body");
 const workspace = $("#workspace");
 const toast = $("#toast");
 const demo = document.body.dataset.mode === "preview";
+const accessRules = window.TirazhAccess;
 const telegram = window.Telegram?.WebApp;
 const insideTelegram = Boolean(!demo && telegram?.initData);
 const labels = {
@@ -78,6 +79,7 @@ let stateRequest = 0;
 let toastTimer;
 let watchedJob = 0;
 const imageUrls = new Map();
+const imageTypes = new Map();
 let themeOverride = null;
 let dateFormatter;
 let dateTimezone;
@@ -107,8 +109,26 @@ function selectionFeedback() {
 }
 
 function button(label, action, kind = "primary", glyph = "", attrs = "") {
-  return '<button type="button" class="button ' + kind + '" data-action="' + action + '" ' + attrs + '>'
+  const write = accessRules.requiresWrite(action);
+  if (write && !canWrite()) return "";
+  return '<button type="button" class="button ' + kind + '" data-action="' + action + '" ' + (write ? 'data-write ' : '') + attrs + '>'
     + (glyph ? icon(glyph) : "") + safe(label) + '</button>';
+}
+function currentAccess() { return accessRules.resolve(state.access, demo); }
+function canWrite() { return currentAccess().can_write; }
+function requireWrite() { accessRules.assertWrite(currentAccess()); }
+function applyAccess() {
+  const access = currentAccess();
+  document.body.dataset.access = access.can_write ? "write" : "read";
+  const banner = $("#access-banner");
+  banner.hidden = access.can_write;
+  $("#access-label").textContent = access.role === "reviewer" ? "Просмотр для жюри" : "Только просмотр";
+  accessRules.apply(root, access);
+  accessRules.apply(dialogBody, access);
+}
+function request(url, options = {}) {
+  accessRules.assertRequest(currentAccess(), options.method);
+  return window.TirazhHTTP.request(url, options);
 }
 function headline(kicker, title, description, action = "") {
   return '<header class="page-head"><div><p class="eyebrow">' + safe(kicker) + '</p><h1>'
@@ -158,7 +178,7 @@ function demoApi(url, method, body) {
       result[post.status] = (result[post.status] || 0) + 1;
       return result;
     }, {total: posts.length});
-    return {businesses: demoWorkspaces.map(({business: b}) => ({id: b.id, name: b.name})),
+    return {access: {role: "owner", can_write: true}, businesses: demoWorkspaces.map(({business: b}) => ({id: b.id, name: b.name})),
       business, sources, counts, posts: posts.slice(0, 6), upcoming: posts.filter(p => p.status === "approved" && p.scheduled_at).sort((a,b) => Date.parse(a.scheduled_at) - Date.parse(b.scheduled_at))[0]};
   }
   if (pathname === "/business" && method === "POST") {
@@ -289,9 +309,10 @@ function demoApi(url, method, body) {
 }
 async function api(url, body) {
   const method = body ? "POST" : "GET";
+  accessRules.assertRequest(currentAccess(), method);
   if (demo) { const result = demoApi(url, method, body); if (method === "POST") persistDemo(); return result; }
   if (!telegram?.initData) throw new Error("Откройте мини-приложение из меню Telegram-бота.");
-  const response = await window.TirazhHTTP.request("./api" + url, {
+  const response = await request("./api" + url, {
       method, headers: {"X-Telegram-Init-Data": telegram.initData,
         ...(body ? {"Content-Type": "application/json"} : {})},
       body: body ? JSON.stringify(body) : undefined,
@@ -322,16 +343,18 @@ async function loadImage(node) {
   node.setAttribute("aria-busy", "true");
   node.innerHTML = icon("image");
   if (!imageUrls.has(id)) {
-    const pending = window.TirazhHTTP.request("./api/asset/" + path(id), {
+    const pending = request("./api/asset/" + path(id), {
       headers: {"X-Telegram-Init-Data": telegram.initData}, cache: "no-store", timeoutMs: 60000,
     }).then(async (response) => {
       if (!response.ok) throw new Error("Нет изображения");
-      const url = URL.createObjectURL(await response.blob());
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
       const check = new Image(); check.src = url;
       try {
         await check.decode();
         if (!check.naturalWidth || !check.naturalHeight) throw new Error("Неверное изображение");
       } catch (error) { URL.revokeObjectURL(url); throw error; }
+      imageTypes.set(id, blob.type);
       return url;
     }).catch(() => null); // Keep failures cached until an explicit image retry.
     imageUrls.set(id, pending);
@@ -344,7 +367,9 @@ async function loadImage(node) {
     if (!node.isConnected || node.dataset.asset !== id) return;
     node.replaceChildren(img);
     if (node.closest("#dialog-body") && img.naturalWidth > 0 && img.naturalHeight > 0) {
-      dialogBody.querySelector("[data-requires-image]")?.removeAttribute("disabled");
+      dialogBody.querySelectorAll("[data-requires-image]").forEach(control => {
+        if (!accessRules.requiresWrite(control.dataset.action) || canWrite()) control.removeAttribute("disabled");
+      });
     }
   } catch {
     if (node.isConnected) {
@@ -418,6 +443,7 @@ function switchSlide(control, action) {
   carousel.dataset.slide = next;
   const surface = carousel.querySelector(".slide-surface");
   surface.innerHTML = stepContent(editorialSteps[next], carousel.hasAttribute("data-compact"));
+  accessRules.apply(surface, currentAccess());
   carousel.querySelectorAll(".slide-dot").forEach((dot, index) => {
     dot.setAttribute("aria-pressed", String(index === next));
   });
@@ -450,7 +476,7 @@ function overview() {
     + button("Автоподготовка", "automation", "secondary", "spark") + '</div>'
     + '<p class="approval-note">' + icon("check") + 'Каждый пост выходит только после вашего согласования.</p></div>'
     + pressArt("draft", "workspace-illustration") + '</section>'
-    + (!ready ? setupProgress() : '')
+    + (!ready && canWrite() ? setupProgress() : '')
     + '<div class="dashboard-metrics">' + editorialStatuses.map(([status, label, glyph]) =>
       '<button class="metric-card panel" data-action="filter" data-status="' + status + '"><span class="metric-heading">'
       + icon(glyph) + label + '</span><strong>' + (state.counts[status] || 0) + '</strong>'
@@ -481,7 +507,9 @@ function conversationView() {
   return conversation.length ? conversation.map(turn => '<div class="chat-message user"><span class="chat-speaker">Вы</span>'
     + safe(turn.user_text) + '</div><div class="chat-message assistant"><span class="chat-speaker">AI-ассистент</span>'
     + safe(turn.assistant_text || 'Поручение принято.') + '</div>').join('')
-    : '<p class="chat-empty">Спросите о компании или поручите подготовить пост. Уточняйте задачу в следующих сообщениях — AI сохранит контекст.</p>';
+    : '<p class="chat-empty">' + (canWrite()
+      ? 'Спросите о компании или поручите подготовить пост. Уточняйте задачу в следующих сообщениях — AI сохранит контекст.'
+      : 'История диалога пока пуста.') + '</p>';
 }
 function workView() {
   const b = controls.business || state.business;
@@ -491,7 +519,8 @@ function workView() {
     button("Обновить", "refresh", "secondary", "refresh"))
     + '<section class="chat-panel panel"><h2>Диалог с маркетологом</h2><p>Пишите обычным языком. История хранится отдельно для «' + safe(state.business.name) + '».</p>'
     + '<div class="conversation" aria-live="polite">' + conversationView() + '</div>'
-    + '<form class="chat-form" data-chat><textarea name="text" maxlength="4000" required aria-label="Сообщение AI-маркетологу" placeholder="Что мы уже подготовили для компании?"></textarea>'
+    + (!canWrite() ? '<p class="access-note">' + safe(accessRules.reason) + '</p>' : '')
+    + '<form class="chat-form" data-chat data-write><textarea name="text" maxlength="4000" required aria-label="Сообщение AI-маркетологу" placeholder="Что мы уже подготовили для компании?"></textarea>'
     + '<button type="submit" class="button primary" aria-label="Отправить сообщение">' + icon("arrow") + '</button></form>'
     + '<p class="form-error" id="chat-error" role="alert"></p></section>'
     + '<div class="control-grid"><section class="panel business-panel"><p class="eyebrow">АВТОНОМНАЯ РАБОТА</p><h2>Автоподготовка</h2><p>'
@@ -662,12 +691,14 @@ function render() {
   root.dataset.screen = nextScreen;
   syncBackButton();
   if (!b) {
-    root.innerHTML = headline("Первый шаг", "Создайте бизнес", "Добавьте карточку, чтобы начать работу с контентом.")
+    root.innerHTML = !canWrite() ? headline("Рабочее пространство", "Пока нет материалов", "Команда ещё не добавила компанию для просмотра.")
+      : headline("Первый шаг", "Создайте бизнес", "Добавьте карточку, чтобы начать работу с контентом.")
       + '<div class="empty">Понадобятся описание бизнеса и канал Telegram.<br>'
       + button("Создать бизнес", "new-business", "primary", "plus") + '</div>';
   } else {
     root.innerHTML = {overview, content: contentView, work: workView, reports: reportView, business: businessView}[view]();
   }
+  applyAccess();
   if (screenChanged && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
     root.animate?.([{opacity: .65, transform: "translateY(5px)"}, {opacity: 1, transform: "none"}],
       {duration: 210, easing: "ease-out"});
@@ -721,6 +752,7 @@ async function refresh() {
     const result = await api("/state" + (businessId ? "?business=" + path(businessId) : ""));
     if (epoch !== stateRequest) return false;
     state = result;
+    applyAccess();
     if (!demo && state.runtime_mode === "demo") {
       const banner = $("#mode-banner"); banner.hidden = false;
       banner.innerHTML = '<span class="demo-pill">ДЕМО</span><span>Тестовый backend. AI и публикации имитируются; данные сохраняются.</span>';
@@ -742,6 +774,7 @@ async function navigate(next, filter = "") {
 }
 function showDialog(html) {
   dialogBody.innerHTML = html;
+  accessRules.apply(dialogBody, currentAccess());
   if (!dialog.open) dialog.showModal();
   syncBackButton();
   void loadImages(dialogBody);
@@ -755,7 +788,8 @@ function formField(label, name, kind, options = "") {
   return '<label class="form-row"><span>' + safe(label) + '</span>' + tag + '</label>';
 }
 function openForm(action, title, detail, fields, submit, id = businessId, revision = 0) {
-  showDialog(dialogHeading(title, detail) + '<form data-form="' + action + '" data-id="' + safe(id)
+  requireWrite();
+  showDialog(dialogHeading(title, detail) + '<form data-write data-form="' + action + '" data-id="' + safe(id)
     + '" data-revision="' + revision + '">' + fields
     + '<p class="form-error" id="form-error" role="alert"></p><div class="dialog-actions">'
     + '<button class="button primary" type="submit">' + safe(submit) + '</button>'
@@ -778,7 +812,7 @@ function showPost(post) {
     if (staleProfile) actions += button("Проверил по новому профилю", "refresh-context", "secondary", "check", attrs);
     if (["review", "approved"].includes(post.status)) actions += button("Отклонить", "reject", "secondary danger", "", attrs);
   }
-  const text = canApprove ? "Согласование относится к этой версии: тексту, изображению, каналу и времени."
+  const text = !canWrite() ? accessRules.reason : canApprove ? "Согласование относится к этой версии: тексту, изображению, каналу и времени."
     : post.status === "review" ? "Выберите будущее время и проверьте материал перед согласованием." : "Любая правка снимает прежнее согласование.";
   const link = /^https:\/\/t\.me\//.test(post.message_url || "")
     ? '<a class="text-button" target="_blank" rel="noopener noreferrer" href="' + safe(post.message_url)
@@ -796,7 +830,9 @@ function showPost(post) {
     + (post.used_source_ids || []).map(id => '<li>' + safe(state.sources.find(s => s.id === id)?.name || id) + '</li>').join('') + '</ul></details>'
     + '<p class="dialog-desc">' + safe(post.last_error || text) + '</p>'
     + (post.status === 'delivery_unknown' ? '<div class="notice">Сначала проверьте канал и уточните доставку в Telegram-боте. Автоматического повтора нет.</div>' : '')
-    + link + '<p class="form-error" id="form-error" role="alert"></p><div class="dialog-actions">' + actions + '</div>');
+    + link + '<p class="form-error" id="form-error" role="alert"></p><div class="dialog-actions">'
+    + button("Скачать изображение", "download-image", "secondary", "image", demo ? "" : 'disabled data-requires-image')
+    + actions + '</div>');
 }
 function editableDate(value) {
   if (!value) return "";
@@ -828,6 +864,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
   const {action, id, revision} = control.dataset;
+  if (accessRules.requiresWrite(action) && !canWrite()) { notify(accessRules.reason); return; }
   if (action === "close") { dialog.close(); return; }
   if (action === "slide-prev" || action === "slide-next" || action === "slide-to") {
     switchSlide(control, action);
@@ -901,7 +938,16 @@ document.addEventListener("click", async (event) => {
     } else if (action === "retry-image") {
       const node = control.closest("[data-asset]");
       imageUrls.delete(node.dataset.asset);
+      imageTypes.delete(node.dataset.asset);
       await loadImage(node);
+    } else if (action === "download-image") {
+      const image = dialogBody.querySelector(".preview-art img");
+      if (!image?.src) throw new Error("Дождитесь загрузки изображения.");
+      const download = document.createElement("a");
+      const mime = imageTypes.get(image.closest("[data-asset]")?.dataset.asset);
+      download.href = image.src;
+      download.download = mime === "image/jpeg" || image.src.startsWith("data:image/jpeg") ? "post-image.jpg" : "post-image.png";
+      document.body.append(download); download.click(); download.remove();
     } else if (action === "automation") {
       const b = state.business;
       openForm("automation", "Автоподготовка", "AI готовит материалы по расписанию. Каждый готовый пост ждёт отдельного согласования.",
@@ -991,10 +1037,11 @@ document.addEventListener("click", async (event) => {
       notify(action === "approve" ? "Версия согласована и поставлена в расписание." : "Пост отклонён.");
     }
   } catch (error) { announceError(error); }
-  finally { control.disabled = false; }
+  finally { control.disabled = false; accessRules.apply(root, currentAccess()); accessRules.apply(dialogBody, currentAccess()); }
 });
 dialog.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!canWrite()) { announceError(new Error(accessRules.reason)); return; }
   const form = event.target;
   const submit = form.querySelector('[type="submit"]');
   if (submit.disabled) return;
@@ -1042,7 +1089,7 @@ dialog.addEventListener("submit", async (event) => {
         persistDemo();
       } else {
         const data = new FormData(); data.append("file", file);
-        const response = await window.TirazhHTTP.request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
+        const response = await request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось загрузить документ.");
       }
       if (currentForm()) dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
@@ -1073,7 +1120,7 @@ dialog.addEventListener("submit", async (event) => {
       notify(action === "channel" ? "Канал подключён." : "Источник добавлен.");
     }
   } catch (error) { if (currentForm()) announceError(error); else notify(error.message); }
-  finally { for (const [field, disabled] of fieldStates) field.disabled = disabled; submit.disabled = false; submit.textContent = submitLabel; }
+  finally { for (const [field, disabled] of fieldStates) field.disabled = disabled; submit.disabled = false; submit.textContent = submitLabel; accessRules.apply(dialogBody, currentAccess()); }
 });
 root.addEventListener("submit", async (event) => {
   const form = event.target;
@@ -1084,6 +1131,7 @@ root.addEventListener("submit", async (event) => {
   }
   if (!form.matches("[data-chat]")) return;
   event.preventDefault();
+  if (!canWrite()) { announceError(new Error(accessRules.reason)); return; }
   const submit = form.querySelector("button");
   if (submit.disabled) return;
   const text = form.elements.text.value.trim();
@@ -1104,9 +1152,10 @@ root.addEventListener("submit", async (event) => {
       notify("Откройте нужный пост и подтвердите правку отдельной кнопкой.");
     }
   } catch (error) { if (errorNode.isConnected) errorNode.textContent = error.message; else announceError(error); }
-  finally { submit.disabled = false; form.elements.text.disabled = false; }
+  finally { submit.disabled = false; form.elements.text.disabled = false; accessRules.apply(root, currentAccess()); }
 });
 async function uploadManualImage(file, business, form) {
+  requireWrite();
   await validateManualImage(file);
   if (form.dataset.assetId) return form.dataset.assetId;
   let assetId;
@@ -1114,7 +1163,7 @@ async function uploadManualImage(file, business, form) {
     assetId = crypto.randomUUID(); demoAssets.set(assetId, {id: assetId, business_id: business, data_url: await fileData(file)});
   } else {
     const data = new FormData(); data.append("file", file);
-    const response = await window.TirazhHTTP.request("./api/business/" + path(business) + "/image", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
+    const response = await request("./api/business/" + path(business) + "/image", {method: "POST", headers: {"X-Telegram-Init-Data": telegram.initData}, body: data});
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось сохранить изображение.");
     assetId = (await response.json()).id;
   }
@@ -1201,6 +1250,7 @@ workspace.addEventListener("change", async () => {
 window.addEventListener("pagehide", () => {
   for (const pending of imageUrls.values()) void pending.then((url) => { if (url) URL.revokeObjectURL(url); });
   imageUrls.clear();
+  imageTypes.clear();
 });
 dialog.addEventListener("close", () => { ++postRequest; syncBackButton(); if (manualPreviewUrl) { URL.revokeObjectURL(manualPreviewUrl); manualPreviewUrl = null; } });
 if (insideTelegram) {

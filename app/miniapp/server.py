@@ -13,7 +13,16 @@ from pydantic import AwareDatetime, Field, ValidationError
 from app.config import Settings
 from app.core.service import BackendService
 from app.miniapp.auth import validate_init_data
-from app.shared.errors import AppError, Conflict, Forbidden, InvalidInput, NotFound, ProviderUnavailable
+from app.shared.errors import (
+    AppError,
+    Conflict,
+    Forbidden,
+    InvalidInput,
+    NotFound,
+    ProviderUnavailable,
+    SafetyBlocked,
+    SafetyUnavailable,
+)
 from app.shared.models import Business, Contract, PostStatus
 
 log = logging.getLogger(__name__)
@@ -142,8 +151,7 @@ async def guard(request, handler):
                 request.headers.get("X-Telegram-Init-Data", ""), request.app[TOKEN],
                 request.app[SERVICE].now(),
             )
-            if actor != request.app[SERVICE].settings.owner_id:
-                raise Forbidden("Доступ к этому пространству есть только у владельца бота.")
+            request.app[SERVICE].require_access(actor, write=request.method not in ("GET", "HEAD"))
             request[ACTOR] = actor
         response = await handler(request)
     except (ValueError, ValidationError):
@@ -151,6 +159,7 @@ async def guard(request, handler):
     except AppError as exc:
         status = {
             Forbidden: 403, NotFound: 404, Conflict: 409, ProviderUnavailable: 502,
+            SafetyBlocked: 422, SafetyUnavailable: 503,
         }.get(type(exc), 400)
         response = web.json_response({"error": str(exc)}, status=status)
     except web.HTTPException as exc:
@@ -214,13 +223,16 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
 
     async def state(request):
         svc, actor = context(request)
+        role = svc.access_role(actor)
+        access = {"role": role, "can_write": role in ("owner", "operator")}
         businesses = svc.list_businesses(actor)
         selected_id = request.query.get("business")
         selected = svc.get_business(actor, selected_id) if selected_id else (businesses[-1] if businesses else None)
         if selected is None:
             return web.json_response({"businesses": [], "business": None, "posts": [], "counts": {},
                                       "sources": [], "jobs": [], "usage": svc.ai_usage(actor),
-                                      "runtime_mode": svc.settings.mode, "capabilities": svc.capabilities(actor)})
+                                      "runtime_mode": svc.settings.mode, "capabilities": svc.capabilities(actor),
+                                      "access": access})
         posts = svc.list_posts(actor, selected.id)
         counts = Counter(p.status for p in posts)
         sources = svc.list_sources(actor, selected.id)
@@ -237,6 +249,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             "usage": svc.ai_usage(actor),
             "runtime_mode": svc.settings.mode,
             "capabilities": svc.capabilities(actor),
+            "access": access,
         })
 
     async def posts(request):
@@ -286,7 +299,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         business_id = request.match_info["id"]
         svc.get_business(actor, business_id)
         filename, content = await file_body(request, min(svc.settings.max_upload_bytes, 10_000_000))
-        return show(svc.upload_post_image(actor, business_id, filename, content))
+        return show(await asyncio.to_thread(svc.upload_post_image, actor, business_id, filename, content))
 
     async def manual_profile(request):
         svc, actor = context(request)
@@ -299,7 +312,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     async def manual_draft(request):
         svc, actor = context(request)
         body = ManualDraftInput.model_validate(await json_body(request))
-        return show(svc.create_manual_draft(
+        return show(await asyncio.to_thread(svc.create_manual_draft,
             actor, request.match_info["id"], body.text, body.image_asset_id, body.request_id,
             scheduled_at=body.scheduled_at, source_ids=body.source_ids,
         ))
@@ -420,8 +433,10 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         payload = await json_body(request)
         if action == "edit":
             edit = PostEdit.model_validate(payload)
-            return show(svc.edit_post(actor, post_id, edit.revision, text=edit.text,
-                                      scheduled_at=edit.scheduled_at, image_asset_id=edit.image_asset_id))
+            return show(await asyncio.to_thread(
+                svc.edit_post, actor, post_id, edit.revision, text=edit.text,
+                scheduled_at=edit.scheduled_at, image_asset_id=edit.image_asset_id,
+            ))
         body = RevisionInput.model_validate(payload)
         change = svc.approve_post if action == "approve" else svc.reject_post
         return show(change(actor, post_id, body.revision))
@@ -467,7 +482,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     app.add_routes([
         web.get("/mini/", index),
         web.get("/mini/health", health),
-        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|demo-store\.js|transport\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
+        web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|demo-store\.js|transport\.js|access\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
         web.get("/mini/api/business/{id}/calendar", calendar),

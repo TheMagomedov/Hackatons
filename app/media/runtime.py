@@ -7,6 +7,7 @@ from app.shared.errors import ProviderUnavailable
 from app.shared.models import BusinessProfile, GeneratedImage, TextDraft
 from app.shared.ports import ImageProvider
 
+from .branding import SalavatBrandingProvider
 from .provider import build_provider as configured_provider
 
 
@@ -22,7 +23,8 @@ def build_provider(settings: Settings) -> ImageProvider:
     if settings.mode == "live" and not key:
         return UnconfiguredImages()
     base = os.getenv("IMAGE_API_BASE", "https://api.openai.com/v1").rstrip("/")
-    return configured_provider(
+    provider = configured_provider(
         settings, api_key=key, model=os.getenv("IMAGE_MODEL") or "gpt-image-1",
         endpoint=f"{base}/images/generations",
     )
+    return provider if settings.mode == "demo" else SalavatBrandingProvider(provider)

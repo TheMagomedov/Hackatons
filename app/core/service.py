@@ -16,7 +16,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
+from app.access import actor_action
 from app.config import Settings
+from app.safety import NoopSafety, SafetyPolicy
 from app.shared.errors import (
     AppError,
     Conflict,
@@ -25,6 +27,8 @@ from app.shared.errors import (
     Forbidden,
     InvalidInput,
     ProviderUnavailable,
+    SafetyBlocked,
+    SafetyUnavailable,
 )
 from app.shared.models import (
     Asset,
@@ -64,6 +68,8 @@ class BackendService:
         notifier: Notifier,
         reporter: ReportProvider | None = None,
         clock: Callable[[], datetime] = utc_now,
+        *,
+        safety: SafetyPolicy | None = None,
     ):
         self.repo = repository
         self.files = files
@@ -74,26 +80,35 @@ class BackendService:
         self.notifier = notifier
         self.reporter = reporter
         self.clock = clock
+        self.safety = NoopSafety() if safety is None else safety
         self._notification_lock = asyncio.Lock()
 
     def now(self) -> datetime:
         return as_utc(self.clock())
 
-    def _owner(self, actor_id: int) -> None:
-        if type(actor_id) is not int or actor_id != self.settings.owner_id:
-            raise Forbidden("Только владелец может управлять этим приложением.")
+    def access_role(self, actor_id: int) -> str | None:
+        return self.repo.access_role(self.settings.owner_id, actor_id)
 
-    def _business(self, actor_id: int, business_id: str) -> Business:
-        self._owner(actor_id)
+    def require_access(self, actor_id: int, *, write: bool = False) -> str:
+        return self.repo.require_access(self.settings.owner_id, actor_id, write=write)
+
+    def claim_invite(self, actor_id: int, token: str) -> str:
+        return self.repo.claim_access_invite(self.settings.owner_id, actor_id, token, self.now())
+
+    def _owner(self, actor_id: int) -> None:
+        self.require_access(actor_id, write=True)
+
+    def _business(self, actor_id: int, business_id: str, *, write: bool = True) -> Business:
+        self.require_access(actor_id, write=write)
         business = self.repo.get_business(business_id)
-        if business.owner_id != actor_id:
+        if business.owner_id != self.settings.owner_id:
             raise Forbidden("Нет доступа к этому бизнесу.")
         return business
 
-    def _post(self, actor_id: int, post_id: str) -> PostView:
-        self._owner(actor_id)
+    def _post(self, actor_id: int, post_id: str, *, write: bool = True) -> PostView:
+        self.require_access(actor_id, write=write)
         post = self.repo.get_post(post_id)
-        self._business(actor_id, post.business_id)
+        self._business(actor_id, post.business_id, write=write)
         return post
 
     async def _external(self, call):
@@ -224,6 +239,7 @@ class BackendService:
             raise Conflict("Профиль или канал изменились во время подготовки. Повторите запрос.")
         return current
 
+    @actor_action
     def create_business(self, actor_id: int, name: str, timezone: str | None = None) -> Business:
         self._owner(actor_id)
         name = name.strip()
@@ -234,18 +250,18 @@ class BackendService:
             ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError):
             raise InvalidInput("Неизвестный часовой пояс.") from None
-        return self.repo.create_business(actor_id, name, timezone, self.now())
+        return self.repo.create_business(self.settings.owner_id, name, timezone, self.now())
 
     def get_business(self, actor_id: int, business_id: str) -> Business:
-        return self._business(actor_id, business_id)
+        return self._business(actor_id, business_id, write=False)
 
     def list_businesses(self, actor_id: int) -> list[Business]:
-        self._owner(actor_id)
-        return [b for b in self.repo.list_businesses() if b.owner_id == actor_id]
+        self.require_access(actor_id)
+        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id]
 
     def capabilities(self, actor_id: int) -> dict:
         """Loaded configuration only; credentials, balance and provider access are never probed."""
-        self._owner(actor_id)
+        self.require_access(actor_id)
         from app.ai.provider import UnconfiguredAI
         from app.media.runtime import UnconfiguredImages
 
@@ -270,9 +286,10 @@ class BackendService:
         This is at-most-once admission, separate from AI quota. After a process
         interruption the owner can inspect state and send a new explicit action.
         """
-        self._owner(actor_id)
+        self.require_access(actor_id)
         return self.repo.claim_inbound_event(actor_id, event_key, digest, self.now())
 
+    @actor_action
     async def connect_channel(self, actor_id: int, business_id: str, channel_id: str) -> Business:
         business = self._business(actor_id, business_id)
         channel = self._provider_result(
@@ -287,6 +304,7 @@ class BackendService:
                 raise Conflict("Сначала отмените согласованные посты и проверьте незавершённые отправки.")
         return self.repo.set_channel(business_id, channel, self.now())
 
+    @actor_action
     def add_text_source(
         self, actor_id: int, business_id: str, text: str, name: str = "Описание владельца"
     ) -> Source:
@@ -305,6 +323,7 @@ class BackendService:
         self.repo.add_source(source)
         return source
 
+    @actor_action
     def add_pdf_source(self, actor_id: int, business_id: str, filename: str, content: bytes) -> Source:
         self._business(actor_id, business_id)
         if not content.startswith(b"%PDF-"):
@@ -323,6 +342,7 @@ class BackendService:
         self.repo.add_source(source)
         return source
 
+    @actor_action
     def add_url_source(self, actor_id: int, business_id: str, url: str) -> Source:
         self._business(actor_id, business_id)
         # This boundary does not fetch URLs. Role 1 must revalidate DNS + every redirect at fetch time.
@@ -361,7 +381,7 @@ class BackendService:
         return source
 
     def list_sources(self, actor_id: int, business_id: str) -> list[Source]:
-        self._business(actor_id, business_id)
+        self._business(actor_id, business_id, write=False)
         return self.repo.list_sources(business_id)
 
     def _check_source_limits(self, business_id: str, *, extra_bytes: int | None = None) -> list[Source]:
@@ -385,6 +405,7 @@ class BackendService:
             raise InvalidInput("Суммарный объём источников превышает лимит бизнеса.")
         return sources
 
+    @actor_action
     async def analyze_business(
         self, actor_id: int, business_id: str, *, request_id: str | None = None
     ) -> Business:
@@ -416,10 +437,12 @@ class BackendService:
             raise Conflict("Источники изменились во время анализа. Запустите анализ заново.")
         if any(set(fact.source_ids) - known for fact in profile.facts):
             raise InvalidInput("AI сослался на неизвестный источник.")
+        self._business(actor_id, business_id)  # The actor may have been revoked during inference.
         return self.repo.set_profile(
             business_id, profile, self.now(), expected_version=business.profile_version
         )
 
+    @actor_action
     def save_profile(
         self, actor_id: int, business_id: str, expected_version: int, profile: BusinessProfile
     ) -> Business:
@@ -430,10 +453,12 @@ class BackendService:
             raise InvalidInput("Профиль бизнеса не соответствует общей схеме.") from None
         return self.repo.set_profile(business_id, profile, self.now(), expected_version=expected_version)
 
+    @actor_action
     def confirm_profile(self, actor_id: int, business_id: str, expected_version: int) -> Business:
         self._business(actor_id, business_id)
         return self.repo.confirm_profile(business_id, expected_version, self.now())
 
+    @actor_action
     def save_manual_profile(
         self, actor_id: int, business_id: str, expected_version: int, *, description: str,
         products: list[str] | None = None, audience: str = "", tone: str = "Дружелюбный, конкретный",
@@ -483,7 +508,7 @@ class BackendService:
             raise Conflict("Сначала подключите канал.")
 
     def conversation_history(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
-        self._business(actor_id, business_id)
+        self._business(actor_id, business_id, write=False)
         return self.repo.conversation_history(business_id, limit)
 
     def _conversation_context(self, business: Business, post_id: str | None) -> dict:
@@ -536,6 +561,7 @@ class BackendService:
             "selected_post": selected.model_dump(mode="json") if selected else None,
         }
 
+    @actor_action
     async def interpret_request(
         self,
         actor_id: int,
@@ -564,6 +590,7 @@ class BackendService:
                 raise ProviderUnavailable("AI вернул пустой ответ. Уточните вопрос.")
             if any(not question.strip() or len(question) > 1000 for question in intent.questions):
                 raise ProviderUnavailable("AI вернул некорректные уточняющие вопросы.")
+            self._business(actor_id, business_id)
             return intent
 
         return await self._ai_operation(
@@ -576,6 +603,7 @@ class BackendService:
             dialogue_text=text,
         )
 
+    @actor_action
     def request_preparation(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
         business = self._business(actor_id, business_id)
         request = self._plain_text(request, 4000, "Укажите запрос длиной до 4000 символов.").strip()
@@ -599,19 +627,21 @@ class BackendService:
         )
 
     def get_job(self, actor_id: int, job_id: str) -> Job:
-        self._owner(actor_id)
+        self.require_access(actor_id)
         job = self.repo.get_job(job_id)
-        self._business(actor_id, job.business_id)
+        self._business(actor_id, job.business_id, write=False)
         return job
 
     def list_jobs(self, actor_id: int, business_id: str) -> list[Job]:
-        self._business(actor_id, business_id)
+        self._business(actor_id, business_id, write=False)
         return self.repo.list_jobs(business_id)
 
+    @actor_action
     def cancel_job(self, actor_id: int, job_id: str) -> Job:
         self.get_job(actor_id, job_id)
         return self.repo.cancel_job(job_id, self.now())
 
+    @actor_action
     def set_publications_paused(self, actor_id: int, business_id: str, paused: bool) -> Business:
         self._business(actor_id, business_id)
         if type(paused) is not bool:
@@ -619,9 +649,9 @@ class BackendService:
         return self.repo.set_publications_paused(business_id, paused, self.now())
 
     def ai_usage(self, actor_id: int) -> dict:
-        self._owner(actor_id)
+        self.require_access(actor_id)
         return {
-            **self.repo.ai_usage(actor_id, self.now()),
+            **self.repo.ai_usage(self.settings.owner_id, self.now()),
             "daily_limit": self.settings.max_ai_operations_per_day,
             "parallel_limit": self.settings.max_concurrent_ai_operations,
             "period_timezone": "UTC",
@@ -633,21 +663,22 @@ class BackendService:
         business_id: str | None = None,
         limit: int = 20,
     ) -> list[dict]:
-        self._owner(actor_id)
+        self.require_access(actor_id)
         if business_id is not None:
-            self._business(actor_id, business_id)
-        return self.repo.list_ai_operations(actor_id, business_id, limit)
+            self._business(actor_id, business_id, write=False)
+        return self.repo.list_ai_operations(self.settings.owner_id, business_id, limit)
 
     def failed_notifications(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
-        self._business(actor_id, business_id)
+        self._business(actor_id, business_id, write=False)
         return self.repo.list_failed_notifications(business_id, limit=limit)
 
     def get_failed_notification(self, actor_id: int, notification_id: str) -> dict:
-        self._owner(actor_id)
+        self.require_access(actor_id)
         notification = self.repo.get_failed_notification(notification_id)
-        self._business(actor_id, notification["business_id"])
+        self._business(actor_id, notification["business_id"], write=False)
         return notification
 
+    @actor_action
     def retry_notification(self, actor_id: int, business_id: str, notification_id: str) -> Notification:
         self._business(actor_id, business_id)
         return self.repo.retry_notification(notification_id, business_id, self.now())
@@ -661,18 +692,19 @@ class BackendService:
         return [post for post in self.repo.list_posts(job.business_id) if post.job_id == job_id]
 
     def list_posts(self, actor_id: int, business_id: str) -> list[PostView]:
-        self._business(actor_id, business_id)
+        self._business(actor_id, business_id, write=False)
         return self.repo.list_posts(business_id)
 
     def get_post(self, actor_id: int, post_id: str) -> PostView:
-        return self._post(actor_id, post_id)
+        return self._post(actor_id, post_id, write=False)
 
     def read_asset(self, actor_id: int, asset_id: str) -> tuple[Asset, bytes]:
-        self._owner(actor_id)
+        self.require_access(actor_id)
         asset = self.repo.get_asset(asset_id)
-        self._business(actor_id, asset.business_id)
+        self._business(actor_id, asset.business_id, write=False)
         return asset, self.files.read(asset)
 
+    @actor_action
     def upload_post_image(self, actor_id: int, business_id: str, filename: str, content: bytes) -> Asset:
         self._business(actor_id, business_id)
         maximum = min(self.settings.max_upload_bytes, 10_000_000)
@@ -695,11 +727,14 @@ class BackendService:
                 Image.DecompressionBombError, Image.DecompressionBombWarning):
             raise InvalidInput("Файл должен быть исправным PNG или JPEG.") from None
         mime_type = "image/png" if image_format == "PNG" else "image/jpeg"
+        self.safety.check_image(content, mime_type)
+        self._business(actor_id, business_id)
         asset = self.files.write(business_id, filename, content, mime_type, self.now(),
                                  is_demo=self.settings.mode == "demo")
         self.repo.add_asset(asset)
         return asset
 
+    @actor_action
     def create_manual_draft(
         self, actor_id: int, business_id: str, text: str, image_asset_id: str, request_id: str,
         *, scheduled_at: datetime | None = None, source_ids: list[str] | None = None,
@@ -728,6 +763,8 @@ class BackendService:
         if self.settings.mode == "live" and asset.is_demo:
             raise InvalidInput("Демонстрационное изображение нельзя использовать в live-режиме.")
         self.files.read(asset)
+        self.safety.check_text([text])
+        self._business(actor_id, business_id)
         return self.repo.create_posts(
             business_id, [{"text": text, "image_asset_id": asset.id, "channel_id": business.channel_id,
                            "scheduled_at": scheduled_at, "profile_version": business.profile_version,
@@ -766,6 +803,7 @@ class BackendService:
             raise InvalidInput(message)
         return text
 
+    @actor_action
     def edit_post(
         self,
         actor_id: int,
@@ -783,6 +821,7 @@ class BackendService:
         if text is not None:
             self._ready(business)
             changes["text"] = self._validate_caption(text)
+            self.safety.check_text([changes["text"]])
             changes["is_demo"] = post.is_demo or self.settings.mode == "demo"
             changes["profile_version"] = business.profile_version
             changes["warnings"] = list(
@@ -810,8 +849,10 @@ class BackendService:
             changes["channel_id"] = channel_id
         if not changes:
             raise InvalidInput("Нет изменений.")
+        self._post(actor_id, post_id)
         return self.repo.revise_post(post_id, expected_revision, changes, self.now())
 
+    @actor_action
     def refresh_post_context(self, actor_id: int, post_id: str, expected_revision: int) -> PostView:
         """Explicit human review against the current profile; never an approval."""
         post = self._post(actor_id, post_id)
@@ -864,6 +905,7 @@ class BackendService:
             log.warning("Edit recovery persistence failed: %s", type(exc).__name__)
         return None
 
+    @actor_action
     async def revise_text(
         self,
         actor_id: int,
@@ -903,6 +945,7 @@ class BackendService:
             if set(draft.used_source_ids) - known_sources:
                 raise InvalidInput("Текст ссылается на неизвестные источники.")
             text = self._validate_caption(draft.text)
+            self._business(actor_id, business.id)
             return self.repo.complete_edit(
                 editing.id,
                 editing.revision,
@@ -926,6 +969,8 @@ class BackendService:
                 editing,
                 "Не удалось изменить текст. Пост не будет опубликован без нового согласования.",
             )
+            if isinstance(exc, Forbidden):
+                raise
             if completed is not None:
                 return completed
             if isinstance(exc, AppError):
@@ -933,6 +978,7 @@ class BackendService:
             log.warning("Text revision failed: %s", type(exc).__name__)
             raise ProviderUnavailable("Не удалось завершить правку текста.") from None
 
+    @actor_action
     async def revise_image(
         self,
         actor_id: int,
@@ -966,6 +1012,7 @@ class BackendService:
             draft = TextDraft(text=self._validate_caption(editing.text), image_brief=feedback)
             generated = await self._external(self.images.generate(business.profile, draft, feedback))
             self._current_context(business)
+            self._business(actor_id, business.id)
             asset = self._store_image(editing.business_id, generated)
             return self.repo.complete_edit(
                 editing.id,
@@ -985,6 +1032,8 @@ class BackendService:
             completed = self._fail_edit_safely(
                 business, editing, "Не удалось изменить изображение. Пост требует нового согласования."
             )
+            if isinstance(exc, Forbidden):
+                raise
             if completed is not None:
                 return completed
             if isinstance(exc, AppError):
@@ -992,6 +1041,7 @@ class BackendService:
             log.warning("Image revision failed: %s", type(exc).__name__)
             raise ProviderUnavailable("Не удалось завершить правку изображения.") from None
 
+    @actor_action
     def approve_post(self, actor_id: int, post_id: str, expected_revision: int) -> PostView:
         post = self._post(actor_id, post_id)
         business = self._business(actor_id, post.business_id)
@@ -1005,10 +1055,12 @@ class BackendService:
             raise InvalidInput("Тестовый материал нельзя публиковать в live-режиме.")
         return self.repo.approve_post(post_id, expected_revision, actor_id, self.now())
 
+    @actor_action
     def reject_post(self, actor_id: int, post_id: str, expected_revision: int) -> PostView:
         self._post(actor_id, post_id)
         return self.repo.reject_post(post_id, expected_revision, self.now())
 
+    @actor_action
     def configure_automation(
         self,
         actor_id: int,
@@ -1216,6 +1268,26 @@ class BackendService:
             image = self.files.read(asset)
             if self.settings.mode == "live" and (post.is_demo or asset.is_demo):
                 raise InvalidInput("Публикация тестового материала запрещена.")
+            await asyncio.to_thread(self.safety.check_text, [post.text])
+            await asyncio.to_thread(self.safety.check_image, image, asset.mime_type)
+            try:
+                current = self._current_context(business)
+            except Conflict:
+                self._fail_publication(
+                    business, post,
+                    "Профиль или канал изменились во время проверки. Обновите пост и согласуйте его заново.",
+                    False,
+                )
+                return True
+            if current.publications_paused:
+                self._fail_publication(
+                    business, post,
+                    "Публикации приостановлены во время проверки. Выберите новое время и согласуйте пост заново.",
+                    False,
+                )
+                return True
+            if not self.repo.approval_allowed(business.owner_id, post):
+                raise Forbidden("Согласование отозвано. Требуется новое согласование действующего оператора.")
             attempted = True
             # Do not wrap ambiguous network errors in a generic provider error here.
             async with asyncio.timeout(self.settings.provider_timeout_seconds):
@@ -1241,12 +1313,15 @@ class BackendService:
                 self._fail_publication(
                     business,
                     post,
-                    "Отправка прервана; проверьте канал перед повторением.",
+                    ("Отправка прервана; проверьте канал перед повторением." if attempted
+                     else "Проверка перед отправкой прервана. Публикация не отправлена."),
                     attempted,
                 )
             except Exception as exc:
                 log.warning("Publication cancellation persistence failed: %s", type(exc).__name__)
             raise
+        except (SafetyBlocked, SafetyUnavailable) as exc:
+            self._fail_publication(business, post, str(exc), False, exc.code)
         except DeliveryRejected:
             self._fail_publication(
                 business,
@@ -1264,6 +1339,7 @@ class BackendService:
             self._fail_publication(business, post, message, attempted)
         return True
 
+    @actor_action
     def resolve_unknown_delivery(
         self,
         actor_id: int,
@@ -1360,7 +1436,7 @@ class BackendService:
         return count
 
     def report_data(self, actor_id: int, business_id: str, start: datetime, end: datetime) -> ReportInput:
-        self._business(actor_id, business_id)
+        self._business(actor_id, business_id, write=False)
         start, end = as_utc(start), as_utc(end)
         if start >= end or end - start > timedelta(days=366):
             raise InvalidInput("Выберите период от начала до конца длиной до 366 дней.")

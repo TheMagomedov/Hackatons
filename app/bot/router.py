@@ -2,8 +2,10 @@ import hashlib
 import io
 import json
 import logging
+import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -120,10 +122,27 @@ class Prompt:
     revision: int = 0
 
 
+@dataclass
+class BotState:
+    pending: Prompt | None = None
+    selected: str | None = None
+    context_epoch: int = 0
+    inflight_inputs: set[int] = field(default_factory=set)
+
+
+_STATE: ContextVar[BotState] = ContextVar("bot_user_state")
+READ_CALLBACKS = {"home", "business", "posts", "post", "jobs", "job", "job-posts", "report", "history"}
+
+
+def state():
+    return _STATE.get()
+
+
 class OwnerAccess(BaseMiddleware):
     def __init__(self, service: BackendService):
         self.service = service
         self.owner = service.settings.owner_id
+        self.states: dict[int, BotState] = {}
         # Fast local cache complements the durable receipt of every owner update.
         self.seen: OrderedDict[int, None] = OrderedDict()
 
@@ -133,13 +152,34 @@ class OwnerAccess(BaseMiddleware):
             if isinstance(event, CallbackQuery):
                 await event.answer("Откройте личный чат с ботом.")
             return
-        if event.from_user is None or event.from_user.id != self.owner:
+        actor = event.from_user.id if event.from_user is not None else None
+        if isinstance(event, Message) and actor is not None:
+            invitation = re.fullmatch(r"/start(?:@[A-Za-z0-9_]+)?\s+join_([A-Za-z0-9_-]{43})", event.text or "")
+            if invitation:
+                try:
+                    self.service.claim_invite(actor, invitation.group(1))
+                except AppError as exc:
+                    await message.answer(str(exc))
+                    return
+        role = self.service.access_role(actor)
+        if role is None:
             if isinstance(event, CallbackQuery):
-                await event.answer("Управлять ботом может только владелец.", show_alert=True)
+                await event.answer("Для входа нужно приглашение команды.", show_alert=True)
             else:
-                await message.answer("Управлять ботом может только владелец.")
+                await message.answer("Для входа нужно приглашение команды. Откройте личную ссылку приглашения.")
             return
+        if role == "reviewer":
+            readable = ((event.data or "").split(":", 1)[0] in READ_CALLBACKS) if isinstance(
+                event, CallbackQuery,
+            ) else bool(re.match(r"^/(start|menu|cancel|help)(?:@[A-Za-z0-9_]+)?(?:\s|$)", event.text or ""))
+            if not readable:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("Режим наблюдателя: доступен только просмотр.", show_alert=True)
+                else:
+                    await message.answer("Режим наблюдателя: откройте /menu для просмотра готовых материалов.")
+                return
         update = data.get("event_update")
+        state_token = _STATE.set(self.states.setdefault(actor, BotState()))
         try:
             if isinstance(update, Update):
                 if update.update_id in self.seen:
@@ -155,7 +195,7 @@ class OwnerAccess(BaseMiddleware):
                     ).encode("utf-8")
                 ).hexdigest()
                 accepted = self.service.accept_telegram_update(
-                    self.owner,
+                    actor,
                     event_key(update, event.bot.id),
                     digest,
                 )
@@ -176,6 +216,8 @@ class OwnerAccess(BaseMiddleware):
                 type(exc).__name__,
             )
             await reply(message, "Действие не завершилось. Проверьте состояние через меню.", menu())
+        finally:
+            _STATE.reset(state_token)
 
 
 class LimitedFile(io.BytesIO):
@@ -221,18 +263,13 @@ def build_router(service: BackendService) -> Router:
     owner_access = OwnerAccess(service)
     router.message.outer_middleware(owner_access)
     router.callback_query.outer_middleware(owner_access)
-    pending: Prompt | None = None
-    selected: str | None = None
-    context_epoch = 0
-    inflight_inputs: set[int] = set()
 
     def check_input_available() -> None:
-        if pending is None and context_epoch in inflight_inputs:
+        if state().pending is None and state().context_epoch in state().inflight_inputs:
             raise Conflict("Предыдущий ответ ещё обрабатывается. Можно открыть другое действие через меню.")
 
     def restore_prompt(context: Prompt | None, epoch: int, actor: int) -> None:
-        nonlocal pending
-        if context is None or epoch != context_epoch or pending is not None:
+        if context is None or epoch != state().context_epoch or state().pending is not None:
             return
         # A failed paid edit already consumed its revision; never restore its old prompt.
         if context.kind in {"text", "image", "time", "found"}:
@@ -241,30 +278,32 @@ def build_router(service: BackendService) -> Router:
                     return
             except AppError:
                 return
-        pending = context
+        state().pending = context
 
     async def home(message: Message, actor: int) -> None:
-        nonlocal pending, selected, context_epoch
-        context_epoch += 1
-        pending = None
-        selected = None
+        state().context_epoch += 1
+        state().pending = None
+        state().selected = None
         businesses = service.list_businesses(actor)
         rows = [[(b.name[:50], f"business:{b.id}")] for b in businesses[-15:]]
+        viewer = service.access_role(actor) == "reviewer"
+        if not viewer:
+            rows.append([("Создать бизнес", "input:name")])
         await reply(
             message,
-            STUDIO_TITLE + "\n\nВыберите бизнес или создайте карточку."
+            STUDIO_TITLE + ("\n\nНаблюдатель · только просмотр. Выберите бизнес." if viewer
+                            else "\n\nОператор · выберите бизнес или создайте карточку.")
             + (" В студии можно заполнить профиль, написать пост и загрузить своё изображение без нейросети."
-               if service.settings.mini_app_url else ""),
+               if service.settings.mini_app_url and not viewer else ""),
             menu(
                 *rows,
-                [("Создать бизнес", "input:name")],
                 mini_app_url=service.settings.mini_app_url,
             ),
         )
 
     def active(actor: int) -> Business:
-        if selected:
-            return service.get_business(actor, selected)
+        if state().selected:
+            return service.get_business(actor, state().selected)
         businesses = service.list_businesses(actor)
         if len(businesses) == 1:
             return businesses[0]
@@ -332,6 +371,12 @@ def build_router(service: BackendService) -> Router:
             rows.append([("Изменить стиль", f"profile-tone:{business.id}:{business.profile_version}")])
             if not business.profile_confirmed:
                 rows.append([("Подтвердить профиль", f"confirm:{business.id}:{business.profile_version}")])
+        rows.append([("История диалога", f"history:{business.id}")])
+        if service.access_role(actor) == "reviewer":
+            parts.insert(1, "Наблюдатель · только просмотр")
+            rows = [[(label, action) for label, action in row if action.split(":", 1)[0] in READ_CALLBACKS]
+                    for row in rows]
+            rows = [row for row in rows if row]
         await reply(message, "\n".join(parts), menu(*rows))
 
     async def preview(message: Message, actor: int, post: PostView) -> None:
@@ -398,6 +443,9 @@ def build_router(service: BackendService) -> Router:
         for detail in (post.last_error, post.message_url):
             if detail:
                 info += f"\n{detail}"
+        if service.access_role(actor) == "reviewer":
+            rows = []
+            info += "\nНаблюдатель · редактирование и публикация недоступны."
         await reply(message, info, menu(*rows))
 
     async def show_posts(message: Message, posts: list[PostView], prefix: str, page: int = 0) -> None:
@@ -429,7 +477,7 @@ def build_router(service: BackendService) -> Router:
                 business = service.get_business(actor, job.business_id)
                 progress += f"\nПоследнее изменение: {format_time(job.updated_at, business.timezone)}"
             rows = [[("Обновить", f"job:{job.id}")]]
-            if job.status == "pending":
+            if job.status == "pending" and service.access_role(actor) != "reviewer":
                 rows.append([("Отменить задание", f"cancel-job:{job.id}")])
             await reply(message, "Задание принято. " + progress + ".", menu(*rows))
             return
@@ -495,8 +543,7 @@ def build_router(service: BackendService) -> Router:
         )
 
     async def ask(message: Message, prompt: Prompt) -> None:
-        nonlocal pending
-        pending = prompt
+        state().pending = prompt
         await reply(message, INPUTS[prompt.kind], menu())
 
     @router.message(Command("start", "menu", "cancel"))
@@ -508,6 +555,10 @@ def build_router(service: BackendService) -> Router:
 
     @router.message(Command("help"))
     async def help_message(message: Message) -> None:
+        if service.access_role(message.from_user.id) == "reviewer":
+            await reply(message, "Вы можете просматривать профиль компании, посты с изображениями, "
+                        "историю и отчёт. Генерация, правки и публикация доступны команде. Откройте /menu.", menu())
+            return
         await reply(
             message,
             "Создайте бизнес, добавьте материалы и соберите профиль. "
@@ -520,7 +571,6 @@ def build_router(service: BackendService) -> Router:
 
     @router.callback_query()
     async def callback(query: CallbackQuery, event_update: Update) -> None:
-        nonlocal pending, selected, context_epoch
         message, actor = query.message, query.from_user.id
         action, _, tail = (query.data or "").partition(":")
         target, _, version = tail.partition(":")
@@ -535,25 +585,25 @@ def build_router(service: BackendService) -> Router:
             "found",
         }
         if changes_context:
-            context_epoch += 1
-            pending = None
-        epoch = context_epoch
+            state().context_epoch += 1
+            state().pending = None
+        epoch = state().context_epoch
         await query.answer()
-        if changes_context and epoch != context_epoch:
+        if changes_context and epoch != state().context_epoch:
             return  # A newer selection/input won while Telegram acknowledged this old button.
         if action == "home":
             await home(message, actor)
         elif action == "business":
             business = service.get_business(actor, target)
-            pending = None
-            selected = business.id  # Select before awaiting; a late render never retargets input.
+            state().pending = None
+            state().selected = business.id  # Select before awaiting; a late render never retargets input.
             await business_menu(message, actor, business)
         elif action == "input" and target in {"name", "notes", "url", "pdf", "channel", "request", "auto"}:
             business_id = "" if target == "name" else service.get_business(actor, version).id
             if target == "request":
                 # A reply to the interpreter's clarification must stay in the
                 # company of this button, even when it came from an older menu.
-                selected = business_id
+                state().selected = business_id
             await ask(message, Prompt(target, business_id))
         elif action == "analyze":
             await reply(message, "Изучаю материалы…")
@@ -613,6 +663,10 @@ def build_router(service: BackendService) -> Router:
                     "Повтор отправит только это уведомление. После обрыва связи ранее отправленное сообщение может повториться.",
                     menu([("Повторить это уведомление", f"retry-notice:{target}")]),
                 )
+        elif action == "history":
+            history = service.conversation_history(actor, target)
+            lines = [f"Вы: {turn['user_text']}\nАссистент: {turn['assistant_text']}" for turn in history]
+            await reply(message, "\n\n".join(lines) if lines else "В этой компании пока нет истории диалога.", menu())
         elif action == "report":
             now = service.now()
             await reply(message, service.build_report(actor, target, now - timedelta(days=7), now), menu())
@@ -665,10 +719,9 @@ def build_router(service: BackendService) -> Router:
 
     @router.message(F.document)
     async def document(message: Message) -> None:
-        nonlocal pending, context_epoch
         check_input_available()
         actor = message.from_user.id
-        context = pending
+        context = state().pending
         if context and context.kind != "pdf":
             raise InvalidInput("Завершите текущее действие или нажмите /cancel перед загрузкой PDF.")
         business = service.get_business(actor, context.object_id) if context else active(actor)
@@ -676,10 +729,10 @@ def build_router(service: BackendService) -> Router:
         limit = min(8 * 1024 * 1024, service.settings.max_upload_bytes)
         if not (file.file_name or "").lower().endswith(".pdf") or (file.file_size or 0) > limit:
             raise InvalidInput("Пришлите PDF до 8 МиБ.")
-        pending = None  # Consume before downloading; later callbacks can safely set a new prompt.
-        context_epoch += 1
-        epoch = context_epoch
-        inflight_inputs.add(epoch)
+        state().pending = None  # Consume before downloading; later callbacks can safely set a new prompt.
+        state().context_epoch += 1
+        epoch = state().context_epoch
+        state().inflight_inputs.add(epoch)
         try:
             with LimitedFile(limit) as destination:
                 await message.bot.download(file, destination=destination, timeout=20)
@@ -688,7 +741,7 @@ def build_router(service: BackendService) -> Router:
             restore_prompt(context, epoch, actor)
             raise
         finally:
-            inflight_inputs.discard(epoch)
+            state().inflight_inputs.discard(epoch)
         await business_menu(message, actor, service.get_business(actor, business.id))
 
     async def handle_post_input(
@@ -723,24 +776,22 @@ def build_router(service: BackendService) -> Router:
 
     @router.message()
     async def receive(message: Message, event_update: Update) -> None:
-        nonlocal pending, context_epoch
         check_input_available()
-        context = pending
-        pending = None  # Never clear or replace a newer prompt after a provider await.
-        context_epoch += 1
-        epoch = context_epoch
+        context = state().pending
+        state().pending = None  # Never clear or replace a newer prompt after a provider await.
+        state().context_epoch += 1
+        epoch = state().context_epoch
         if context is not None:
-            inflight_inputs.add(epoch)
+            state().inflight_inputs.add(epoch)
         try:
             await receive_text(message, event_update, context)
         except AppError:
             restore_prompt(context, epoch, message.from_user.id)
             raise
         finally:
-            inflight_inputs.discard(epoch)
+            state().inflight_inputs.discard(epoch)
 
     async def receive_text(message: Message, event_update: Update, context: Prompt | None) -> None:
-        nonlocal selected
         actor = message.from_user.id
         text = (message.text or "").strip()
         if context and context.kind == "found":
@@ -751,7 +802,7 @@ def build_router(service: BackendService) -> Router:
             await handle_post_input(message, actor, context, text, event_key(event_update, message.bot.id))
         elif context and context.kind == "name":
             business = service.create_business(actor, text)
-            selected = business.id
+            state().selected = business.id
             await business_menu(message, actor, business)
         else:
             business = service.get_business(actor, context.object_id) if context else active(actor)
