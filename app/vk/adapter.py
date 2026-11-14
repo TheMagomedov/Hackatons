@@ -123,6 +123,9 @@ class VKBotAdapter:
                 cursor = str(result.get("ts", ""))
                 self.store.cursor(cursor)  # Ack only after all events have been persisted.
                 server["ts"] = cursor
+                # A transient poll failure must not leave the delivery worker paused
+                # after the existing, already verified server starts responding again.
+                self.ready = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

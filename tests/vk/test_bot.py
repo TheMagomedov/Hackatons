@@ -299,3 +299,34 @@ async def test_delivery_timeout_cannot_replay_mutation_or_response(bot):
     assert bot.client.send.await_count == 1
     row = bot.store.db.execute("SELECT state,text FROM inbox").fetchone()
     assert row[:] == ("failed", "")
+
+
+async def test_successful_poll_resumes_delivery_after_transient_failure(bot):
+    class Stop:
+        done = False
+
+        def is_set(self):
+            return self.done
+
+        async def wait(self):
+            raise TimeoutError
+
+    stop = Stop()
+    calls = 0
+    bot.client.poll_server.return_value = {"server": "https://lp.vk.com/wh", "key": "private", "ts": "1"}
+
+    async def poll(server):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ProviderUnavailable("Temporary network error")
+        assert not bot.ready
+        stop.done = True
+        return {"ts": "2", "updates": [event("Меню")]}
+
+    bot.client.poll.side_effect = poll
+    await bot.poll_loop(stop)
+    assert bot.ready
+    assert bot.store.cursor() == "2"
+    assert await bot.process_next()
+    bot.client.send.assert_awaited_once()
