@@ -3,6 +3,7 @@
   font-style:normal;font-weight:100 900;font-display:swap;
 }
 * {box-sizing:border-box}
+.studio-video { width: 100%; max-height: 60vh; }
 :root {
   --canvas:#13171e;--app:#1b2029;--surface:#252c37;--raised:#303b4a;
   --ink:#f2f1ed;--muted:#c6c9d1;--subtle:#adb5c4;--line:#485465;

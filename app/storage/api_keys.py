@@ -44,9 +44,9 @@ class APIKeyRepository:
 
     def issue_api_key(self, business_id, actor_id, name, scopes, days, now):
         if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 80
-                or not isinstance(scopes, list) or not scopes or set(scopes) - {'read', 'generate'}
+                or not isinstance(scopes, list) or not scopes or set(scopes) - {'read', 'generate', 'leads'}
                 or type(days) is not int or not 1 <= days <= 90):
-            raise InvalidInput('Укажите название, права read/generate и срок от 1 до 90 дней.')
+            raise InvalidInput('Укажите название, права read/generate/leads и срок от 1 до 90 дней.')
         with self._transaction() as conn:
             business = self._business(conn, business_id)
             if business.owner_id != actor_id or business.archived:

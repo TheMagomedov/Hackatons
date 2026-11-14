@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+from app.shared.marketing import MarketingReport
 from app.shared.models import (
     BusinessProfile,
     ChannelInfo,
@@ -19,6 +20,8 @@ from app.shared.models import (
 
 
 class AIProvider(Protocol):
+    async def marketing_report(self, profile: BusinessProfile, kind: str,
+                               request: str, evidence: list[dict]) -> MarketingReport: ...
     async def build_profile(self, sources: list[SourceInput]) -> BusinessProfile: ...
     async def interpret_request(self, text: str, context: dict) -> TaskIntent: ...
     async def make_plan(self, profile: BusinessProfile, request: str) -> ContentPlan: ...

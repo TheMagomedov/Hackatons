@@ -1,5 +1,7 @@
 # САЛАВАТСТЕКЛО · Контент-студия
 
+Обновление 14.11: [маркетинговые материалы, видео, UTM и обращения](docs/MARKETING.md). [Проверки и оставшиеся ограничения](docs/RELEASE_PROGRESS.md). [Презентация PPTX](outputs/Salavatsteklo-product-v2.pptx) · [PDF](outputs/Salavatsteklo-product-v2.pdf).
+
 Презентация продукта: [PowerPoint с редактируемыми графиками](outputs/Salavatsteklo-product.pptx), [PDF для показа](outputs/Salavatsteklo-product.pdf). [Установленные доработки, проверки и оставшиеся задачи](docs/RELEASE_PROGRESS.md).
 
 Последнее обновление: права и приглашения отдельно по компании, сохраняемая очередь изображений с отменой/повтором, автосохранение форм и черновики до подключения канала. Проверены настоящие AgentRouter → FLUX → черновик → согласование в изолированной базе; 1048 тестов прошли. [Как пользоваться доступом](docs/TEAM_ACCESS.md), [эксплуатация очереди](docs/OPERATIONS.md).

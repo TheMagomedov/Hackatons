@@ -137,7 +137,7 @@ function apiTimeout(url, method) {
   if (method === "POST" && /^\/business\/[^/?#]+\/visuals$/.test(url)) return 660000;
   // Only synchronous inference needs the backend's 300s budget plus transport margin.
   // Creating a generation job is a short queue operation and keeps the default.
-  return method === "POST" && /^(?:\/business\/[^/?#]+\/(?:profile\/analyze|chat)|\/post\/[^/?#]+\/revise-(?:text|image))$/.test(url)
+  return method === "POST" && /^(?:\/business\/[^/?#]+\/(?:profile\/analyze|chat|marketing|videos)|\/post\/[^/?#]+\/revise-(?:text|image))$/.test(url)
     ? 330000 : undefined;
 }
 async function api(url, body) {
@@ -521,6 +521,8 @@ function reportView() {
     + '<svg viewBox="0 0 600 190" role="img" aria-label="График подготовки и публикаций" font-size="15">'
     + [28, 73, 118, 162].map((y) => '<path d="M36 ' + y + 'h530" class="baseline"/>').join("")
     + bars + '</svg><div class="legend"><span><i></i>Подготовлено</span><span><i></i>Опубликовано</span></div></section>'
+    + '<section class="panel"><h2>Кампании и обращения</h2><p>Создайте UTM-ссылку и отмечайте пришедшие обращения. Источник задаётся явно вами или вашей CRM; просмотры и клики здесь не измеряются.</p>'
+    + button('Кампании и обращения','campaigns','secondary')+'</section>'
     + (report?.detail ? '<details class="panel report-detail"><summary>Полный отчёт</summary><pre>'
       + safe(report.detail) + '</pre></details>' : "");
 }
@@ -538,15 +540,76 @@ function businessView() {
     + button("Собрать с AI", "analyze", "secondary", "spark")
     + (profile && !b.profile_confirmed ? button("Подтвердить", "confirm-profile", "primary", "check") : "")
     + '</section><div><section class="panel business-panel"><h2>Источники</h2><p>Загрузите договор, регламент или брендбук; вопросы можно задать AI.</p>'
-    + '<p>Поддерживаются текст, публичная страница сайта и PDF с текстовым слоем.</p><ul>'
+    + '<p>Текст, публичная страница, DOCX и PDF. Сканы PDF распознаются локально.</p><ul>'
     + state.sources.map((s) => '<li>' + safe(s.name) + '</li>').join("") + '</ul>'
     + button("Добавить источник", "add-source", "secondary", "plus")
     + button("PDF или Word", "upload-pdf", "secondary", "posts")
     + button("Поиск по документам", "knowledge-search", "secondary", "posts")
+    + '</section><section class="panel business-panel"><h2>Маркетинг</h2><p>Стратегия на 90 дней, сравнение страниц конкурентов и сценарии роликов. Все материалы сохраняются; рекомендации требуют вашей оценки.</p>'
+    + button('Подготовить материал', 'new-marketing', 'secondary', 'spark')
+    + button('Сохранённые материалы', 'marketing-history', 'secondary', 'posts')
     + '</section><section class="panel business-panel"><h2>Канал</h2><p>'
     + safe(b.channel_title || b.channel_id || "Канал пока не подключён.") + '</p>'
     + button(b.channel_id ? "Изменить канал" : "Подключить канал", "channel", "secondary", "telegram")
     + '</section>' + (currentAccess().role === "owner" ? '<section class="panel business-panel"><h2>API для интеграций</h2><p>Ключ даёт доступ только к этой компании. Генерация создаёт черновики; согласование выполняется в студии.</p>' + button('Управлять API-ключами', 'api-keys', 'secondary') + button('Лимит AI компании', 'company-ai-limit', 'secondary') + '</section><section class="panel business-panel"><h2>Команда и доступ</h2><p>Настройте права участников отдельно для этой компании.</p>' + button('Управлять доступом', 'company-team', 'secondary') + button('Пригласить участника', 'company-invite', 'secondary') + '</section><section class="panel business-panel"><h2>Архив компании</h2><p>Скрыть компанию из списка и остановить подготовку и публикации. Данные сохранятся.</p>' + button("Перенести в архив", "archive-business", "secondary") + '</section>' : '') + '</div></div>';
+}
+let marketingSelection = null;
+const marketingHistory = new Map();
+const marketingLabels={observation:'Наблюдение из источников',recommendation:'Рекомендация',hypothesis:'Гипотеза для проверки'};
+let videoURL = null;
+const videoDocuments = new Map();
+dialog.addEventListener('close',()=>{if(videoURL){URL.revokeObjectURL(videoURL);videoURL=null;}});
+async function showVideo(item) {
+  const company=businessId;
+  if(item.asset.business_id!==company)throw new Error('Видео относится к другой компании.');
+  showDialog(dialogHeading(item.title,item.duration+' с · '+item.width+' × '+item.height+' · MP4 без звука. Автоматическая публикация видео не включена.')
+    + '<p data-video-progress>Загружаем видео…</p><video class="studio-video" controls playsinline aria-label="Просмотр ролика"></video>'
+    +button('Скачать MP4','download-video','secondary','','disabled'));
+  const element=dialogBody.querySelector('video');
+  const response=await request('./api/video/'+path(item.asset.id),{headers:session.headers(),cache:'no-store',timeoutMs:60000});
+  if(!response.ok)throw new Error('Не удалось загрузить видео.');
+  const blob=await response.blob();
+  if(!element.isConnected||company!==businessId)return;
+  if(videoURL)URL.revokeObjectURL(videoURL);
+  videoURL=URL.createObjectURL(blob);element.src=videoURL;
+  dialogBody.querySelector('[data-video-progress]').textContent='Видео готово к просмотру.';
+  dialogBody.querySelector('[data-action="download-video"]').disabled=false;
+}
+let campaignSelection = null;
+const leadStages={new:'Новое',qualified:'Квалифицировано',won:'Сделка закрыта',lost:'Не состоялось'};
+const rubles=value=>(value/100).toLocaleString('ru-RU',{style:'currency',currency:'RUB'});
+function campaignOptions(items) {return '<option value="">Источник не установлен</option>'+items.map(c=>'<option value="'+safe(c.id)+'">'+safe(c.name)+'</option>').join('');}
+function showCampaigns(data) {
+  campaignSelection={business:businessId,data};
+  const t=data.total;
+  showDialog(dialogHeading('Кампании и обращения','Данные введены участниками или получены через API. Это не подтверждение оплаты и не доказательство причинного влияния публикаций на продажи.')
+    + '<p><strong>'+t.total+'</strong> обращений · '+t.won+' закрытых сделок · Заявленная сумма: '+safe(rubles(t.amount_kopecks))+'</p>'
+    + '<p>Без установленного источника: '+data.unattributed.total+'. Доля закрытых сделок: '+(t.total?Math.round(t.won/t.total*100)+'%':'нет данных')+'.</p>'
+    + button('Создать UTM-ссылку','new-campaign','primary')+button('Добавить обращение','new-lead','secondary')
+    + '<h3>Кампании</h3>'+(data.campaigns.length?data.campaigns.map(c=>'<details class="post-sources"><summary>'+safe(c.name)+' · '+c.metrics.total+' обращений</summary><p>Источник: '+safe(c.source)+' · '+safe(c.medium)+' · '+safe(c.campaign)+'</p><label class="form-row"><span>Ссылка для публикации</span><textarea readonly rows="3">'+safe(c.tracked_url)+'</textarea></label><p class="post-text">ID для CRM: '+safe(c.id)+'</p><p>Закрыто сделок: '+c.metrics.won+' · '+safe(rubles(c.metrics.amount_kopecks))+'</p></details>').join(''):'<p>Кампаний пока нет.</p>')
+    + '<h3>Обращения</h3><p>Показано '+data.leads.length+' из '+data.leads_total+', пропущено '+data.offset+'.</p>'
+    + data.leads.map(l=>'<article class="post-sources"><h4>'+safe(l.title)+'</h4><p>'+safe(leadStages[l.stage])+' · '+safe(formatDate(l.created_at))+' · '+(l.origin==='api'?'Импорт API':'Внесено вручную')+'</p><p>'+safe(l.note)+'</p><p>'+safe(rubles(l.amount_kopecks))+'</p>'+button('Изменить статус','edit-lead','secondary','','data-id="'+safe(l.id)+'"')+'</article>').join('')
+    + (data.offset?button('Предыдущие обращения','campaigns','secondary','','data-offset="'+Math.max(0,data.offset-100)+'"'):'')
+    + (data.more?button('Следующие обращения','campaigns','secondary','','data-offset="'+(data.offset+100)+'"'):''));
+}
+const marketingKinds = {strategy:'Стратегия на 90 дней',competitors:'Сравнение конкурентов',video_script:'Сценарий видео'};
+function marketingContent(doc) {
+  const r=doc.report;
+  const evidence=new Map(doc.evidence.map(e=>[e.id,e]));
+  return '<p class="date">'+safe(marketingKinds[doc.kind])+' · '+safe(formatDate(doc.created_at))+' · Профиль v'+doc.profile_version+'</p>'
+    + (doc.profile_version!==state.business.profile_version?'<p class="notice">Профиль компании изменился после подготовки. Проверьте актуальность материала.</p>':'')
+    + '<p class="post-text">'+safe(r.summary)+'</p>'
+    + r.sections.map(s=>'<section class="post-sources"><small>'+safe(marketingLabels[s.kind])+'</small><h3>'+safe(s.heading)+'</h3><p class="post-text">'+safe(s.text)+'</p><p>'+safe(s.source_ids.map(id=>evidence.get(id)?.name||id).join(' · '))+'</p></section>').join('')
+    + (r.scenes.length?'<h3>Сценарий · '+r.scenes.reduce((n,s)=>n+s.seconds,0)+' секунд</h3><p>Это сценарий, не готовый видеофайл.</p>'+r.scenes.map((s,i)=>'<section class="post-sources"><h4>Кадр '+(i+1)+' · '+s.seconds+' с</h4><p>'+safe(s.visual)+'</p><p><strong>Речь:</strong> '+safe(s.voiceover||'Без речи')+'</p><p><strong>Надпись:</strong> '+safe(s.screen_text||'Без надписи')+'</p></section>').join(''):'')
+    + '<h3>Следующие шаги</h3><ol>'+r.next_steps.map(v=>'<li>'+safe(v)+'</li>').join('')+'</ol>'
+    + (r.measurement_plan.length?'<h3>План измерений</h3><ul>'+r.measurement_plan.map(v=>'<li>'+safe(v)+'</li>').join('')+'</ul>':'')
+    + (r.warnings.length?'<h3>Ограничения</h3><ul>'+r.warnings.map(v=>'<li>'+safe(v)+'</li>').join('')+'</ul>':'')
+    + '<h3>Источники и выдержки</h3>'+doc.evidence.map(e=>'<details class="post-sources"><summary>'+safe(e.name)+'</summary><p class="post-text">'+safe(e.url||'Материал компании')+'</p><p>Получено: '+safe(formatDate(e.captured_at))+'</p><p class="post-text">'+safe(e.excerpt)+'</p></details>').join('');
+}
+function showMarketing(doc) {
+  marketingSelection={business:businessId,doc};
+  showDialog(dialogHeading(doc.report.title,'Материал AI. Перед использованием проверьте факты и предложения.')+marketingContent(doc)
+    +button('Скачать материал','download-marketing','secondary'));
 }
 function updateNavigation() {
   document.querySelectorAll("nav [data-view]").forEach((button) => {
@@ -800,7 +863,8 @@ function visualStudioCard() {
     + (local ? ', а локальный FLUX создаст изображение.' : ' и подготовит изображение.')
     + ' Можно скачать результат или использовать его в посте.</p></div><div class="press-actions">'
     + button("Создать изображение", "new-visual", "primary", "image")
-    + button("Мои изображения", "visual-gallery", "secondary") + '</div></section>';
+    + button("Мои изображения", "visual-gallery", "secondary")
+    + button('Собрать видео','new-video','secondary')+button('Мои видео','videos','secondary')+'</div></section>';
 }
 function showVisual(visual) {
   if (visual.asset.business_id !== businessId) throw new Error("Изображение относится к другой компании.");
@@ -914,6 +978,72 @@ document.addEventListener("click", async (event) => {
       const requestId=control.dataset.requestId || (control.dataset.requestId=crypto.randomUUID());
       await api('/job/' + path(id) + '/retry-visual',{request_id:requestId});
       await refresh(); notify('Создано новое задание. Этот явный повтор расходует лимит генерации.');
+    } else if (action === 'new-video') {
+      const company=businessId;const result=await api('/business/'+path(company)+'/visuals');
+      if(company!==businessId)return;
+      if(!result.items.length)throw new Error('Сначала создайте изображения в студии.');
+      const options=result.items.map(v=>'<option value="'+safe(v.asset.id)+'">'+safe(v.request.slice(0,80))+'</option>').join('');
+      openForm('video','Видео из изображений','Сборка MP4 на сервере: до 6 кадров, без звука. Изображения сохранятся целиком. Сборка учитывается как одна операция в дневном лимите.',
+        formField('Название ролика','title','text','maxlength="100"')
+        +'<label class="form-row"><span>Формат</span><select name="format"><option value="portrait">Вертикальный 9:16</option><option value="square">Квадрат 1:1</option></select></label>'
+        +'<label class="form-row"><span>Секунд на кадр</span><input name="seconds" type="number" min="2" max="10" value="5" required></label>'
+        +Array.from({length:6},(_,i)=>'<label class="form-row"><span>Кадр '+(i+1)+(i?' — необязательно':'')+'</span><select name="frame'+i+'" '+(i?'':'required')+'><option value="">Выберите изображение</option>'+options+'</select></label><label class="form-row"><span>Подпись кадра '+(i+1)+'</span><input name="caption'+i+'" maxlength="80"></label>').join(''),'Собрать MP4');
+    } else if (action === 'videos') {
+      const company=businessId;const result=await api('/business/'+path(company)+'/videos');
+      if(company!==businessId)return;
+      videoDocuments.clear();result.items.forEach(v=>videoDocuments.set(v.asset.id,v));
+      showDialog(dialogHeading('Мои видео','Последние 50 роликов текущей компании.')
+        +(result.items.length?result.items.map(v=>'<article class="post-sources"><h3>'+safe(v.title)+'</h3><p>'+v.duration+' с · '+v.width+' × '+v.height+'</p>'+button('Посмотреть видео','open-video','secondary','','data-id="'+safe(v.asset.id)+'"')+'</article>').join(''):'<p>Видео пока нет. Нажмите «Собрать видео».</p>'));
+    } else if (action === 'open-video') {
+      const video=videoDocuments.get(id);if(!video)throw new Error('Откройте список видео заново.');await showVideo(video);
+    } else if (action === 'download-video') {
+      if(!videoURL)throw new Error('Видео ещё загружается.');
+      const link=document.createElement('a');link.href=videoURL;link.download='studio-video.mp4';link.click();
+    } else if (action === 'campaigns') {
+      const company=businessId;const data=await api('/business/'+path(company)+'/campaigns?offset='+(Number(control.dataset.offset)||0));
+      if(company===businessId)showCampaigns(data);
+    } else if (action === 'new-campaign') {
+      openForm('campaign','Новая UTM-ссылка','Метка связывает ссылку с кампанией. Само создание ссылки не включает сбор кликов.',
+        formField('Название кампании','name','text','maxlength="120"')+formField('Публичная страница','url','url','maxlength="2000"')
+        +formField('Источник, например telegram или vk','source','text','pattern="[a-zA-Z0-9_-]{1,80}" maxlength="80"')
+        +formField('Метка кампании латиницей','campaign','text','pattern="[a-zA-Z0-9_-]{1,80}" maxlength="80"'),'Создать ссылку');
+    } else if (action === 'new-lead') {
+      if(campaignSelection?.business!==businessId)throw new Error('Откройте список обращений заново.');
+      openForm('lead','Новое обращение','Укажите внутренний номер заявки или краткое название. Контактные и платёжные реквизиты не нужны; эти данные не передаются модели.',
+        formField('Название или номер заявки','title','text','maxlength="160"')
+        +'<label class="form-row"><span>Кампания</span><select name="campaign_id">'+campaignOptions(campaignSelection.data.campaigns)+'</select></label>'
+        +'<label class="form-row"><span>Заметка</span><textarea name="note" maxlength="1000" rows="3"></textarea></label>','Добавить');
+    } else if (action === 'edit-lead') {
+      const lead=campaignSelection?.business===businessId&&campaignSelection.data.leads.find(l=>l.id===id);
+      if(!lead)throw new Error('Откройте список обращений заново.');
+      openForm('lead-edit','Статус обращения',lead.title,
+        '<input type="hidden" name="lead_id" value="'+safe(lead.id)+'"><input type="hidden" name="revision" value="'+lead.revision+'">'
+        +'<label class="form-row"><span>Статус</span><select name="stage">'+Object.entries(leadStages).map(([k,v])=>'<option value="'+k+'" '+(k===lead.stage?'selected':'')+'>'+v+'</option>').join('')+'</select></label>'
+        +'<label class="form-row"><span>Заявленная сумма, ₽ — только для закрытой сделки</span><input name="amount" type="number" min="0" max="1000000000" step="0.01" value="'+lead.amount_kopecks/100+'" required></label>','Сохранить статус');
+    } else if (action === 'new-marketing') {
+      if(demo)throw new Error('Маркетинговые материалы доступны в рабочей студии.');
+      openForm('marketing','Подготовить маркетинговый материал','Используем подтверждённый профиль компании. Для сравнения укажите до трёх публичных страниц, по одной ссылке в строке.',
+        '<label class="form-row"><span>Тип материала</span><select name="kind">'+Object.entries(marketingKinds).map(([k,v])=>'<option value="'+k+'">'+v+'</option>').join('')+'</select></label>'
+        + '<label class="form-row"><span>Задача и ограничения</span><textarea name="request" maxlength="4000" required rows="4" placeholder="Цель, аудитория, доступные ресурсы и период"></textarea></label>'
+        + '<label class="form-row"><span>Страницы конкурентов — только для сравнения</span><textarea name="urls" maxlength="6002" rows="3" placeholder="https://example.com"></textarea></label>', 'Подготовить');
+    } else if (action === 'marketing-history') {
+      const company=businessId;
+      const result=await api('/business/'+path(company)+'/marketing');
+      if(company!==businessId)return;
+      marketingHistory.clear();result.items.forEach(d=>marketingHistory.set(d.id,{company,doc:d}));
+      showDialog(dialogHeading('Сохранённые материалы','Последние 50 документов текущей компании.')
+        + (result.items.length?result.items.map(d=>'<details class="post-sources"><summary>'+safe(d.report.title)+'</summary>'+marketingContent(d)+button('Открыть и скачать','open-marketing','secondary','','data-id="'+safe(d.id)+'"')+'</details>').join(''):'<p>Материалов пока нет. Нажмите «Подготовить материал» в разделе «Маркетинг».</p>'));
+    } else if (action === 'open-marketing') {
+      const saved=marketingHistory.get(id);
+      if(saved?.company!==businessId)throw new Error('Откройте список материалов заново.');
+      showMarketing(saved.doc);
+    } else if (action === 'download-marketing') {
+      if(marketingSelection?.business!==businessId)throw new Error('Откройте материал текущей компании заново.');
+      const d=marketingSelection.doc,r=d.report;
+      const text=[r.title,'Материал AI · '+d.created_at+' · Профиль v'+d.profile_version,r.summary,...r.sections.map(s=>marketingLabels[s.kind]+' · '+s.heading+'\n'+s.text+'\nИсточники: '+s.source_ids.join(', ')),...r.scenes.map((s,i)=>'Кадр '+(i+1)+' ('+s.seconds+' с)\n'+s.visual+'\nРечь: '+s.voiceover+'\nНадпись: '+s.screen_text),
+        'Следующие шаги',...r.next_steps,'План измерений',...r.measurement_plan,'Ограничения',...r.warnings,'Источники',...d.evidence.map(e=>e.id+' · '+e.name+' · '+(e.url||'материал компании')+'\n'+e.excerpt)].join('\n\n');
+      const url=URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'}));
+      const link=document.createElement('a');link.href=url;link.download='marketing-'+d.kind+'.txt';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     } else if (action === 'company-ai-limit') {
       const usage=await api('/business/'+path(businessId)+'/ai-limit');
       openForm('company-ai-limit','Лимит AI компании','Сегодня: '+usage.used_today+' операций. Сутки UTC. Это количество действий, не денежная стоимость. 0 останавливает новые AI-вызовы, пустое поле оставляет общий лимит.',
@@ -928,7 +1058,7 @@ document.addEventListener("click", async (event) => {
     } else if (action === 'new-api-key') {
       openForm('api-key','Новый API-ключ','Ключ не сможет согласовывать или отправлять публикации.',
         formField('Название интеграции','name','text','maxlength="80"')
-        + '<label class="form-row"><span>Доступ</span><select name="scope"><option value="read">Только чтение</option><option value="generate">Чтение и генерация</option></select></label>'
+        + '<label class="form-row"><span>Доступ</span><select name="scope"><option value="read">Только чтение</option><option value="generate">Чтение и генерация</option><option value="leads">Чтение и приём обращений CRM</option></select></label>'
         + '<label class="form-row"><span>Срок в днях</span><input name="days" type="number" min="1" max="90" value="30" required></label>', 'Создать ключ');
     } else if (action === 'revoke-api-key') {
       await api('/business/'+path(businessId)+'/api-keys/'+path(id)+'/revoke',{});
@@ -1175,11 +1305,29 @@ dialog.addEventListener("submit", async (event) => {
   let submittingBusiness = businessId;
   const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
-    if (action === 'company-ai-limit') {
+    if (action === 'video') {
+      submit.textContent='Собираем MP4 на сервере…';
+      const requestId=form.dataset.requestId||(form.dataset.requestId=crypto.randomUUID());
+      const frames=Array.from({length:6},(_,i)=>({asset_id:values['frame'+i],caption:values['caption'+i]})).filter(f=>f.asset_id);
+      const video=await api('/business/'+path(id)+'/videos',{title:values.title,frames,portrait:values.format==='portrait',seconds_per_frame:Number(values.seconds),request_id:requestId});
+      if(currentForm())await showVideo(video);
+    } else if (['campaign','lead','lead-edit'].includes(action)) {
+      const requestId=form.dataset.requestId||(form.dataset.requestId=crypto.randomUUID());
+      if(action==='campaign')await api('/business/'+path(id)+'/campaigns',{...values,request_id:requestId});
+      else if(action==='lead')await api('/business/'+path(id)+'/leads',{...values,campaign_id:values.campaign_id||null,request_id:requestId});
+      else await api('/business/'+path(id)+'/leads/'+path(values.lead_id),{revision:Number(values.revision),stage:values.stage,amount_kopecks:Math.round(Number(values.amount)*100)});
+      const data=await api('/business/'+path(id)+'/campaigns');
+      if(currentForm())showCampaigns(data);
+    } else if (action === 'marketing') {
+      submit.textContent='Изучаем материалы и готовим документ…';
+      const requestId=form.dataset.requestId||(form.dataset.requestId=crypto.randomUUID());
+      const doc=await api('/business/'+path(id)+'/marketing',{kind:values.kind,request:values.request,urls:values.urls.split(/\r?\n/).map(v=>v.trim()).filter(Boolean),request_id:requestId});
+      if(currentForm())showMarketing(doc);
+    } else if (action === 'company-ai-limit') {
       await api('/business/'+path(id)+'/ai-limit',{limit:values.limit===''?null:Number(values.limit)});
       if(currentForm())dialog.close();notify('Лимит компании сохранён.');
     } else if (action === 'api-key') {
-      const key=await api('/business/'+path(id)+'/api-keys',{name:values.name,days:Number(values.days),scopes:values.scope==='generate'?['read','generate']:['read']});
+      const key=await api('/business/'+path(id)+'/api-keys',{name:values.name,days:Number(values.days),scopes:values.scope==='read'?['read']:['read',values.scope]});
       if(currentForm())showDialog(dialogHeading('Сохраните API-ключ', 'Он показан только сейчас. Храните его в переменной окружения сервера, не в коде сайта или GitHub.')
         + '<label class="form-row"><span>Ключ</span><input readonly type="text" value="'+safe(key.token)+'" autocomplete="off" spellcheck="false"></label>'
         + '<p>Заголовок запроса: Authorization: Bearer &lt;ключ&gt;</p><p>Адрес: '+safe(location.origin+'/mini/integration/v1')+'</p>'+button('Закрыть','close','secondary'));

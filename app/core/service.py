@@ -92,6 +92,7 @@ class BackendService:
         self.knowledge = knowledge
         self.telemetry = telemetry
         self._notification_lock = asyncio.Lock()
+        self._video_lock = asyncio.Lock()
 
     def now(self) -> datetime:
         return as_utc(self.clock())
@@ -245,6 +246,45 @@ class BackendService:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise InvalidInput("Лимит журнала: от 1 до 100.")
         return [] if self.telemetry is None else self.telemetry.recent(business_id, limit=limit)
+
+    @actor_action
+    async def create_marketing_document(self, actor_id, business_id, kind, request, urls, *, request_id):
+        from app.core.marketing import create_document
+        return await create_document(self, actor_id, business_id, kind, request, urls, request_id)
+
+    def marketing_documents(self, actor_id, business_id):
+        self._business(actor_id, business_id, write=False)
+        return self.repo.marketing_documents(business_id)
+
+    @actor_action
+    def create_campaign(self, actor_id, business_id, body):
+        from app.core.campaigns import create_campaign
+        return create_campaign(self, actor_id, business_id, body)
+
+    @actor_action
+    def create_lead(self, actor_id, business_id, body, *, origin='manual'):
+        from app.core.campaigns import create_lead
+        return create_lead(self, actor_id, business_id, body, origin)
+
+    @actor_action
+    def edit_lead(self, actor_id, business_id, lead_id, body):
+        from app.shared.campaigns import LeadEdit
+        self._business(actor_id, business_id)
+        body = LeadEdit.model_validate(body)
+        return self.repo.edit_lead(business_id,actor_id,lead_id,body.revision,body.stage,body.amount_kopecks,self.now())
+
+    def campaign_report(self, actor_id, business_id, *, offset=0):
+        from app.core.campaigns import report
+        return report(self, actor_id, business_id, offset)
+
+    @actor_action
+    async def create_video(self, actor_id, business_id, body):
+        from app.core.video import create
+        return await create(self,actor_id,business_id,body)
+
+    def videos(self, actor_id, business_id):
+        self._business(actor_id,business_id,write=False)
+        return self.repo.video_results(business_id)
 
     def _source_inputs(self, business_id: str) -> list[SourceInput]:
         return [SourceInput(source=source, content=self.files.read(self.repo.get_asset(source.asset_id))

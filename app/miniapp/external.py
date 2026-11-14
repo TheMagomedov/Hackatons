@@ -11,7 +11,7 @@ from app.shared.models import Contract
 
 class KeyInput(Contract):
     name: str = Field(min_length=1, max_length=80)
-    scopes: list[str] = Field(min_length=1, max_length=2)
+    scopes: list[str] = Field(min_length=1, max_length=3)
     days: int = Field(default=30, strict=True, ge=1, le=90)
 
 
@@ -89,6 +89,21 @@ def register(app, service, context, json_body):
         return web.json_response({'items': [item.model_dump(mode='json') for item in
             service.list_posts(key['actor_id'], key['business_id'])[-100:]]})
 
+    async def campaigns(request):
+        key = authorize(request, 'read')
+        return web.json_response(service.campaign_report(key['actor_id'], key['business_id'],
+                                                        offset=int(request.query.get('offset','0'))))
+
+    async def leads(request):
+        from app.shared.campaigns import LeadInput
+        key = authorize(request, 'leads')
+        if 'id' in request.match_info:
+            return web.json_response(service.edit_lead(key['actor_id'],key['business_id'],
+                                                       request.match_info['id'],await json_body(request)))
+        body = LeadInput.model_validate(await json_body(request))
+        data = body.model_copy(update={'request_id':request_key(key,body.request_id)}).model_dump()
+        return web.json_response(service.create_lead(key['actor_id'],key['business_id'],data,origin='api'))
+
     async def asset(request):
         key = authorize(request, 'read')
         item = service.repo.get_asset(request.match_info['id'])
@@ -108,4 +123,6 @@ def register(app, service, context, json_body):
         web.get('/mini/integration/v1/me', me), web.post('/mini/integration/v1/images', images),
         web.post('/mini/integration/v1/prepare', prepare), web.get('/mini/integration/v1/jobs/{id}', job),
         web.get('/mini/integration/v1/posts', posts), web.get('/mini/integration/v1/assets/{id}', asset),
+        web.get('/mini/integration/v1/campaigns', campaigns), web.post('/mini/integration/v1/leads', leads),
+        web.post('/mini/integration/v1/leads/{id}', leads),
     ])

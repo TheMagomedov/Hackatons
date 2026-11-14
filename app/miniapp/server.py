@@ -24,6 +24,7 @@ from app.shared.errors import (
     SafetyBlocked,
     SafetyUnavailable,
 )
+from app.shared.marketing import MarketingKind
 from app.shared.models import Business, Contract, PostStatus
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,11 @@ class ManualDraftInput(Contract):
 class NewJob(Contract):
     request: str = Field(min_length=1, max_length=4000)
     request_id: str = Field(min_length=1, max_length=100)
+
+
+class MarketingInput(NewJob):
+    kind: MarketingKind
+    urls: list[str] = Field(default_factory=list, max_length=3)
 
 
 class ArchiveInput(Contract):
@@ -235,7 +241,7 @@ async def guard(request, handler):
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; "
-        "img-src 'self' blob: data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+        "img-src 'self' blob: data:; media-src 'self' blob:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
         "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
     )
     return response
@@ -557,6 +563,44 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         svc, actor = context(request)
         return web.json_response({"items": svc.ai_traces(actor, request.match_info["id"])})
 
+    async def marketing(request):
+        svc, actor = context(request)
+        business_id = request.match_info['id']
+        if request.method == 'GET':
+            return web.json_response({'items': svc.marketing_documents(actor, business_id)})
+        body = MarketingInput.model_validate(await json_body(request))
+        return show(await svc.create_marketing_document(actor, business_id, body.kind, body.request, body.urls,
+                                                       request_id='mini-marketing:' + body.request_id))
+
+    async def campaigns(request):
+        svc, actor = context(request)
+        business = request.match_info['id']
+        if request.method == 'GET':
+            return web.json_response(svc.campaign_report(actor,business,offset=int(request.query.get('offset','0'))))
+        return web.json_response(svc.create_campaign(actor,business,await json_body(request)))
+
+    async def leads(request):
+        svc, actor = context(request)
+        body = await json_body(request)
+        business = request.match_info['id']
+        if 'lead' in request.match_info:
+            return web.json_response(svc.edit_lead(actor,business,request.match_info['lead'],body))
+        return web.json_response(svc.create_lead(actor,business,body))
+
+    async def videos(request):
+        svc, actor = context(request)
+        business = request.match_info['id']
+        if request.method == 'GET':
+            return web.json_response({'items': svc.videos(actor,business)})
+        return show(await svc.create_video(actor,business,await json_body(request)))
+
+    async def video_file(request):
+        svc, actor = context(request)
+        asset, data = svc.read_asset(actor,request.match_info['id'])
+        if asset.mime_type != 'video/mp4':
+            raise NotFound('Видео недоступно.')
+        return web.Response(body=data,content_type='video/mp4')
+
     async def chat(request):
         svc, actor = context(request)
         business_id = request.match_info["id"]
@@ -687,6 +731,15 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.post("/mini/api/business/{id}/chat", chat),
         web.post("/mini/api/business/{id}/knowledge/search", knowledge_search),
         web.get("/mini/api/business/{id}/traces", traces),
+        web.get('/mini/api/business/{id}/marketing', marketing),
+        web.post('/mini/api/business/{id}/marketing', marketing),
+        web.get('/mini/api/business/{id}/campaigns', campaigns),
+        web.post('/mini/api/business/{id}/campaigns', campaigns),
+        web.post('/mini/api/business/{id}/leads', leads),
+        web.post('/mini/api/business/{id}/leads/{lead}', leads),
+        web.get('/mini/api/business/{id}/videos', videos),
+        web.post('/mini/api/business/{id}/videos', videos),
+        web.get('/mini/api/video/{id}', video_file),
         web.get("/mini/api/job/{id}", job),
         web.post("/mini/api/job/{id}/cancel", cancel_job),
         web.post('/mini/api/job/{id}/retry-visual', retry_visual),

@@ -38,8 +38,9 @@ from app.shared.models import (
 )
 from app.storage.access import AccessRepository
 from app.storage.api_keys import APIKeyRepository
+from app.storage.campaigns import CampaignRepository
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
@@ -61,7 +62,7 @@ def _new_id() -> str:
     return str(uuid4())
 
 
-class Repository(AccessRepository, APIKeyRepository):
+class Repository(AccessRepository, APIKeyRepository, CampaignRepository):
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
         self._uri = self.db_path == ":memory:"
@@ -152,6 +153,9 @@ class Repository(AccessRepository, APIKeyRepository):
                 version = 6
             if version == 6:
                 self._migrate_v6_to_v7(conn)
+                version = 7
+            if version == 7:
+                self.initialize_campaigns(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if version != 0:
@@ -186,6 +190,7 @@ class Repository(AccessRepository, APIKeyRepository):
             self._migrate_v4_to_v5(conn)
             self._migrate_v5_to_v6(conn)
             self._migrate_v6_to_v7(conn)
+            self.initialize_campaigns(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -1752,6 +1757,23 @@ class Repository(AccessRepository, APIKeyRepository):
                 item['asset'] = json.loads(row['data'])
                 results.append(item)
             return results
+
+    def marketing_documents(self, business_id: str) -> list[dict]:
+        with self._reader() as conn:
+            self._business(conn, business_id)
+            return [{'id': row['id'], **json.loads(row['result'])} for row in conn.execute(
+                "SELECT id,result FROM ai_operations WHERE business_id=? AND status='done' "
+                "AND kind IN ('marketing_strategy','marketing_competitors','marketing_video_script') "
+                "ORDER BY created_at DESC,id DESC LIMIT 50", (business_id,))]
+
+    def video_results(self, business_id):
+        with self._reader() as conn:
+            self._business(conn,business_id)
+            return [json.loads(row['result']) for row in conn.execute(
+                "SELECT o.result FROM ai_operations o JOIN assets a ON a.id=json_extract(o.result,'$.asset.id') "
+                "WHERE o.business_id=? AND a.business_id=? AND o.kind='video_render' AND o.status='done' "
+                "AND COALESCE(json_extract(a.data,'$.archived'),0)=0 ORDER BY o.created_at DESC,o.id DESC LIMIT 50",
+                (business_id,business_id))]
 
     def list_jobs(self, business_id: str) -> list[Job]:
         with self._reader() as conn:

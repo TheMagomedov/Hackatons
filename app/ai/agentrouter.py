@@ -6,6 +6,7 @@ The child receives only the redacted request in stdin and a short-lived home.
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -23,6 +24,7 @@ from app.safety.privacy import redact_for_egress
 from app.shared.errors import InvalidInput, ProviderUnavailable
 
 BASE_URL = "https://agentrouter.org/v1"
+log = logging.getLogger(__name__)
 # Tool-disabling flags are part of the security contract. Requalify a new CLI
 # against scripts/check_agentrouter_cli.py before extending this allowlist.
 VERIFIED_CLI_VERSIONS = {"codex-cli 0.167.0-alpha.4.1"}
@@ -133,7 +135,9 @@ class AgentRouterClient(ChatGPTClient):
             raise InvalidInput("Слишком много данных для одного запроса.")
         prompt = "Задание: " + instruction + "\n" + payload
         try:
-            async with asyncio.timeout(self.timeout):
+            # Structured multi-section documents have a larger, still bounded budget.
+            budget = min(240, self.timeout * 2) if schema.__name__ == 'MarketingReport' else self.timeout
+            async with asyncio.timeout(budget):
                 with tempfile.TemporaryDirectory(prefix="studio-agentrouter-") as directory:
                     root = Path(directory).resolve()
                     env = self._environment(root)
@@ -158,7 +162,15 @@ class AgentRouterClient(ChatGPTClient):
             raise ProviderUnavailable(
                 "AgentRouter не выполнил запрос. Проверьте доступ и лимиты ключа, сеть и версию Codex CLI."
             ) from None
-        except (TimeoutError, OSError, ValidationError, ValueError, ExceptionGroup):
+        except TimeoutError:
+            log.warning('AgentRouter deadline exceeded schema=%s', schema.__name__)
+            raise ProviderUnavailable('AgentRouter не успел ответить за отведённое время. Уточните или сократите задачу.') from None
+        except ValidationError as exc:
+            # Types/count only: validation input can contain private company data.
+            log.warning('AgentRouter invalid output schema=%s errors=%s', schema.__name__,
+                        [e['type'] for e in exc.errors(include_input=False, include_context=False)])
+            raise ProviderUnavailable('Ответ AgentRouter не соответствует формату материала.') from None
+        except (OSError, ValueError, ExceptionGroup):
             raise ProviderUnavailable("Не удалось получить допустимый ответ AgentRouter за отведённое время.") from None
 
 

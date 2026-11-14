@@ -5,6 +5,7 @@ import asyncio
 from pydantic import ValidationError
 
 from app.shared.errors import ProviderUnavailable
+from app.shared.marketing import MarketingReport
 from app.shared.models import ContentPlan, GeneratedImage, TaskIntent, TextDraft
 
 from .client import MAX_TEXT_CHARACTERS, MAX_TEXT_ITEMS, SafetyPolicy
@@ -43,6 +44,15 @@ class ModeratedAI:
     async def build_profile(self, sources):
         # Business facts and source documents are not publication content.
         return await self.provider.build_profile(sources)
+
+    async def marketing_report(self, profile, kind, request, evidence):
+        self.policy.require_configured()
+        method = getattr(self.provider, 'marketing_report', None)
+        if method is None:
+            raise ProviderUnavailable('Подключённый AI не поддерживает маркетинговые документы.')
+        result = _model(MarketingReport, await method(profile, kind, request, evidence))
+        await _review_texts(self.policy, result.texts())
+        return result
 
     async def interpret_request(self, text, context):
         self.policy.require_configured()

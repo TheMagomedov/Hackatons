@@ -86,6 +86,11 @@ async def main(*, role=None, port=0, vk=False) -> None:
     with TemporaryDirectory(prefix="tirazh-ui-") as destination:
         # Explicit default demo mode and demo factories, no env-file loading.
         runtime = await build_runtime(Settings(mode="demo", owner_id=OWNER, data_dir=Path(destination).resolve()))
+        # Only this isolated test server supplies synthetic marketing output.
+        from tests.test_marketing import document
+        async def marketing_report(profile, kind, request, evidence):
+            return document(evidence)
+        runtime.service.ai.marketing_report = marketing_report
         app = create_app(runtime.service, token=TOKEN)
 
         @web.middleware
