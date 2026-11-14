@@ -132,8 +132,9 @@ async def build_runtime(settings: Settings) -> Runtime:
                     clients.append(OllamaJSONClient(selected))
                 ai.client = InferenceRouter(clients, telemetry)
             elif isinstance(ai, ModelAI):
+                from app.ai.agentrouter import AgentRouterClient
                 from app.ai.client import ChatJSONClient
-                if isinstance(ai.client, ChatJSONClient):
+                if isinstance(ai.client, (ChatJSONClient, AgentRouterClient)):
                     # One explicitly selected external provider; never silently
                     # switch to another model, account or local fallback.
                     ai.client = InferenceRouter([ai.client], telemetry)
