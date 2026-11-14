@@ -47,6 +47,7 @@ let watchedJob = 0;
 const imageUrls = new Map();
 const imageTypes = new Map();
 const visualDrafts = new Map();
+const formSaves = new WeakMap();
 let themeOverride = null;
 let dateFormatter;
 let dateTimezone;
@@ -409,7 +410,9 @@ function workView() {
       + '</span><h3>' + safe(job.request) + '</h3><p>' + safe(stageLabels[job.stage] || job.stage || '')
       + (job.total ? ' · ' + job.processed + '/' + job.total : '') + ' · ' + safe(formatDate(job.created_at)) + '</p>'
       + (job.error ? '<p class="form-error">' + safe(job.error) + '</p>' : '') + '</div>'
-      + (job.status === 'pending' ? button("Отменить", "cancel-job", "secondary", "close", 'data-id="' + safe(job.id) + '"') : '')
+      + (job.status === 'pending' || (job.kind === 'visual' && job.status === 'running') ? button("Отменить", "cancel-job", "secondary", "close", 'data-id="' + safe(job.id) + '"') : '')
+      + (job.kind === 'visual' && job.status === 'done' ? button('Открыть изображение', 'job-visual', 'secondary', 'image', 'data-id="'+safe(job.id)+'"') : '')
+      + (job.kind === 'visual' && ['failed','cancelled'].includes(job.status) ? button('Повторить генерацию', 'retry-visual-job', 'secondary', 'spark', 'data-id="'+safe(job.id)+'"') : '')
       + '</article>').join('') + '</div>' : '<div class="empty">Очередь пуста. Создайте задание или включите автоподготовку.</div>') + '</section>'
     + '<details class="panel report-detail activity-panel"><summary>История операций AI</summary>'
     + ((controls.operations || []).length ? '<ol class="activity-list">' + controls.operations.map(op =>
@@ -542,7 +545,7 @@ function businessView() {
     + '</section><section class="panel business-panel"><h2>Канал</h2><p>'
     + safe(b.channel_title || b.channel_id || "Канал пока не подключён.") + '</p>'
     + button(b.channel_id ? "Изменить канал" : "Подключить канал", "channel", "secondary", "telegram")
-    + '</section>' + (currentAccess().role === "owner" ? '<section class="panel business-panel"><h2>Архив компании</h2><p>Скрыть компанию из списка и остановить подготовку и публикации. Данные сохранятся.</p>' + button("Перенести в архив", "archive-business", "secondary") + '</section>' : '') + '</div></div>';
+    + '</section>' + (currentAccess().role === "owner" ? '<section class="panel business-panel"><h2>Команда и доступ</h2><p>Настройте права участников отдельно для этой компании.</p>' + button('Управлять доступом', 'company-team', 'secondary') + button('Пригласить участника', 'company-invite', 'secondary') + '</section><section class="panel business-panel"><h2>Архив компании</h2><p>Скрыть компанию из списка и остановить подготовку и публикации. Данные сохранятся.</p>' + button("Перенести в архив", "archive-business", "secondary") + '</section>' : '') + '</div></div>';
 }
 function updateNavigation() {
   document.querySelectorAll("nav [data-view]").forEach((button) => {
@@ -684,7 +687,49 @@ function openForm(action, title, detail, fields, submit, id = businessId, revisi
     + '<p class="form-error" id="form-error" role="alert"></p><div class="dialog-actions">'
     + '<button class="button primary" type="submit">' + safe(submit) + '</button>'
     + button("Отмена", "close", "secondary") + '</div></form>');
+  const form = dialogBody.querySelector('form');
+  if (!demo && ['manual-post','visual'].includes(action)) attachFormSave(form);
 }
+function attachFormSave(form) {
+  const status = document.createElement('p'); status.className = 'manual-hint'; status.dataset.draftStatus = '1';
+  status.setAttribute('aria-live','polite'); form.append(status);
+  const record = {revision:0, chain:Promise.resolve(), active:true, touched:false, loaded:false};
+  formSaves.set(form, record);
+  record.url = '/business/' + path(form.dataset.id) + '/form-draft/' + path(form.dataset.form);
+  record.ready = api(record.url).then(saved => {
+    record.revision = saved.revision; record.loaded = true;
+    if (saved.data && !record.touched && form.isConnected) {
+      for (const name of ['text','request','scheduled_at']) if (form.elements[name]) form.elements[name].value = saved.data[name] || '';
+      for (const [property,key] of [['assetId','asset_id'],['requestId','request_id'],['imageCaption','image_caption'],['imageRequestId','image_request_id'],['imageRequestText','image_request_text']]) {
+        if (saved.data[key]) form.dataset[property] = saved.data[key];
+      }
+      const preview = form.querySelector('.manual-image-preview');
+      if (preview && saved.data.asset_id) { preview.innerHTML=postArt({business_id:form.dataset.id,image_asset_id:saved.data.asset_id});preview.hidden=false;void loadImages(preview); }
+      const counter = form.querySelector('.manual-text-count');
+      if (counter) counter.textContent = (form.elements.text?.value.length || 0) + ' / 900';
+      status.textContent='Черновик восстановлен. Невыгруженный файл нужно выбрать заново.';
+    } else status.textContent='Текст автоматически сохраняется на сервере.';
+  }).catch(() => { status.textContent='Автосохранение недоступно. Не закрывайте форму до сохранения поста.'; });
+}
+function saveForm(form, {clear=false}={}) {
+  const record=formSaves.get(form);
+  if (!record || !record.active || (!record.touched && !clear)) return Promise.resolve();
+  clearTimeout(record.timer);
+  if (clear) record.active=false;
+  record.chain=record.chain.catch(()=>{}).then(async()=>{
+    await record.ready;
+    if (!record.loaded) throw new Error('Автосохранение не подключено.');
+    const data=clear ? null : {
+      text:form.elements.text?.value||'', request:form.elements.request?.value||'', scheduled_at:form.elements.scheduled_at?.value||'',
+      asset_id:form.dataset.assetId||'', request_id:form.dataset.requestId||'', image_caption:form.dataset.imageCaption||'',
+      image_request_id:form.dataset.imageRequestId||'',image_request_text:form.dataset.imageRequestText||'',
+    };
+    const saved=await api(record.url,{revision:record.revision,data}); record.revision=saved.revision;
+    const status=form.querySelector('[data-draft-status]'); if(status)status.textContent=clear?'Черновик перенесён в пост.':'Черновик сохранён на сервере.';
+  }).catch(error=>{const status=form.querySelector('[data-draft-status]');if(status)status.textContent='Автосохранение: '+error.message; if(!form.isConnected)notify('Черновик формы не сохранён: '+error.message);});
+  return record.chain;
+}
+dialog.addEventListener('close',()=>{const form=dialogBody.querySelector('form');if(form)void saveForm(form);});
 function knowledgeResults(result) {
   if (result?.preview) return '<p class="notice">В предпросмотре документы не индексируются. Настоящий поиск доступен в рабочей студии.</p>';
   if (!Array.isArray(result?.items)) throw new Error("Не удалось прочитать результаты поиска. Повторите запрос.");
@@ -722,7 +767,7 @@ function showPost(post) {
     + statusLabel(post.status) + '<span class="date">Версия ' + post.revision + ' · Профиль v' + (post.profile_version ?? '—')
     + '</span>' + (post.content_origin === 'manual' ? '<span class="date">Создан вручную</span>' : '') + '</div><p class="post-text">' + safe(post.text) + '</p>'
     + (staleProfile ? '<div class="notice approval-warning">Профиль бизнеса изменился. Проверьте факты и обновите контекст перед согласованием.</div>' : '')
-    + (staleChannel ? '<div class="notice approval-warning">Канал изменился. Создайте новый черновик для текущего канала.</div>' : '')
+    + (staleChannel ? '<div class="notice approval-warning">Канал изменился. Создайте новый черновик для текущего канала.</div>' + (state.business.channel_id ? button('Привязать к текущему каналу', 'assign-channel', 'secondary', '', 'data-id="'+safe(post.id)+'" data-revision="'+post.revision+'"') : '') : '')
     + ((post.warnings || []).length ? '<div class="notice approval-warning"><strong>Перед публикацией</strong><ul>'
       + post.warnings.map(w => '<li>' + safe(w) + '</li>').join('') + '</ul></div>' : '')
     + '<details class="post-sources"><summary>Источники фактов · ' + (post.used_source_ids || []).length + '</summary><ul>'
@@ -777,6 +822,20 @@ async function watchJob(job, business) {
     catch { notify("Проверьте статус подготовки в чате бота."); return; }
   }
   notify("Задание в работе. Бот сообщит о результате.");
+}
+async function queuedVisual(business, payload, progress) {
+  let job = await api('/business/' + path(business) + '/visual-jobs', payload);
+  notify('Задание сохранено. Можно закрыть студию: результат останется в «Моих изображениях», статус — в «Задачах».');
+  for (let count = 0; count < 240; count++) {
+    if (job.status === 'done' && job.visual_result) return job.visual_result;
+    if (['failed','cancelled'].includes(job.status)) throw new Error(job.error || 'Задание отменено.');
+    if (business !== businessId) throw new Error('Генерация продолжится. Откройте «Мои изображения» исходной компании.');
+    if (progress?.isConnected) progress.textContent = job.status === 'pending' ? 'Изображение в очереди. Ожидающее задание можно отменить в разделе «Задачи».' : 'Изображение создаётся: ' + (stageLabels[job.stage] || job.stage);
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    try { job = await api('/job/' + path(job.id)); }
+    catch { throw new Error('Не удалось получить статус. Задание сохранено: проверьте «Задачи» или «Мои изображения».'); }
+  }
+  throw new Error('Задание ещё выполняется. Его статус сохранён в разделе «Задачи».');
 }
 document.addEventListener("click", async (event) => {
   const control = event.target.closest("[data-view], [data-action]");
@@ -833,6 +892,17 @@ document.addEventListener("click", async (event) => {
     } else if (action === "confirm-reset-demo" && demo) {
       if (!preview.clear()) throw new Error("Браузер не разрешает очистить локальное хранилище.");
       location.reload();
+    } else if (action === 'job-visual') {
+      const job = await api('/job/' + path(id));
+      if (!job.visual_result) throw new Error('Изображение ещё не готово.');
+      showVisual(job.visual_result);
+    } else if (action === 'retry-visual-job') {
+      const requestId=control.dataset.requestId || (control.dataset.requestId=crypto.randomUUID());
+      await api('/job/' + path(id) + '/retry-visual',{request_id:requestId});
+      await refresh(); notify('Создано новое задание. Этот явный повтор расходует лимит генерации.');
+    } else if (action === 'assign-channel') {
+      const post = await api('/post/' + path(id) + '/edit', {revision:Number(revision),channel_id:state.business.channel_id});
+      await refresh(); if (post.business_id === businessId) showPost(post);
     } else if (action === "new-visual") {
       if (demo) throw new Error("Настоящая генерация изображений доступна в рабочей студии из меню бота.");
       if ([state.capabilities?.text_generation, state.capabilities?.image_generation].includes("unconfigured")) {
@@ -863,7 +933,7 @@ document.addEventListener("click", async (event) => {
     } else if (action === "visual-post") {
       const visual = visualDrafts.get(id);
       if (!visual || visual.asset.business_id !== businessId) throw new Error("Откройте изображение заново.");
-      if (!state.business.profile_confirmed || !state.business.channel_id) {
+      if (!state.business.profile_confirmed) {
         dialog.close(); await navigate("business");
         notify("Картинка сохранена. Для поста подтвердите профиль и подключите канал, затем выберите её в «Моих изображениях»."); return;
       }
@@ -890,8 +960,8 @@ document.addEventListener("click", async (event) => {
         + '<div class="manual-image-preview" hidden></div><p class="manual-hint">' + imageUploadHint() + '</p>',
         "Сохранить новую версию", id, Number(revision));
     } else if (action === "manual-post") {
-      if (!state.business.profile_confirmed || !state.business.channel_id) {
-        await navigate("business"); notify("Заполните и подтвердите профиль, затем подключите канал. Это можно сделать без AI."); return;
+      if (!state.business.profile_confirmed) {
+        await navigate("business"); notify("Заполните и подтвердите профиль. Канал можно подключить позже, перед согласованием."); return;
       }
       openForm("manual-post", "Новый пост", "Напишите текст. Если своего изображения нет, AI создаст его по смыслу поста. Публикация требует отдельного согласования.",
         formField("Текст публикации", "text", "textarea", 'maxlength="900" placeholder="О чём расскажем аудитории?"')
@@ -947,12 +1017,22 @@ document.addEventListener("click", async (event) => {
         showDialog(dialogHeading("AI пока не подключён", "Администратору нужно проверить подключение модели. Можно сохранить материал вручную.")
           + '<div class="dialog-actions">' + button("Создать вручную", "manual-post", "primary", "plus") + button("Закрыть", "close", "secondary") + '</div>'); return;
       }
-      if (!state.business.profile_confirmed || !state.business.channel_id) {
-        await navigate("business"); notify("Подтвердите профиль и подключите канал, чтобы создать первый пост."); return;
+      if (!state.business.profile_confirmed) {
+        await navigate("business"); notify("Подтвердите профиль, чтобы создать первый пост. Канал понадобится перед согласованием."); return;
       }
       openForm("prepare", "Пост с текстом и изображением", "Опишите тему. AI подготовит текст и подберёт сцену, затем генератор создаст картинку. Оба материала появятся в черновике.",
         formField("Задание для AI", "request", "textarea", 'maxlength="4000" placeholder="Например: два поста о стекле в архитектуре"'),
         "Поставить в очередь");
+    } else if (action === 'company-invite') {
+      openForm('company-invite', 'Пригласить в эту компанию', 'Одноразовое приглашение действует 24 часа. Новый участник получит доступ только к выбранной компании.',
+        '<label class="form-row"><span>Роль</span><select name="role"><option value="reviewer">Наблюдатель</option><option value="operator">Оператор</option></select></label>', 'Создать приглашение');
+    } else if (action === 'company-team') {
+      const result = await api('/business/' + path(businessId) + '/team');
+      if (!result.items.length) { notify('Участники появятся после принятия приглашений в команду.'); return; }
+      openForm('company-team', 'Доступ к компании', '«Только назначенные» закрывает остальные компании, кроме ранее назначенных. Изменение прав отменяет прежние согласования участника.',
+        '<label class="form-row"><span>Участник (Telegram ID)</span><select name="actor_id">' + result.items.map(m => '<option value="'+m.actor_id+'">'+m.actor_id+' · '+safe(m.workspace_role)+' · '+safe(m.scope)+' · '+safe(m.role)+'</option>').join('') + '</select></label>'
+        + '<label class="form-row"><span>Область доступа</span><select name="scope"><option value="selected">Только назначенные компании</option><option value="all">Все компании, кроме явно закрытых</option></select></label>'
+        + '<label class="form-row"><span>Эта компания</span><select name="role"><option value="reviewer">Только просмотр</option><option value="operator">Редактирование и согласование</option><option value="none">Нет доступа</option></select></label>', 'Сохранить права');
     } else if (action === "business-archive") {
       if (demo) throw new Error("Архив доступен в рабочей студии.");
       const result = await api("/business-archive");
@@ -1041,15 +1121,26 @@ dialog.addEventListener("submit", async (event) => {
   let submittingBusiness = businessId;
   const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
-    if (action === "business-archive") {
+    if (action === 'company-invite') {
+      const invitation = await api('/business/' + path(id) + '/team/invite', {role:values.role});
+      showDialog(dialogHeading('Приглашение готово', 'Передайте участнику эту команду. Её нужно отправить нашему Telegram-боту. Действует 24 часа, один вход.')
+        + '<textarea readonly rows="4" aria-label="Команда приглашения">/start '+safe(invitation.start_parameter)+'</textarea>'
+        + '<p>После входа участник может связать свой аккаунт ВК командой /link_vk.</p>' + button('Закрыть','close','secondary'));
+    } else if (action === 'company-team') {
+      await api('/business/' + path(id) + '/team', {actor_id:Number(values.actor_id),role:values.role,scope:values.scope});
+      if (currentForm()) dialog.close(); notify('Права обновлены. Старые согласования участника больше не действуют.');
+    } else if (action === "business-archive") {
       await api("/business/"+path(id)+"/archive", {archived:values.archived === "true",confirmation:values.confirmation});
       if (currentForm()) dialog.close();
       businessId = ""; await refresh(); notify("Изменение сохранено. Публикации этой компании на паузе.");
     } else if (action === "visual") {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
       submit.textContent = "Создаём изображение…";
+      const pendingForm=formSaves.get(form);if(pendingForm)pendingForm.touched=true;
+      await saveForm(form);
       notify("AI подбирает сцену, затем создаётся изображение. Дождитесь результата — это может занять несколько минут.");
-      const result = await api("/business/" + path(id) + "/visuals", {request: values.request, request_id: requestId});
+      const result = await queuedVisual(id, {request: values.request, request_id: requestId});
+      await saveForm(form, {clear:true});
       if (currentForm()) showVisual(result);
       else notify("Изображение готово. Откройте «Мои изображения» нужной компании.");
     } else if (action === "visual-post") {
@@ -1080,9 +1171,12 @@ dialog.addEventListener("submit", async (event) => {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
       if (!values.image?.size && !form.dataset.assetId) await generateImageForForm(form, id);
       const assetId = await uploadManualImage(values.image, id, form);
+      const pendingForm=formSaves.get(form);if(pendingForm)pendingForm.touched=true;
+      await saveForm(form);
       const payload = {text: values.text, image_asset_id: assetId, request_id: requestId};
       if (values.scheduled_at) payload.scheduled_at = new Date(values.scheduled_at).toISOString();
       const post = await api("/business/" + path(id) + "/draft", payload);
+      await saveForm(form, {clear:true});
       if (currentForm()) showPost(post); await refresh(); notify("Черновик сохранён. Он не согласован к публикации.");
     } else if (action === "replace-image") {
       const post = await api("/post/" + path(id));
@@ -1205,14 +1299,18 @@ async function generateImageForForm(form, business) {
     form.dataset.imageRequestId = crypto.randomUUID(); form.dataset.imageRequestText = text;
   }
   try {
-    const result = await api("/business/" + path(business) + "/visuals", {
+    const pendingForm=formSaves.get(form);if(pendingForm)pendingForm.touched=true;
+    await saveForm(form);
+    const result = await queuedVisual(business, {
       request: "Создай подходящую иллюстрацию к этому посту, без надписей на изображении:\n" + text,
       caption: text,
       request_id: form.dataset.imageRequestId,
-    });
+    }, progress);
     if (!form.isConnected || business !== businessId) { notify("Картинка сохранена в «Моих изображениях»."); return; }
     form.dataset.assetId = result.asset.id;
     form.dataset.imageCaption = text;
+    const record=formSaves.get(form);if(record)record.touched=true;
+    void saveForm(form);
     delete form.dataset.imageRequestId;
     form.elements.image.value = "";
     const target = form.querySelector('.manual-image-preview');
@@ -1296,6 +1394,8 @@ root.addEventListener("keydown", async event => {
 });
 document.addEventListener("input", event => {
   const form = event.target.closest("form");
+  const saving=form && formSaves.get(form);
+  if (saving && saving.active) {saving.touched=true;clearTimeout(saving.timer);saving.timer=setTimeout(()=>void saveForm(form),800);}
   if (event.target.name === "text" && form?.dataset.form === "manual-post") form.querySelector('.manual-text-count').textContent = event.target.value.length + " / 900";
   if (event.target.name === "text" && form?.dataset.imageCaption && event.target.value.trim() !== form.dataset.imageCaption) {
     form.querySelector('[data-image-progress]').textContent = "Текст изменён после генерации. Проверьте картинку и её заголовок или сгенерируйте новую.";

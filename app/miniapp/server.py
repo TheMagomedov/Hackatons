@@ -53,6 +53,7 @@ class RevisionInput(Contract):
 
 
 class PostEdit(RevisionInput):
+    channel_id: str | None = Field(default=None, min_length=1, max_length=128)
     scheduled_at: AwareDatetime | None = None
     text: str | None = Field(default=None, min_length=1, max_length=900)
     image_asset_id: str | None = Field(default=None, min_length=1, max_length=100)
@@ -82,6 +83,35 @@ class NewJob(Contract):
 class ArchiveInput(Contract):
     archived: bool
     confirmation: str = Field(min_length=1, max_length=200)
+
+
+class CompanyAccessInput(Contract):
+    actor_id: int = Field(strict=True, gt=0)
+    role: str = Field(pattern='^(operator|reviewer|none)$')
+    scope: str = Field(pattern='^(all|selected)$')
+
+
+class InviteMemberInput(Contract):
+    role: str = Field(pattern='^(operator|reviewer)$')
+
+
+class RetryJobInput(Contract):
+    request_id: str = Field(min_length=1, max_length=100)
+
+
+class FormDraftData(Contract):
+    text: str = Field(default='', max_length=900)
+    request: str = Field(default='', max_length=4000)
+    scheduled_at: str = Field(default='', max_length=32)
+    asset_id: str = Field(default='', max_length=100)
+    request_id: str = Field(default='', max_length=100)
+    image_caption: str = Field(default='', max_length=900)
+    image_request_id: str = Field(default='', max_length=100)
+    image_request_text: str = Field(default='', max_length=900)
+
+
+class FormDraftInput(RevisionInput):
+    data: FormDraftData | None
 
 
 class VisualInput(NewJob):
@@ -266,6 +296,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
                                       "sources": [], "jobs": [], "usage": svc.ai_usage(actor),
                                       "runtime_mode": svc.settings.mode, "capabilities": svc.capabilities(actor),
                                       "access": access})
+        role = svc.repo.business_role(svc.settings.owner_id, actor, selected.id)
+        access = {"role": role, "can_write": role in ('owner', 'operator')}
         posts = svc.list_posts(actor, selected.id)
         counts = Counter(p.status for p in posts)
         sources = svc.list_sources(actor, selected.id)
@@ -314,6 +346,47 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             return web.json_response({"items": [b.model_dump(mode="json") for b in svc.archived_businesses(actor)]})
         body = ArchiveInput.model_validate(await json_body(request))
         return show(svc.archive_business(actor, request.match_info["id"], body.archived, body.confirmation))
+
+    async def company_team(request):
+        svc, actor = context(request)
+        business_id = request.match_info['id']
+        if request.method == 'GET':
+            return web.json_response({'items': svc.company_team(actor, business_id)})
+        body = CompanyAccessInput.model_validate(await json_body(request))
+        return web.json_response(svc.set_company_access(actor, business_id, body.actor_id, body.role, body.scope))
+
+    async def visual_jobs(request):
+        svc, actor = context(request)
+        body = VisualInput.model_validate(await json_body(request))
+        return web.json_response(svc.request_visual(actor, request.match_info['id'], body.request,
+                                 body.request_id, caption=body.caption).model_dump(mode='json'), status=202)
+
+    async def invite_member(request):
+        svc, actor = context(request)
+        body = InviteMemberInput.model_validate(await json_body(request))
+        return web.json_response(svc.invite_company_member(actor, request.match_info['id'], body.role))
+
+    async def retry_visual(request):
+        svc, actor = context(request)
+        job = svc.get_job(actor, request.match_info['id'])
+        if job.kind != 'visual' or job.status not in {'failed', 'cancelled'}:
+            raise Conflict('Повтор доступен только для прерванного или отменённого изображения.')
+        body = RetryJobInput.model_validate(await json_body(request))
+        return web.json_response(svc.request_visual(actor, job.business_id, job.request, body.request_id,
+                                 caption=job.caption).model_dump(mode='json'), status=202)
+
+    async def form_draft(request):
+        svc, actor = context(request)
+        business_id, kind = request.match_info['id'], request.match_info['kind']
+        svc._business(actor, business_id)
+        if request.method == 'GET':
+            return web.json_response(svc.repo.form_draft(business_id, actor, kind))
+        body = FormDraftInput.model_validate(await json_body(request))
+        if body.data and body.data.asset_id:
+            if svc.repo.get_asset(body.data.asset_id).business_id != business_id:
+                raise InvalidInput('Изображение относится к другой компании.')
+        return web.json_response(svc.repo.save_form_draft(svc.settings.owner_id, business_id, actor, kind,
+                                 body.revision, body.data.model_dump() if body.data else None, svc.now()))
 
     async def add_source(request):
         svc, actor = context(request)
@@ -492,7 +565,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             edit = PostEdit.model_validate(payload)
             return show(await asyncio.to_thread(
                 svc.edit_post, actor, post_id, edit.revision, text=edit.text,
-                scheduled_at=edit.scheduled_at, image_asset_id=edit.image_asset_id,
+                scheduled_at=edit.scheduled_at, image_asset_id=edit.image_asset_id, channel_id=edit.channel_id,
             ))
         body = RevisionInput.model_validate(payload)
         change = svc.approve_post if action == "approve" else svc.reject_post
@@ -557,6 +630,12 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.post("/mini/api/business", create_business),
         web.get("/mini/api/business-archive", archive_business),
         web.post("/mini/api/business/{id}/archive", archive_business),
+        web.get('/mini/api/business/{id}/team', company_team),
+        web.post('/mini/api/business/{id}/team', company_team),
+        web.post('/mini/api/business/{id}/team/invite', invite_member),
+        web.post('/mini/api/business/{id}/visual-jobs', visual_jobs),
+        web.get('/mini/api/business/{id}/form-draft/{kind:manual-post|visual}', form_draft),
+        web.post('/mini/api/business/{id}/form-draft/{kind:manual-post|visual}', form_draft),
         web.post("/mini/api/business/{id}/source", add_source),
         web.post("/mini/api/business/{id}/pdf", upload_pdf),
         web.post("/mini/api/business/{id}/image", upload_image),
@@ -577,6 +656,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.get("/mini/api/business/{id}/traces", traces),
         web.get("/mini/api/job/{id}", job),
         web.post("/mini/api/job/{id}/cancel", cancel_job),
+        web.post('/mini/api/job/{id}/retry-visual', retry_visual),
         web.get("/mini/api/post/{id}", post),
         web.post("/mini/api/post/{id}/{action:edit|approve|reject}", change_post),
         web.post("/mini/api/post/{id}/revise-{kind:text|image}", revise_post),

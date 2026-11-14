@@ -113,6 +113,9 @@ class BackendService:
         business = self.repo.get_business(business_id)
         if business.owner_id != self.settings.owner_id:
             raise Forbidden("Нет доступа к этому бизнесу.")
+        role = self.repo.business_role(self.settings.owner_id, actor_id, business_id)
+        if role is None or (write and role == 'reviewer'):
+            raise Forbidden('Нет прав на это действие в выбранной компании.')
         if write and business.archived:
             raise Conflict("Компания в архиве. Сначала восстановите её.")
         return business
@@ -316,10 +319,12 @@ class BackendService:
             raise InvalidInput(message) from None
         return value
 
-    def _current_context(self, business: Business) -> Business:
+    def _current_context(self, business: Business, actor_id: int | None = None) -> Business:
+        if actor_id is not None:
+            self._business(actor_id, business.id)
         current = self.repo.get_business(business.id)
         if (
-            current.profile_version != business.profile_version
+            current.archived or current.profile_version != business.profile_version
             or current.channel_id != business.channel_id
             or not current.profile_confirmed
         ):
@@ -337,18 +342,42 @@ class BackendService:
             ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError):
             raise InvalidInput("Неизвестный часовой пояс.") from None
-        return self.repo.create_business(self.settings.owner_id, name, timezone, self.now())
+        business = self.repo.create_business(self.settings.owner_id, name, timezone, self.now())
+        if not self.repo.business_role(self.settings.owner_id, actor_id, business.id):
+            self.repo.set_company_access(self.settings.owner_id, actor_id, business.id, 'operator', 'selected', self.now())
+        return business
 
     def get_business(self, actor_id: int, business_id: str) -> Business:
         return self._business(actor_id, business_id, write=False)
 
     def list_businesses(self, actor_id: int) -> list[Business]:
         self.require_access(actor_id)
-        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id and not b.archived]
+        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id and not b.archived
+                and self.repo.business_role(self.settings.owner_id, actor_id, b.id)]
 
     def archived_businesses(self, actor_id: int) -> list[Business]:
         self.require_access(actor_id)
-        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id and b.archived]
+        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id and b.archived
+                and self.repo.business_role(self.settings.owner_id, actor_id, b.id)]
+
+    def company_team(self, actor_id: int, business_id: str) -> list[dict]:
+        if self.require_access(actor_id) != 'owner':
+            raise Forbidden('Командой управляет владелец пространства.')
+        self._business(actor_id, business_id, write=False)
+        return self.repo.company_access(self.settings.owner_id, business_id)
+
+    @actor_action
+    def set_company_access(self, actor_id: int, business_id: str, member_id: int, role: str, scope: str):
+        self.company_team(actor_id, business_id)
+        self.repo.set_company_access(self.settings.owner_id, member_id, business_id, role, scope, self.now())
+        return {'saved': True}
+
+    @actor_action
+    def invite_company_member(self, actor_id: int, business_id: str, role: str):
+        self.company_team(actor_id, business_id)
+        invite = self.repo.create_access_invite(self.settings.owner_id, role, 1, self.now()+timedelta(hours=24),
+                                                self.now(), business_id=business_id)
+        return {'start_parameter': 'join_'+invite['token'], 'expires_at': invite['expires_at'], 'role': role}
 
     @actor_action
     def archive_business(self, actor_id: int, business_id: str, archived: bool, confirmation: str) -> Business:
@@ -616,10 +645,10 @@ class BackendService:
         )
         return self.repo.set_manual_profile(business.id, expected_version, profile, source, actor_id, now)
 
-    def _ready(self, business: Business) -> None:
+    def _ready(self, business: Business, *, require_channel: bool = True) -> None:
         if not business.profile or not business.profile_confirmed:
             raise Conflict("Сначала подтвердите актуальный профиль бизнеса.")
-        if not business.channel_id:
+        if require_channel and not business.channel_id:
             raise Conflict("Сначала подключите канал.")
 
     def conversation_history(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
@@ -749,7 +778,7 @@ class BackendService:
             if existing.request != request:
                 raise Conflict("Ключ задания уже использован для другого запроса.")
             return existing
-        self._ready(business)
+        self._ready(business, require_channel=False)
         # Same Telegram update/callback ID -> same durable job, including after restart.
         return self.repo.enqueue_job(
             business_id,
@@ -758,6 +787,7 @@ class BackendService:
             self.now(),
             max_pending=self.settings.max_pending_jobs,
             max_per_day=self.settings.max_generation_jobs_per_day,
+            requested_by=actor_id,
         )
 
     async def prepare_with_tools(self, actor_id: int, business_id: str, request: str, request_id: str) -> Job:
@@ -781,7 +811,8 @@ class BackendService:
 
     @actor_action
     def cancel_job(self, actor_id: int, job_id: str) -> Job:
-        self.get_job(actor_id, job_id)
+        job = self.get_job(actor_id, job_id)
+        self._business(actor_id, job.business_id)
         return self.repo.cancel_job(job_id, self.now())
 
     @actor_action
@@ -809,7 +840,8 @@ class BackendService:
         self.require_access(actor_id)
         if business_id is not None:
             self._business(actor_id, business_id, write=False)
-        return self.repo.list_ai_operations(self.settings.owner_id, business_id, limit)
+        entries = self.repo.list_ai_operations(self.settings.owner_id, business_id, limit)
+        return [row for row in entries if self.repo.business_role(self.settings.owner_id, actor_id, row['business_id'])]
 
     def failed_notifications(self, actor_id: int, business_id: str, limit: int = 20) -> list[dict]:
         self._business(actor_id, business_id, write=False)
@@ -897,7 +929,7 @@ class BackendService:
         existing = self.repo.find_manual_post(business_id, request_id, digest)
         if existing is not None:
             return existing
-        self._ready(business)
+        self._ready(business, require_channel=False)
         if scheduled_at is not None and scheduled_at <= self.now():
             raise InvalidInput("Выберите время публикации в будущем.")
         asset = self.repo.get_asset(image_asset_id)
@@ -909,7 +941,7 @@ class BackendService:
         self.safety.check_text([text])
         self._business(actor_id, business_id)
         return self.repo.create_posts(
-            business_id, [{"text": text, "image_asset_id": asset.id, "channel_id": business.channel_id,
+            business_id, [{"text": text, "image_asset_id": asset.id, "channel_id": business.channel_id or '',
                            "scheduled_at": scheduled_at, "profile_version": business.profile_version,
                            "is_demo": self.settings.mode == "demo", "used_source_ids": source_ids,
                            "warnings": ["Создано вручную: AI не проверял текст и изображение."]}], self.now(),
@@ -919,8 +951,24 @@ class BackendService:
         )[0]
 
     @actor_action
+    def request_visual(self, actor_id: int, business_id: str, request: str, request_id: str,
+                       *, caption: str | None = None) -> Job:
+        business = self._business(actor_id, business_id)
+        request = self._plain_text(request, 4000, 'Опишите изображение.').strip()
+        self._plain_text(request_id, 100, 'Укажите идентификатор запроса.')
+        guard_input(request)
+        if caption is not None:
+            self._validate_caption(caption)
+            guard_input(caption)
+        return self.repo.enqueue_job(business_id, request, f'visual:{actor_id}:{request_id}', self.now(),
+                                     kind='visual', requested_by=actor_id, caption=caption,
+                                     profile_version=business.profile_version,
+                                     max_pending=self.settings.max_pending_jobs,
+                                     max_per_day=self.settings.max_generation_jobs_per_day)
+
+    @actor_action
     async def generate_visual(self, actor_id: int, business_id: str, request: str, request_id: str,
-                              *, caption: str | None = None) -> VisualDraft:
+                              *, caption: str | None = None, job_id: str | None = None) -> VisualDraft:
         business = self._business(actor_id, business_id)
         self._plain_text(request, 4000, "Опишите изображение: от 1 до 4000 символов.")
         guard_input(request)
@@ -931,6 +979,8 @@ class BackendService:
         profile = business.profile or BusinessProfile(name=business.name, description="")
 
         def check_context():
+            if job_id and self.repo.get_job(job_id).status != 'running':
+                raise Conflict('Создание изображения отменено. Уже начатый расчёт может завершиться без сохранения результата.')
             current = self._business(actor_id, business_id)
             if current.profile_version != business.profile_version:
                 raise Conflict("Профиль изменился во время генерации. Повторите запрос.")
@@ -939,12 +989,16 @@ class BackendService:
             # The text model derives a scene from the complete user's idea and
             # business style. FLUX receives that scene, never an invented fallback.
             check_context()
+            if job_id:
+                self.repo.set_job_progress(job_id, 'text', 0, 2, self.now())
             item = PlanItem(topic=request[:300], goal="Создать изображение по идее пользователя и краткую подпись.",
                             brief=request, image_brief=request)
             draft = self._provider_result(TextDraft, await self._external(self.ai.write_post(profile, item)))
             if caption is not None:
                 draft = draft.model_copy(update={"text": caption})
             check_context()
+            if job_id:
+                self.repo.set_job_progress(job_id, 'image', 1, 2, self.now())
             image = await self._external(self.images.generate(profile, draft))
             check_context()
             asset = self._store_image(business_id, image)
@@ -1006,7 +1060,7 @@ class BackendService:
         business = self._business(actor_id, post.business_id)
         changes = {}
         if text is not None:
-            self._ready(business)
+            self._ready(business, require_channel=False)
             changes["text"] = self._validate_caption(text)
             self.safety.check_text([changes["text"]])
             changes["is_demo"] = post.is_demo or self.settings.mode == "demo"
@@ -1044,7 +1098,7 @@ class BackendService:
         """Explicit human review against the current profile; never an approval."""
         post = self._post(actor_id, post_id)
         business = self._business(actor_id, post.business_id)
-        self._ready(business)
+        self._ready(business, require_channel=False)
         return self.repo.revise_post(
             post_id,
             expected_revision,
@@ -1057,7 +1111,7 @@ class BackendService:
     ) -> tuple[Business, PostView]:
         post = self._post(actor_id, post_id)
         business = self._business(actor_id, post.business_id)
-        self._ready(business)
+        self._ready(business, require_channel=False)
         if type(expected_revision) is not int or post.revision != expected_revision:
             raise Conflict("Откройте актуальную версию поста.")
         if post.status not in {
@@ -1067,7 +1121,7 @@ class BackendService:
             PostStatus.FAILED,
         }:
             raise Conflict("Пост уже изменяется, отправляется или отправлен.")
-        if post.channel_id != business.channel_id:
+        if post.channel_id != (business.channel_id or ''):
             raise Conflict("Сначала обновите канал в предпросмотре поста.")
         self._plain_text(feedback, 4000, "Укажите правку длиной до 4000 символов.")
         guard_input(feedback)
@@ -1298,7 +1352,15 @@ class BackendService:
             return False
         business = self.repo.get_business(job.business_id)
         try:
-            self._ready(business)
+            self._business(job.requested_by or business.owner_id, business.id)
+            if job.kind == 'visual':
+                if job.profile_version != business.profile_version:
+                    raise Conflict('Профиль изменился после постановки изображения в очередь.')
+                result = await self.generate_visual(job.requested_by, business.id, job.request,
+                                                     f'visual-job:{job.id}', caption=job.caption, job_id=job.id)
+                self.repo.finish_visual_job(job.id, result, self.now())
+                return True
+            self._ready(business, require_channel=False)
             guard_input(job.request)
             profile = await self._knowledge_profile(business, job.request)
             self.repo.set_job_progress(job.id, "plan", 0, 0, self.now())
@@ -1311,7 +1373,7 @@ class BackendService:
                 lambda: self._external(self.ai.make_plan(profile, request)),
                 request_id=f"job:{job.id}:plan",
             )
-            self._current_context(business)
+            self._current_context(business, job.requested_by or business.owner_id)
             if len(plan.items) > self.settings.max_posts_per_job:
                 raise InvalidInput("AI превысил лимит публикаций на одно задание.")
             self.repo.save_plan(business.id, job.id, plan, self.now())
@@ -1319,7 +1381,7 @@ class BackendService:
             source_ids = {source.id for source in self.repo.list_sources(business.id)}
             total = 1 + 2 * len(plan.items)
             for index, item in enumerate(plan.items):
-                self._current_context(business)
+                self._current_context(business, job.requested_by or business.owner_id)
                 self.repo.set_job_progress(job.id, "text", 1 + 2 * index, total, self.now())
                 text = await self._ai_operation(
                     business,
@@ -1329,7 +1391,7 @@ class BackendService:
                     lambda: self._external(self.ai.write_post(profile, item)),
                     request_id=f"job:{job.id}:text:{index}",
                 )
-                self._current_context(business)
+                self._current_context(business, job.requested_by or business.owner_id)
                 self._validate_caption(text.text)
                 if set(text.used_source_ids) - source_ids:
                     raise InvalidInput("Текст ссылается на неизвестные источники.")
@@ -1337,7 +1399,7 @@ class BackendService:
 
                 async def generate_image():
                     generated = await self._external(self.images.generate(business.profile, text))
-                    self._current_context(business)
+                    self._current_context(business, job.requested_by or business.owner_id)
                     return self._store_image(business.id, generated)
 
                 asset = await self._ai_operation(
@@ -1348,13 +1410,13 @@ class BackendService:
                     generate_image,
                     request_id=f"job:{job.id}:image:{index}",
                 )
-                self._current_context(business)
+                self._current_context(business, job.requested_by or business.owner_id)
                 proposed = as_utc(item.suggested_at) if item.suggested_at else None
                 drafts.append(
                     {
                         "text": text.text,
                         "image_asset_id": asset.id,
-                        "channel_id": business.channel_id,
+                        "channel_id": business.channel_id or '',
                         "scheduled_at": proposed if proposed and proposed > self.now() else None,
                         "is_demo": asset.is_demo or self.settings.mode == "demo",
                         "profile_version": business.profile_version,

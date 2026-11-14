@@ -170,7 +170,11 @@ class PublicationResult(Contract):
 class Job(Contract):
     id: str
     business_id: str
-    kind: Literal["prepare"] = "prepare"
+    kind: Literal["prepare", "visual"] = "prepare"
+    requested_by: int | None = Field(default=None, strict=True, gt=0)
+    caption: str | None = Field(default=None, max_length=900)
+    profile_version: int | None = None
+    visual_result: VisualDraft | None = None
     request: str
     status: Literal["pending", "running", "done", "failed", "cancelled"]
     dedup_key: str

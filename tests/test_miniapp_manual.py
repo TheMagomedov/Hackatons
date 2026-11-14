@@ -120,7 +120,7 @@ async def test_manual_post_complete_cycle_without_ai_and_persistent_deduplicatio
     assert manual.service.ai_usage(OWNER)["used_today"] == 0
 
 
-async def test_manual_draft_requires_explicit_profile_confirmation_and_channel(manual):
+async def test_manual_draft_requires_profile_confirmation_but_channel_can_be_added_later(manual):
     asset = await (await upload(manual)).json()
     assert (await draft(manual, asset["id"])).status == 409
     profile = await (await manual.client.post(manual.prefix + "/profile/manual", json={
@@ -128,7 +128,9 @@ async def test_manual_draft_requires_explicit_profile_confirmation_and_channel(m
     })).json()
     assert (await draft(manual, asset["id"])).status == 409
     await manual.client.post(manual.prefix + "/profile/confirm", json={"revision": profile["profile_version"]})
-    assert (await draft(manual, asset["id"])).status == 409
+    pending = await draft(manual, asset["id"])
+    assert pending.status == 200
+    assert (await pending.json())['channel_id'] == ''
     await manual.client.post(manual.prefix + "/channel", json={"value": "-100bakery"})
     assert (await draft(manual, asset["id"])).status == 200
 

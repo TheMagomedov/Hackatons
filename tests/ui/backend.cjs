@@ -374,10 +374,19 @@ async function stopFixture(child) {
   await page.locator('#main[data-business="'+previousBusiness+'"]').waitFor();
   await page.locator('#main [data-action="manual-post"]').click();
   const automaticCaption='Стеклянный фасад в сосновом лесу. Мягкий утренний свет.';
+  await page.locator('textarea[name="text"]').fill('Текст, который должен пережить перезагрузку');
+  await page.getByText('Черновик сохранён на сервере.',{exact:true}).waitFor();
+  await page.reload();
+  await page.locator('#main [data-action="manual-post"]').waitFor();
+  await page.locator('#workspace').selectOption(previousBusiness);
+  await page.locator('#main[data-business="'+previousBusiness+'"][aria-busy="false"]').waitFor();
+  await page.locator('#main [data-action="manual-post"]').click();
+  await page.getByText('Черновик восстановлен. Невыгруженный файл нужно выбрать заново.',{exact:true}).waitFor();
+  assert.equal(await page.locator('textarea[name="text"]').inputValue(),'Текст, который должен пережить перезагрузку');
   await page.locator('textarea[name="text"]').fill(automaticCaption);
   assert.equal(await page.locator('input[name="image"]').evaluate(el=>el.required),false);
   const visualRequests=[];
-  page.on('request',request=>{if(request.method()==='POST'&&request.url().endsWith('/visuals')) visualRequests.push(request.postDataJSON());});
+  page.on('request',request=>{if(request.method()==='POST'&&request.url().endsWith('/visual-jobs')) visualRequests.push(request.postDataJSON());});
   const draftResponse=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/draft')).catch(async error=>{console.error('Image form error:',await page.locator('#form-error').textContent(),'Visual calls:',visualRequests.length);throw error;});
   await page.getByRole('button',{name:'Сохранить черновик',exact:true}).click();
   const generatedPost=await (await draftResponse).json();
@@ -387,6 +396,7 @@ async function stopFixture(child) {
   assert.equal(visualRequests[0].caption,automaticCaption);
   let gallery=await backendAPI('get','/business/'+previousBusiness+'/visuals');
   assert.equal(gallery.items[0].asset.id,generatedPost.image_asset_id);
+  assert.equal((await backendAPI('get','/business/'+previousBusiness+'/form-draft/manual-post')).data,null,'Saved post clears the private form buffer');
   await page.getByRole('button',{name:'Закрыть',exact:true}).click();
   await page.locator('#main [data-action="manual-post"]').click();
   await page.locator('textarea[name="text"]').fill('Новый текст для другой картинки');
@@ -432,6 +442,11 @@ async function stopFixture(child) {
   const restoredBusiness=(await backendAPI('get','/state?business='+archiveBusiness.id)).business;
   assert.equal(restoredBusiness.archived,false);
   assert.equal(restoredBusiness.publications_paused,true);
+  await page.locator('.dock [data-view="business"]').click();
+  await page.getByRole('button',{name:'Пригласить участника',exact:true}).click();
+  await page.getByRole('button',{name:'Создать приглашение',exact:true}).click();
+  await page.getByRole('textbox',{name:'Команда приглашения',exact:true}).waitFor();
+  assert.match(await page.getByRole('textbox',{name:'Команда приглашения',exact:true}).inputValue(),/^\/start join_[A-Za-z0-9_-]{43}$/);
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}

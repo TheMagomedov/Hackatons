@@ -38,7 +38,7 @@ from app.shared.models import (
 )
 from app.storage.access import AccessRepository
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
@@ -139,6 +139,9 @@ class Repository(AccessRepository):
                 version = 4
             if version == 4:
                 self._migrate_v4_to_v5(conn)
+                version = 5
+            if version == 5:
+                self._migrate_v5_to_v6(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if version != 0:
@@ -171,6 +174,7 @@ class Repository(AccessRepository):
             self._migrate_v2_to_v3(conn)
             self._migrate_v3_to_v4(conn)
             self._migrate_v4_to_v5(conn)
+            self._migrate_v5_to_v6(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -609,7 +613,7 @@ class Repository(AccessRepository):
         """The owner's source and unconfirmed profile are one revision and one transaction."""
         with self._transaction() as conn:
             old = self._business(conn, business_id)
-            if not self._may_operate(conn, old.owner_id, actor_id):
+            if not self._may_operate(conn, old.owner_id, actor_id, old.id):
                 raise Forbidden("Нет доступа к этому бизнесу")
             if old.profile_version != expected_version:
                 raise Conflict("Версия профиля изменилась. Откройте актуальный профиль.")
@@ -786,7 +790,7 @@ class Repository(AccessRepository):
         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 900:
             raise InvalidInput("Текст публикации должен содержать от 1 до 900 символов")
         channel_id = data.get("channel_id")
-        if not isinstance(channel_id, str) or not channel_id or channel_id != business.channel_id:
+        if not isinstance(channel_id, str) or channel_id != (business.channel_id or ''):
             raise InvalidInput("Публикация должна быть адресована текущему каналу бизнеса")
         asset = Repository._asset(conn, data.get("image_asset_id", ""), business.id)
         if asset.mime_type not in {"image/png", "image/jpeg"}:
@@ -854,7 +858,7 @@ class Repository(AccessRepository):
             business = self._business(conn, business_id)
             manual = any(value is not None for value in (manual_request_id, manual_payload_hash, manual_actor_id))
             if manual:
-                if (job_id is not None or len(items) != 1 or not self._may_operate(conn, business.owner_id, manual_actor_id)
+                if (job_id is not None or len(items) != 1 or not self._may_operate(conn, business.owner_id, manual_actor_id, business.id)
                         or not isinstance(manual_request_id, str) or not 1 <= len(manual_request_id) <= 100
                         or not isinstance(manual_payload_hash, str)
                         or re.fullmatch(r"[0-9a-f]{64}", manual_payload_hash) is None):
@@ -862,8 +866,8 @@ class Repository(AccessRepository):
                 duplicate = self._manual_post(conn, business_id, manual_request_id, manual_payload_hash)
                 if duplicate:
                     return [duplicate]
-                if not business.profile_confirmed or business.profile is None or not business.channel_id:
-                    raise Conflict("Подтвердите профиль и подключите канал перед созданием поста.")
+                if not business.profile_confirmed or business.profile is None:
+                    raise Conflict("Подтвердите профиль перед созданием поста.")
             if expected_profile_version is not None and business.profile_version != expected_profile_version:
                 raise Conflict("Профиль изменился во время генерации; результат не сохранён")
             if expected_channel_id is not None and business.channel_id != expected_channel_id:
@@ -1168,7 +1172,7 @@ class Repository(AccessRepository):
             post = self._post(conn, post_id)
             self._check_revision(post, expected_revision)
             business = self._business(conn, post.business_id)
-            if not self._may_operate(conn, business.owner_id, actor_id):
+            if not self._may_operate(conn, business.owner_id, actor_id, business.id):
                 raise Forbidden("Согласовывать публикации может только владелец или оператор")
             if post.channel_id != business.channel_id:
                 raise Conflict("Канал бизнеса изменился; обновите предпросмотр")
@@ -1432,6 +1436,8 @@ class Repository(AccessRepository):
         *,
         max_pending: int | None = None,
         max_per_day: int | None = None,
+        kind: str = 'prepare', requested_by: int | None = None, caption: str | None = None,
+        profile_version: int | None = None,
     ) -> Job:
         now = _utc(now)
         if not isinstance(request, str) or not 1 <= len(request.strip()) <= 4000:
@@ -1440,7 +1446,7 @@ class Repository(AccessRepository):
             raise InvalidInput("Некорректный ключ задания")
         with self._transaction() as conn:
             self._business(conn, business_id)
-            job, _ = self._enqueue(
+            job, inserted = self._enqueue(
                 conn,
                 business_id,
                 request.strip(),
@@ -1449,7 +1455,28 @@ class Repository(AccessRepository):
                 max_pending=max_pending,
                 max_per_day=max_per_day,
             )
+            if inserted:
+                job = Job.model_validate({**job.model_dump(), 'kind': kind, 'requested_by': requested_by,
+                                          'caption': caption, 'profile_version': profile_version})
+                conn.execute('UPDATE jobs SET data=? WHERE id=?', (_dump(job), job.id))
+            elif (job.kind, job.request, job.caption) != (kind, request.strip(), caption):
+                raise Conflict('Ключ задания уже использован с другими параметрами.')
             return job
+
+    def finish_visual_job(self, job_id, result, now):
+        with self._transaction() as conn:
+            job = self._job(conn, job_id)
+            if job.status != 'running' or job.kind != 'visual':
+                raise Conflict('Задание изображения уже завершено.')
+            business = self._business(conn, job.business_id)
+            if (business.archived or business.profile_version != result.profile_version
+                    or not self._may_operate(conn, business.owner_id, job.requested_by, business.id)):
+                raise Conflict('Профиль или права изменились во время создания изображения.')
+            done = job.model_copy(update={'status': 'done', 'stage': 'done', 'processed': 2, 'total': 2,
+                                          'visual_result': result, 'finished_at': now, 'updated_at': now})
+            conn.execute("UPDATE jobs SET status='done',data=? WHERE id=?", (_dump(done), job.id))
+            self._audit(conn, 'job', job.id, 'done', now, asset_id=result.asset.id)
+            return done
 
     def get_job(self, job_id: str) -> Job:
         with self._reader() as conn:
@@ -1745,14 +1772,14 @@ class Repository(AccessRepository):
             job = self._job(conn, job_id)
             if job.status == "cancelled":
                 return job
-            if job.status != "pending":
+            if job.status != "pending" and not (job.kind == 'visual' and job.status == 'running'):
                 raise Conflict("Отменить можно только ещё не начатое задание")
             updated = job.model_copy(
                 update={"status": "cancelled", "stage": "cancelled", "finished_at": now, "updated_at": now}
             )
             conn.execute(
-                "UPDATE jobs SET status='cancelled',data=? WHERE id=? AND status='pending'",
-                (_dump(updated), job_id),
+                "UPDATE jobs SET status='cancelled',data=? WHERE id=? AND status=?",
+                (_dump(updated), job_id, job.status),
             )
             self._audit(conn, "job", job_id, "cancelled", now)
             return updated
@@ -1904,6 +1931,19 @@ class Repository(AccessRepository):
             rows = conn.execute("SELECT data FROM jobs WHERE status='running'").fetchall()
             for row in rows:
                 job = Job.model_validate_json(row["data"])
+                if job.kind == 'visual':
+                    operation = conn.execute("SELECT result FROM ai_operations WHERE request_key=? AND status='done'",
+                                             (f'visual-job:{job.id}',)).fetchone()
+                    business = self._business(conn, job.business_id)
+                    if (operation and not business.archived and business.profile_version == job.profile_version
+                            and self._may_operate(conn, business.owner_id, job.requested_by, business.id)):
+                        done = Job.model_validate({**job.model_dump(), 'visual_result': json.loads(operation['result']),
+                                                   'status': 'done', 'stage': 'done', 'processed': 2, 'total': 2,
+                                                   'finished_at': now, 'updated_at': now})
+                        conn.execute("UPDATE jobs SET status='done',data=? WHERE id=?", (_dump(done), job.id))
+                        self._audit(conn, 'job', job.id, 'result_recovered', now)
+                        counts['jobs'] += 1
+                        continue
                 new = job.model_copy(
                     update={
                         "status": "failed",

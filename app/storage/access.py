@@ -18,6 +18,93 @@ def stamp(value):
 
 class AccessRepository:
     @staticmethod
+    def _migrate_v5_to_v6(conn):
+        conn.execute("CREATE TABLE IF NOT EXISTS invite_companies (invite_id TEXT PRIMARY KEY REFERENCES access_invites(id), "
+                     "business_id TEXT NOT NULL REFERENCES businesses(id))")
+        conn.execute("CREATE TABLE IF NOT EXISTS form_drafts (business_id TEXT NOT NULL REFERENCES businesses(id), "
+                     "actor_id INTEGER NOT NULL, kind TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT, "
+                     "updated_at TEXT NOT NULL, PRIMARY KEY(business_id,actor_id,kind))")
+        conn.execute("CREATE TABLE IF NOT EXISTS company_scopes (owner_id INTEGER NOT NULL, actor_id INTEGER NOT NULL, "
+                     "scope TEXT NOT NULL CHECK(scope IN ('all','selected')), PRIMARY KEY(owner_id,actor_id))")
+        conn.execute("CREATE TABLE IF NOT EXISTS company_members (business_id TEXT NOT NULL REFERENCES businesses(id), "
+                     "actor_id INTEGER NOT NULL, role TEXT NOT NULL CHECK(role IN ('operator','reviewer','none')), "
+                     "PRIMARY KEY(business_id,actor_id))")
+
+    @classmethod
+    def _business_role(cls, conn, owner_id, actor_id, business_id):
+        global_role = cls._access_role(conn, owner_id, actor_id)
+        if global_role in {None, 'owner'}:
+            return global_role
+        grant = conn.execute('SELECT role FROM company_members WHERE business_id=? AND actor_id=?',
+                             (business_id, actor_id)).fetchone()
+        if grant:
+            if grant['role'] == 'none':
+                return None
+            return 'reviewer' if global_role == 'reviewer' else grant['role']
+        scope = conn.execute('SELECT scope FROM company_scopes WHERE owner_id=? AND actor_id=?',
+                             (owner_id, actor_id)).fetchone()
+        return None if scope and scope['scope'] == 'selected' else global_role
+
+    def business_role(self, owner_id, actor_id, business_id):
+        with self._reader() as conn:
+            return self._business_role(conn, owner_id, actor_id, business_id)
+
+    def set_company_access(self, owner_id, actor_id, business_id, role, scope, now):
+        if role not in {'operator', 'reviewer', 'none'} or scope not in {'all', 'selected'}:
+            raise InvalidInput('Выберите роль и область доступа.')
+        if actor_id == owner_id:
+            raise InvalidInput('Права владельца изменять нельзя.')
+        with self._transaction() as conn:
+            if self._business(conn, business_id).owner_id != owner_id:
+                raise Forbidden('Нет доступа к компании.')
+            member = self._access_role(conn, owner_id, actor_id)
+            if member is None or (member == 'reviewer' and role == 'operator'):
+                raise InvalidInput('Участник должен принять приглашение соответствующей роли.')
+            conn.execute('INSERT INTO company_scopes VALUES(?,?,?) ON CONFLICT(owner_id,actor_id) '
+                         'DO UPDATE SET scope=excluded.scope', (owner_id, actor_id, scope))
+            conn.execute('INSERT INTO company_members VALUES(?,?,?) ON CONFLICT(business_id,actor_id) '
+                         'DO UPDATE SET role=excluded.role', (business_id, actor_id, role))
+            # Any change invalidates older approvals, even if access is later re-granted.
+            self._audit(conn, 'company_access', str(actor_id), 'changed', now,
+                        business_id=business_id, role=role, scope=scope)
+
+    def company_access(self, owner_id, business_id):
+        with self._reader() as conn:
+            rows = conn.execute('SELECT actor_id,role FROM access_members WHERE owner_id=? AND revoked_at IS NULL',
+                                (owner_id,)).fetchall()
+            result = []
+            for row in rows:
+                scope = conn.execute('SELECT scope FROM company_scopes WHERE owner_id=? AND actor_id=?',
+                                     (owner_id, row['actor_id'])).fetchone()
+                result.append({'actor_id': row['actor_id'], 'workspace_role': row['role'],
+                               'role': self._business_role(conn, owner_id, row['actor_id'], business_id) or 'none',
+                               'scope': scope['scope'] if scope else 'all'})
+            return result
+
+    def form_draft(self, business_id, actor_id, kind):
+        with self._reader() as conn:
+            row = conn.execute('SELECT revision,data FROM form_drafts WHERE business_id=? AND actor_id=? AND kind=?',
+                               (business_id, actor_id, kind)).fetchone()
+            return {'revision': row['revision'], 'data': json.loads(row['data']) if row['data'] else None} if row else {'revision': 0, 'data': None}
+
+    def save_form_draft(self, owner_id, business_id, actor_id, kind, revision, data, now):
+        from app.shared.errors import Conflict
+        with self._transaction() as conn:
+            if not self._may_operate(conn, owner_id, actor_id, business_id):
+                raise Forbidden('Нет права сохранять черновик этой компании.')
+            if self._business(conn, business_id).archived:
+                raise Conflict('Компания находится в архиве.')
+            row = conn.execute('SELECT revision FROM form_drafts WHERE business_id=? AND actor_id=? AND kind=?',
+                               (business_id, actor_id, kind)).fetchone()
+            if revision != (row['revision'] if row else 0):
+                raise Conflict('Черновик изменён в другом окне. Переоткройте форму, чтобы загрузить его.')
+            encoded = json.dumps(data, ensure_ascii=False) if data is not None else None
+            conn.execute('INSERT INTO form_drafts VALUES(?,?,?,?,?,?) ON CONFLICT(business_id,actor_id,kind) '
+                         'DO UPDATE SET revision=excluded.revision,data=excluded.data,updated_at=excluded.updated_at',
+                         (business_id, actor_id, kind, revision+1, encoded, stamp(now)))
+            return {'revision': revision+1, 'data': data}
+
+    @staticmethod
     def _migrate_v4_to_v5(conn):
         conn.execute(
             "CREATE TABLE IF NOT EXISTS access_invites (id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, "
@@ -49,8 +136,10 @@ class AccessRepository:
         return row["role"] if row else None
 
     @classmethod
-    def _may_operate(cls, conn, owner_id, actor_id):
-        return cls._access_role(conn, owner_id, actor_id) in {"owner", "operator"}
+    def _may_operate(cls, conn, owner_id, actor_id, business_id=None):
+        role = (cls._business_role(conn, owner_id, actor_id, business_id) if business_id is not None
+                else cls._access_role(conn, owner_id, actor_id))
+        return role in {"owner", "operator"}
 
     def access_role(self, owner_id, actor_id):
         with self._reader() as conn:
@@ -64,7 +153,7 @@ class AccessRepository:
 
     @classmethod
     def _approval_allowed(cls, conn, owner_id, post):
-        if not cls._may_operate(conn, owner_id, post.approved_by):
+        if not cls._may_operate(conn, owner_id, post.approved_by, post.business_id):
             return False
         if post.approved_by == owner_id:
             return True
@@ -74,6 +163,9 @@ class AccessRepository:
         ).fetchone()
         # A fresh invite after revocation never revives a former approval.
         cutoff = cls._revocation_sequence(conn, post.approved_by)
+        company_cutoff = conn.execute("SELECT MAX(id) FROM audit WHERE entity_type='company_access' AND entity_id=?",
+                                      (str(post.approved_by),)).fetchone()[0]
+        cutoff = max(cutoff or 0, company_cutoff or 0)
         if not approval or (cutoff is not None and approval["id"] <= cutoff):
             return False
         details = json.loads(approval["details"])
@@ -92,7 +184,7 @@ class AccessRepository:
         with self._reader() as conn:
             return self._approval_allowed(conn, owner_id, post)
 
-    def create_access_invite(self, owner_id, role, max_uses, expires_at, now):
+    def create_access_invite(self, owner_id, role, max_uses, expires_at, now, *, business_id=None):
         created, expires = stamp(now), stamp(expires_at)
         if role not in {"operator", "reviewer"} or type(max_uses) is not int or not 1 <= max_uses <= 100:
             raise InvalidInput("Укажите роль operator/reviewer и лимит от 1 до 100 участников.")
@@ -100,10 +192,14 @@ class AccessRepository:
             raise InvalidInput("Приглашение должно действовать от текущего момента до 30 дней.")
         token, invite_id = secrets.token_urlsafe(32), str(uuid4())
         with self._transaction() as conn:
+            if business_id is not None and self._business(conn, business_id).owner_id != owner_id:
+                raise Forbidden('Нет доступа к компании приглашения.')
             conn.execute(
                 "INSERT INTO access_invites VALUES (?,?,?,?,?,?,?,NULL)",
                 (invite_id, hashlib.sha256(token.encode()).hexdigest(), owner_id, role, max_uses, created, expires),
             )
+            if business_id is not None:
+                conn.execute('INSERT INTO invite_companies VALUES(?,?)', (invite_id, business_id))
             self._audit(conn, "access_invite", invite_id, "created", now,
                         role=role, max_uses=max_uses, origin="local_admin")
         return {"id": invite_id, "token": token, "role": role, "max_uses": max_uses, "expires_at": expires}
@@ -125,6 +221,9 @@ class AccessRepository:
                 "SELECT * FROM access_members WHERE owner_id=? AND actor_id=?", (owner_id, actor_id),
             ).fetchone()
             cutoff = self._revocation_sequence(conn, actor_id)
+            company_cutoff = conn.execute("SELECT MAX(id) FROM audit WHERE entity_type='company_access' AND entity_id=?",
+                                          (str(actor_id),)).fetchone()[0]
+            cutoff = max(cutoff or 0, company_cutoff or 0) or None
             if cutoff is not None:
                 issued = conn.execute(
                     "SELECT id FROM audit WHERE entity_type='access_invite' AND entity_id=? AND action='created' "
@@ -151,6 +250,16 @@ class AccessRepository:
                     "DO UPDATE SET role=excluded.role,granted_at=excluded.granted_at,revoked_at=NULL",
                     (owner_id, actor_id, role, at),
                 )
+            scoped = conn.execute('SELECT business_id FROM invite_companies WHERE invite_id=?', (invite['id'],)).fetchone()
+            if scoped and role != 'owner':
+                if not member or member['revoked_at'] or (member['role'] == 'reviewer' and invite['role'] == 'operator'):
+                    conn.execute("INSERT INTO company_scopes VALUES(?,?,'selected') ON CONFLICT(owner_id,actor_id) "
+                                 "DO UPDATE SET scope='selected'", (owner_id, actor_id))
+                    conn.execute('DELETE FROM company_members WHERE actor_id=?', (actor_id,))
+                prior_role = self._business_role(conn, owner_id, actor_id, scoped['business_id'])
+                company_role = 'operator' if prior_role == 'operator' else invite['role']
+                conn.execute('INSERT INTO company_members VALUES(?,?,?) ON CONFLICT(business_id,actor_id) '
+                             'DO UPDATE SET role=excluded.role', (scoped['business_id'], actor_id, company_role))
             self._audit(conn, "access_member", str(actor_id), "invite_claimed", now,
                         actor_id=actor_id, role=role, invite_id=invite["id"])
             return role
