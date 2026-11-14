@@ -72,6 +72,20 @@ class TelegramBotAdapter:
         await asyncio.gather(*(install(actor) for actor in sorted(actors)))
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        delay = 2
+        while not stop_event.is_set():
+            try:
+                await self._run_connected(stop_event)
+                return
+            except (ProviderUnavailable, TelegramAPIError):
+                log.warning("Telegram connection unavailable; reconnecting in %s seconds", delay)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                delay = min(delay * 2, 60)
+
+    async def _run_connected(self, stop_event: asyncio.Event) -> None:
         if stop_event.is_set():
             return
         self.updates.stopping = False

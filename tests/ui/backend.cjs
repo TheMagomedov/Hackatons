@@ -409,6 +409,29 @@ async function stopFixture(child) {
   await page.locator('.visual-tile').first().click();
   await page.locator('#dialog-body .preview-art img').waitFor();
   assert.equal(await page.getByRole('button',{name:'Скачать изображение',exact:true}).isEnabled(),true);
+  await page.getByRole('button',{name:'Закрыть',exact:true}).first().click();
+  // Archive hides an idle company without losing its images; restore stays paused.
+  const archiveBusiness=await backendAPI('post','/business',{name:'Архив браузерной проверки'});
+  await page.reload();
+  await page.locator('#workspace').selectOption(archiveBusiness.id);
+  await page.locator('#main[data-business="'+archiveBusiness.id+'"][aria-busy="false"]').waitFor();
+  await page.locator('.dock [data-view="business"]').click();
+  await page.getByRole('button',{name:'Перенести в архив',exact:true}).click();
+  await page.locator('input[name="confirmation"]').fill(archiveBusiness.name);
+  const archiveResponse=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/archive'));
+  await page.getByRole('button',{name:'В архив',exact:true}).click();
+  assert.equal((await archiveResponse).status(),200);
+  await page.locator('#main[aria-busy="false"]').waitFor();
+  await page.locator('.dock [data-view="business"]').click();
+  await page.getByRole('button',{name:'Архив компаний',exact:true}).click();
+  await page.getByRole('button',{name:'Восстановить',exact:true}).click();
+  await page.locator('input[name="confirmation"]').fill(archiveBusiness.name);
+  const restoreResponse=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/archive'));
+  await page.getByRole('button',{name:'Восстановить',exact:true}).click();
+  assert.equal((await restoreResponse).status(),200);
+  const restoredBusiness=(await backendAPI('get','/state?business='+archiveBusiness.id)).business;
+  assert.equal(restoredBusiness.archived,false);
+  assert.equal(restoredBusiness.publications_paused,true);
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}

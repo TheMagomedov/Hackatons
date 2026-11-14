@@ -79,6 +79,11 @@ class NewJob(Contract):
     request_id: str = Field(min_length=1, max_length=100)
 
 
+class ArchiveInput(Contract):
+    archived: bool
+    confirmation: str = Field(min_length=1, max_length=200)
+
+
 class VisualInput(NewJob):
     caption: str | None = Field(default=None, min_length=1, max_length=900)
 
@@ -254,6 +259,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         businesses = svc.list_businesses(actor)
         selected_id = request.query.get("business")
         selected = svc.get_business(actor, selected_id) if selected_id else (businesses[-1] if businesses else None)
+        if selected is not None and selected.archived:
+            selected = businesses[-1] if businesses else None
         if selected is None:
             return web.json_response({"businesses": [], "business": None, "posts": [], "counts": {},
                                       "sources": [], "jobs": [], "usage": svc.ai_usage(actor),
@@ -300,6 +307,13 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         svc, actor = context(request)
         body = NewBusiness.model_validate(await json_body(request))
         return web.json_response(business_view(svc.create_business(actor, body.name, body.timezone)), status=201)
+
+    async def archive_business(request):
+        svc, actor = context(request)
+        if request.method == "GET":
+            return web.json_response({"items": [b.model_dump(mode="json") for b in svc.archived_businesses(actor)]})
+        body = ArchiveInput.model_validate(await json_body(request))
+        return show(svc.archive_business(actor, request.match_info["id"], body.archived, body.confirmation))
 
     async def add_source(request):
         svc, actor = context(request)
@@ -541,6 +555,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.get("/mini/api/business/{id}/posts", posts),
         web.get("/mini/api/business/{id}/calendar", calendar),
         web.post("/mini/api/business", create_business),
+        web.get("/mini/api/business-archive", archive_business),
+        web.post("/mini/api/business/{id}/archive", archive_business),
         web.post("/mini/api/business/{id}/source", add_source),
         web.post("/mini/api/business/{id}/pdf", upload_pdf),
         web.post("/mini/api/business/{id}/image", upload_image),

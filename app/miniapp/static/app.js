@@ -524,7 +524,7 @@ function businessView() {
   const b = state.business;
   const profile = b.profile;
   return headline("Настройки", b.name, "Источники, профиль и Telegram-канал.",
-    button("Новый бизнес", "new-business", "secondary", "plus"))
+    button("Новый бизнес", "new-business", "secondary", "plus") + button("Архив компаний", "business-archive", "secondary"))
     + '<div class="business-layout"><section class="panel business-panel"><h2>Профиль</h2>'
     + '<p>' + safe(profile?.description || "Добавьте материалы и соберите профиль бизнеса.") + '</p>'
     + (profile ? '<p><strong>Стиль:</strong> ' + safe(profile.tone) + '</p><p>'
@@ -542,7 +542,7 @@ function businessView() {
     + '</section><section class="panel business-panel"><h2>Канал</h2><p>'
     + safe(b.channel_title || b.channel_id || "Канал пока не подключён.") + '</p>'
     + button(b.channel_id ? "Изменить канал" : "Подключить канал", "channel", "secondary", "telegram")
-    + '</section></div></div>';
+    + '</section>' + (currentAccess().role === "owner" ? '<section class="panel business-panel"><h2>Архив компании</h2><p>Скрыть компанию из списка и остановить подготовку и публикации. Данные сохранятся.</p>' + button("Перенести в архив", "archive-business", "secondary") + '</section>' : '') + '</div></div>';
 }
 function updateNavigation() {
   document.querySelectorAll("nav [data-view]").forEach((button) => {
@@ -584,7 +584,7 @@ function render() {
     root.innerHTML = !canWrite() ? headline("Рабочее пространство", "Пока нет материалов", "Команда ещё не добавила компанию для просмотра.")
       : headline("Первый шаг", "Создайте бизнес", "Добавьте карточку, чтобы начать работу с контентом.")
       + '<div class="empty">Понадобятся описание бизнеса и канал Telegram.<br>'
-      + button("Создать бизнес", "new-business", "primary", "plus") + '</div>';
+      + button("Создать бизнес", "new-business", "primary", "plus") + button("Архив компаний", "business-archive", "secondary") + '</div>';
   } else {
     root.innerHTML = {overview, content: contentView, work: workView, reports: reportView, business: businessView}[view]();
   }
@@ -953,6 +953,19 @@ document.addEventListener("click", async (event) => {
       openForm("prepare", "Пост с текстом и изображением", "Опишите тему. AI подготовит текст и подберёт сцену, затем генератор создаст картинку. Оба материала появятся в черновике.",
         formField("Задание для AI", "request", "textarea", 'maxlength="4000" placeholder="Например: два поста о стекле в архитектуре"'),
         "Поставить в очередь");
+    } else if (action === "business-archive") {
+      if (demo) throw new Error("Архив доступен в рабочей студии.");
+      const result = await api("/business-archive");
+      showDialog(dialogHeading("Архив компаний", "После восстановления публикации остаются на паузе, автоподготовка отключена.")
+        + result.items.map(b => '<p><strong>' + safe(b.name) + '</strong></p>'
+          + (currentAccess().role === "owner" ? button("Восстановить", "restore-business", "secondary", "", 'data-id="'+safe(b.id)+'" data-name="'+safe(b.name)+'"') : '')).join('')
+        + (!result.items.length ? '<p>Архив пуст.</p>' : '') + button("Закрыть", "close", "secondary"));
+    } else if (action === "archive-business" || action === "restore-business") {
+      const restoring = action === "restore-business", name = restoring ? control.dataset.name : state.business.name;
+      openForm("business-archive", restoring ? "Восстановить компанию" : "Перенести компанию в архив",
+        "Для подтверждения введите название: " + name,
+        formField("Название компании", "confirmation", "text", 'maxlength="200"')
+        + '<input type="hidden" name="archived" value="'+(!restoring)+'">', restoring ? "Восстановить" : "В архив", restoring ? id : businessId);
     } else if (action === "new-business") {
       openForm("business", "Новый бизнес", "Укажите название. Материалы можно добавить после создания.",
         formField("Название", "name", "text", 'maxlength="150" placeholder="Название компании"'), "Создать бизнес");
@@ -1028,7 +1041,11 @@ dialog.addEventListener("submit", async (event) => {
   let submittingBusiness = businessId;
   const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
-    if (action === "visual") {
+    if (action === "business-archive") {
+      await api("/business/"+path(id)+"/archive", {archived:values.archived === "true",confirmation:values.confirmation});
+      if (currentForm()) dialog.close();
+      businessId = ""; await refresh(); notify("Изменение сохранено. Публикации этой компании на паузе.");
+    } else if (action === "visual") {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
       submit.textContent = "Создаём изображение…";
       notify("AI подбирает сцену, затем создаётся изображение. Дождитесь результата — это может занять несколько минут.");
@@ -1037,7 +1054,10 @@ dialog.addEventListener("submit", async (event) => {
       else notify("Изображение готово. Откройте «Мои изображения» нужной компании.");
     } else if (action === "visual-post") {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
-      const post = await api("/business/" + path(id) + "/draft", {text: values.text, image_asset_id: values.asset_id, request_id: requestId});
+      const visual = visualDrafts.get(values.asset_id);
+      if (visual && visual.profile_version !== state.business.profile_version) throw new Error("Профиль изменился после генерации. Создайте изображение с актуальным стилем компании.");
+      const post = await api("/business/" + path(id) + "/draft", {text: values.text, image_asset_id: values.asset_id,
+        source_ids: visual?.draft.used_source_ids || [], request_id: requestId});
       if (currentForm()) showPost(post);
       await refresh(); notify("Черновик сохранён. Проверьте и согласуйте публикацию отдельно.");
     } else if (action === "knowledge-search") {
@@ -1192,6 +1212,7 @@ async function generateImageForForm(form, business) {
     });
     if (!form.isConnected || business !== businessId) { notify("Картинка сохранена в «Моих изображениях»."); return; }
     form.dataset.assetId = result.asset.id;
+    form.dataset.imageCaption = text;
     delete form.dataset.imageRequestId;
     form.elements.image.value = "";
     const target = form.querySelector('.manual-image-preview');
@@ -1232,7 +1253,9 @@ async function validateManualImage(file) {
 }
 dialog.addEventListener("change", async event => {
   if (event.target.name !== "image") return;
-  const form = event.target.form; delete form.dataset.assetId;
+  const form = event.target.form; delete form.dataset.assetId; delete form.dataset.imageCaption;
+  const progress = form.querySelector('[data-image-progress]');
+  if (progress) progress.textContent = '';
   const preview = form.querySelector('.manual-image-preview');
   if (manualPreviewUrl) URL.revokeObjectURL(manualPreviewUrl);
   preview.hidden = true; preview.replaceChildren();
@@ -1274,6 +1297,9 @@ root.addEventListener("keydown", async event => {
 document.addEventListener("input", event => {
   const form = event.target.closest("form");
   if (event.target.name === "text" && form?.dataset.form === "manual-post") form.querySelector('.manual-text-count').textContent = event.target.value.length + " / 900";
+  if (event.target.name === "text" && form?.dataset.imageCaption && event.target.value.trim() !== form.dataset.imageCaption) {
+    form.querySelector('[data-image-progress]').textContent = "Текст изменён после генерации. Проверьте картинку и её заголовок или сгенерируйте новую.";
+  }
   if (form && !form.querySelector('button[type="submit"]')?.disabled) delete form.dataset.requestId;
 });
 workspace.addEventListener("change", async () => {

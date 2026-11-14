@@ -28,6 +28,7 @@ FORMAT_VERSION = 1
 MAX_DATABASE_BYTES = 2_000_000_000
 MAX_MANIFEST_BYTES = 16_000_000
 MAX_ASSETS = 100_000
+EXTRA_DATABASES = frozenset({"vk.sqlite3", "knowledge.sqlite3", "ai-runtime.sqlite3"})
 
 
 def _path(value: str | Path) -> Path:
@@ -142,6 +143,15 @@ def backup_data(data_dir: str | Path, destination: str | Path) -> dict:
         files = {
             "backend.sqlite3": _copy_verified(stage / "backend.sqlite3", None, maximum=MAX_DATABASE_BYTES)
         }
+        for name in sorted(EXTRA_DATABASES):
+            if not (source / name).exists():
+                continue
+            with _read_database(source / name) as original:
+                with closing(sqlite3.connect(stage / name)) as copied:
+                    original.backup(copied)
+                    if copied.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise Conflict("Дополнительная база не прошла проверку целостности.")
+            files[name] = _copy_verified(stage / name, None, maximum=MAX_DATABASE_BYTES)
         store = FileStore(source / "assets", max_bytes=20_000_000) if assets else None
         for asset in assets:
             content = store.read(asset)
@@ -174,21 +184,22 @@ def _verified_backup(backup_dir: str | Path) -> tuple[dict, dict]:
         if (
             manifest["format"] != FORMAT_VERSION
             or not isinstance(files, dict)
-            or not 1 <= len(files) <= MAX_ASSETS + 1
+            or not 1 <= len(files) <= MAX_ASSETS + 1 + len(EXTRA_DATABASES)
         ):
             raise ValueError
         for name, checksum in files.items():
-            if name != "backend.sqlite3" and not re.fullmatch(r"assets/[a-f0-9-]{36}\.blob", name):
+            if name not in {"backend.sqlite3", *EXTRA_DATABASES} and not re.fullmatch(r"assets/[a-f0-9-]{36}\.blob", name):
                 raise ValueError
             if not isinstance(checksum, str) or not re.fullmatch(r"[a-f0-9]{64}", checksum):
                 raise ValueError
             actual = _copy_verified(
-                source / name, None, maximum=MAX_DATABASE_BYTES if name == "backend.sqlite3" else 20_000_000
+                source / name, None, maximum=MAX_DATABASE_BYTES if name.endswith(".sqlite3") else 20_000_000
             )
             if actual != checksum:
                 raise Conflict("Контрольная сумма резервной копии не совпадает.")
         version, assets = _inventory(source / "backend.sqlite3")
         expected = {"backend.sqlite3", *(f"assets/{asset.id}.blob" for asset in assets)}
+        expected.update(set(files) & EXTRA_DATABASES)
         if set(files) != expected or version != manifest["schema_version"]:
             raise ValueError
         if assets:
@@ -219,11 +230,19 @@ def restore_data(backup_dir: str | Path, destination: str | Path) -> dict:
             actual = _copy_verified(
                 source / name,
                 stage / name,
-                maximum=MAX_DATABASE_BYTES if name == "backend.sqlite3" else 20_000_000,
+                maximum=MAX_DATABASE_BYTES if name.endswith(".sqlite3") else 20_000_000,
             )
             if actual != checksum:
                 raise Conflict("Копия изменилась во время восстановления.")
         repo = Repository(stage / "backend.sqlite3")
+        if (stage / "vk.sqlite3").exists():
+            with closing(sqlite3.connect(stage / "vk.sqlite3")) as vk:
+                tables = {row[0] for row in vk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if {"tickets", "inbox", "cursor"} <= tables:
+                    vk.execute("DELETE FROM tickets")
+                    vk.execute("DELETE FROM cursor")
+                    vk.execute("UPDATE inbox SET state='interrupted',text='' WHERE state IN ('pending','running')")
+                    vk.commit()
         try:
             repo.initialize()
             now = datetime.now(UTC)

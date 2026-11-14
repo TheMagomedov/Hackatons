@@ -48,6 +48,7 @@ class BusinessProfile(Contract):
 class Business(Contract):
     id: str
     owner_id: int
+    archived: bool = False
     name: str
     timezone: str
     channel_id: str | None = None

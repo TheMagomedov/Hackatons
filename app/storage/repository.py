@@ -508,6 +508,21 @@ class Repository(AccessRepository):
                 for r in conn.execute("SELECT data FROM businesses ORDER BY rowid")
             ]
 
+    def archive_business(self, business_id: str, archived: bool, now: datetime) -> Business:
+        with self._transaction() as conn:
+            old = self._business(conn, business_id)
+            for table, statuses in (("jobs", ("pending", "running")), ("posts", ("publishing", "editing")),
+                                    ("ai_operations", ("running",))):
+                marks = ",".join("?" for _ in statuses)
+                if conn.execute(f"SELECT 1 FROM {table} WHERE business_id=? AND status IN ({marks}) LIMIT 1",
+                                (business_id, *statuses)).fetchone():
+                    raise Conflict("Дождитесь активных операций и отмените ожидающие задания компании.")
+            new = old.model_copy(update={"archived": archived, "publications_paused": True,
+                                         "automation_enabled": False, "next_generation_at": None})
+            self._save_business(conn, new)
+            self._audit(conn, "business", business_id, "archived" if archived else "restored", now)
+            return new
+
     def set_channel(self, business_id: str, channel: ChannelInfo, now: datetime) -> Business:
         now = _utc(now)
         if not channel.id.strip():

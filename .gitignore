@@ -15,6 +15,7 @@ htmlcov/
 var/
 backups/
 build/
+.chart-data-*/
 dist/
 *.egg-info/
 .idea/

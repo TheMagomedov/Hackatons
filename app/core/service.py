@@ -113,6 +113,8 @@ class BackendService:
         business = self.repo.get_business(business_id)
         if business.owner_id != self.settings.owner_id:
             raise Forbidden("Нет доступа к этому бизнесу.")
+        if write and business.archived:
+            raise Conflict("Компания в архиве. Сначала восстановите её.")
         return business
 
     def _post(self, actor_id: int, post_id: str, *, write: bool = True) -> PostView:
@@ -342,7 +344,20 @@ class BackendService:
 
     def list_businesses(self, actor_id: int) -> list[Business]:
         self.require_access(actor_id)
-        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id]
+        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id and not b.archived]
+
+    def archived_businesses(self, actor_id: int) -> list[Business]:
+        self.require_access(actor_id)
+        return [b for b in self.repo.list_businesses() if b.owner_id == self.settings.owner_id and b.archived]
+
+    @actor_action
+    def archive_business(self, actor_id: int, business_id: str, archived: bool, confirmation: str) -> Business:
+        if self.require_access(actor_id, write=True) != "owner":
+            raise Forbidden("Архивом компаний управляет владелец пространства.")
+        business = self._business(actor_id, business_id, write=False)
+        if confirmation.strip() != business.name:
+            raise InvalidInput("Введите точное название компании для подтверждения.")
+        return self.repo.archive_business(business_id, archived, self.now())
 
     def capabilities(self, actor_id: int) -> dict:
         """Loaded configuration only; credentials, balance and provider access are never probed."""
