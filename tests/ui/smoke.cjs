@@ -81,7 +81,7 @@ const url = process.env.MINI_APP_URL || 'http://127.0.0.1:8765/mini/';
     await page.locator('input[name="value"]').fill('@glass_workshop_test');
     await page.getByRole('button',{name:'Проверить канал',exact:true}).click();
     await nav('content');
-    await page.getByRole('button',{name:'Сгенерировать с AI',exact:true}).click();
+    await page.getByRole('button',{name:'Создать пост с AI',exact:true}).click();
     await page.locator('textarea[name="request"]').fill('Пост о стеклянной перегородке для офиса');
     await page.getByRole('button',{name:'Поставить в очередь',exact:true}).click();
     await page.locator('.post-card').waitFor();

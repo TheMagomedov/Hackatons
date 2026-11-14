@@ -449,3 +449,14 @@ body[data-theme="light"] .metric-card :is(.metric-heading,.metric-link) {color:v
   .metric-card::before {left:0;width:100%}
 }
 @media(max-width:345px) {.workspace-hero {padding:22px 16px}.workspace-hero h1 {font-size:29px}}
+
+.visual-studio {margin:24px 0;padding:24px;border-left:5px solid #289389;background:var(--surface)}
+.visual-studio h2 {margin:8px 0;font-size:clamp(22px,4vw,30px)}
+.visual-studio p {max-width:65ch;line-height:1.6}
+.visual-gallery {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:20px 0}
+.visual-tile {min-width:0;padding:0;border:1px solid #C1D0D3;border-radius:12px;overflow:hidden;color:inherit;background:transparent;text-align:left;cursor:pointer}
+.visual-tile span {display:block;padding:12px;overflow-wrap:anywhere}
+.visual-tile .post-art {aspect-ratio:1;min-height:0}
+.visual-tile img {width:100%;height:100%;object-fit:cover}
+[data-image-progress] {padding:12px;border-left:3px solid #0094A8}
+@media(max-width:550px) {.visual-studio {padding:20px}.visual-studio .press-actions {display:grid}.visual-gallery {gap:10px}}

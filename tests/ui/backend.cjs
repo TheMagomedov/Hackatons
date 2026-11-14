@@ -99,7 +99,7 @@ async function stopFixture(child) {
   await page.locator('input[name="value"]').fill('@qa_channel');
   await page.getByRole('button',{name:'Проверить канал',exact:true}).click();
   await page.locator('.dock [data-view="content"]').click();
-  await page.getByRole('button',{name:'Сгенерировать с AI',exact:true}).click();
+  await page.getByRole('button',{name:'Создать пост с AI',exact:true}).click();
   await page.locator('textarea[name="request"]').fill('Один пост о компании');
   await page.getByRole('button',{name:'Поставить в очередь',exact:true}).click();
   await page.locator('.post-card').first().waitFor({timeout:15000});
@@ -368,6 +368,47 @@ async function stopFixture(child) {
    assert.equal(await retryPage.locator('#main').getAttribute('data-business'),retryStates[0]);
    assert.equal(await retryPage.locator('#workspace').inputValue(),retryStates[0]);
   } finally {await retryPage.unrouteAll({behavior:'ignoreErrors'});await retryPage.close();}
+  // A manual post with no uploaded file derives and attaches an illustration.
+  await page.locator('#workspace').selectOption(previousBusiness);
+  await page.locator('.dock [data-view="overview"]').click();
+  await page.locator('#main[data-business="'+previousBusiness+'"]').waitFor();
+  await page.locator('#main [data-action="manual-post"]').click();
+  const automaticCaption='Стеклянный фасад в сосновом лесу. Мягкий утренний свет.';
+  await page.locator('textarea[name="text"]').fill(automaticCaption);
+  assert.equal(await page.locator('input[name="image"]').evaluate(el=>el.required),false);
+  const visualRequests=[];
+  page.on('request',request=>{if(request.method()==='POST'&&request.url().endsWith('/visuals')) visualRequests.push(request.postDataJSON());});
+  const draftResponse=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/draft')).catch(async error=>{console.error('Image form error:',await page.locator('#form-error').textContent(),'Visual calls:',visualRequests.length);throw error;});
+  await page.getByRole('button',{name:'Сохранить черновик',exact:true}).click();
+  const generatedPost=await (await draftResponse).json();
+  await page.locator('#dialog-body .preview-art img').waitFor();
+  assert.equal(generatedPost.text,automaticCaption,'Image generation preserves the original post text');
+  assert.equal(visualRequests.length,1);
+  assert.equal(visualRequests[0].caption,automaticCaption);
+  let gallery=await backendAPI('get','/business/'+previousBusiness+'/visuals');
+  assert.equal(gallery.items[0].asset.id,generatedPost.image_asset_id);
+  await page.getByRole('button',{name:'Закрыть',exact:true}).click();
+  await page.locator('#main [data-action="manual-post"]').click();
+  await page.locator('textarea[name="text"]').fill('Новый текст для другой картинки');
+  await page.getByRole('button',{name:'Сгенерировать по тексту поста',exact:true}).click();
+  await page.locator('[data-image-progress]').getByText('Картинка готова', {exact:false}).waitFor();
+  assert.equal(visualRequests.length,2);
+  const secondDraftResponse=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/draft'));
+  await page.getByRole('button',{name:'Сохранить черновик',exact:true}).click();
+  await secondDraftResponse;
+  await page.locator('#dialog-body .preview-art img').waitFor();
+  assert.equal(visualRequests.length,2,'Saving an already generated image must not generate again');
+  await page.getByRole('button',{name:'Закрыть',exact:true}).click();
+  await page.reload();
+  await page.locator('#main [data-action="visual-gallery"]').waitFor();
+  await page.locator('#workspace').selectOption(previousBusiness);
+  await page.locator('#main[data-business="'+previousBusiness+'"][aria-busy="false"]').waitFor();
+  await page.locator('#main [data-action="visual-gallery"]').click();
+  await page.locator('.visual-tile').first().waitFor();
+  assert.equal(await page.locator('.visual-tile').count(),2,'Images survive a reload');
+  await page.locator('.visual-tile').first().click();
+  await page.locator('#dialog-body .preview-art img').waitFor();
+  assert.equal(await page.getByRole('button',{name:'Скачать изображение',exact:true}).isEnabled(),true);
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}

@@ -46,6 +46,7 @@ let toastTimer;
 let watchedJob = 0;
 const imageUrls = new Map();
 const imageTypes = new Map();
+const visualDrafts = new Map();
 let themeOverride = null;
 let dateFormatter;
 let dateTimezone;
@@ -132,6 +133,7 @@ function persistDemo() {
   if (note) note.textContent = saved ? "Изменения сохраняются в этом браузере." : "Хранилище недоступно или заполнено. Изменения сохраняются только в этой вкладке.";
 }
 function apiTimeout(url, method) {
+  if (method === "POST" && /^\/business\/[^/?#]+\/visuals$/.test(url)) return 660000;
   // Only synchronous inference needs the backend's 300s budget plus transport margin.
   // Creating a generation job is a short queue operation and keeps the default.
   return method === "POST" && /^(?:\/business\/[^/?#]+\/(?:profile\/analyze|chat)|\/post\/[^/?#]+\/revise-(?:text|image))$/.test(url)
@@ -309,10 +311,11 @@ function overview() {
   return '<div class="workspace-home"><section class="workspace-hero"><div><p class="press-kicker">КОНТЕНТ-СТУДИЯ</p>'
     + '<h1>От идеи к публикации.</h1><p class="hero-description">' + safe(b.name) + ' · '
     + (ready ? "Всё для контента в одном пространстве." : "Давайте настроим пространство компании.") + '</p>'
-    + '<div class="press-actions">' + button("Сгенерировать с AI", "new-post", "primary", "spark")
+    + '<div class="press-actions">' + button("Создать пост с AI", "new-post", "primary", "spark")
     + button("Создать вручную", "manual-post", "secondary", "plus") + '</div>'
     + '<p class="approval-note">' + icon("check") + 'Каждый пост выходит только после вашего согласования.</p></div>'
     + pressArt("draft", "workspace-illustration") + '</section>'
+    + visualStudioCard()
     + (!ready && canWrite() ? setupProgress() : '')
     + '<div class="dashboard-metrics">' + editorialStatuses.map(([status, label, glyph]) =>
       '<button class="metric-card panel" data-action="filter" data-status="' + status + '"><span class="metric-heading">'
@@ -477,7 +480,7 @@ function calendarView() {
 function contentView() {
   const filters = [["", "Все"], ["review", "На согласовании"], ["approved", "Запланированы"], ["published", "Опубликованы"], ["failed", "Ошибки"], ["rejected", "Отклонены"], ["delivery_unknown", "Проверить доставку"]];
   return headline("Редакция", "Посты", "Ваши материалы и календарь публикаций.",
-    '<div class="content-create-actions">' + button("Сгенерировать с AI", "new-post", "primary", "spark") + button("Создать вручную", "manual-post", "secondary", "plus") + '</div>')
+    '<div class="content-create-actions">' + button("Создать пост с AI", "new-post", "primary", "spark") + button("Создать изображение", "new-visual", "secondary", "image") + button("Создать вручную", "manual-post", "secondary", "plus") + '</div>')
     + '<div class="content-toolbar"><form class="content-search" data-search><input name="search" type="search" maxlength="200" value="' + safe(searchQuery)
     + '" aria-label="Поиск по тексту постов" placeholder="Найти пост по тексту…"><button type="submit" class="button secondary">Найти</button></form>'
     + '<div class="content-layout" aria-label="Отображение постов">'
@@ -730,6 +733,30 @@ function showPost(post) {
     + button("Скачать изображение", "download-image", "secondary", "image", demo ? "" : 'disabled data-requires-image')
     + actions + '</div>');
 }
+
+function visualStudioCard() {
+  const local = state.capabilities?.image_local;
+  return '<section class="visual-studio panel"><div><p class="eyebrow">'
+    + (local ? 'FLUX · НА ВАШЕМ ПК' : 'ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ')
+    + '</p><h2>Опишите идею — получите картинку</h2><p>Пишите по-русски. AI подберёт сцену, композицию и свет'
+    + (local ? ', а локальный FLUX создаст изображение.' : ' и подготовит изображение.')
+    + ' Можно скачать результат или использовать его в посте.</p></div><div class="press-actions">'
+    + button("Создать изображение", "new-visual", "primary", "image")
+    + button("Мои изображения", "visual-gallery", "secondary") + '</div></section>';
+}
+function showVisual(visual) {
+  if (visual.asset.business_id !== businessId) throw new Error("Изображение относится к другой компании.");
+  visualDrafts.set(visual.asset.id, visual);
+  showDialog(dialogHeading("Изображение готово", "Сохранено в «Моих изображениях». Публикация требует отдельного согласования.")
+    + postArt({business_id: businessId, image_asset_id: visual.asset.id}, "preview-art")
+    + '<p class="post-text">' + safe(visual.request) + '</p>'
+    + '<details><summary>Как AI понял идею</summary><p class="post-text">' + safe(visual.draft.image_brief) + '</p></details>'
+    + (visual.draft.warnings.length ? '<p class="notice">' + visual.draft.warnings.map(safe).join('<br>') + '</p>' : '')
+    + '<div class="dialog-actions">'
+    + button("Скачать изображение", "download-image", "secondary", "image", 'disabled data-requires-image')
+    + button("Создать пост с картинкой", "visual-post", "primary", "plus", 'data-id="' + safe(visual.asset.id) + '"')
+    + button("Другая идея", "new-visual", "secondary", "spark") + button("Закрыть", "close", "secondary") + '</div>');
+}
 function editableDate(value) {
   if (!value) return "";
   const when = new Date(value);
@@ -806,6 +833,48 @@ document.addEventListener("click", async (event) => {
     } else if (action === "confirm-reset-demo" && demo) {
       if (!preview.clear()) throw new Error("Браузер не разрешает очистить локальное хранилище.");
       location.reload();
+    } else if (action === "new-visual") {
+      if (demo) throw new Error("Настоящая генерация изображений доступна в рабочей студии из меню бота.");
+      if ([state.capabilities?.text_generation, state.capabilities?.image_generation].includes("unconfigured")) {
+        throw new Error("Для этой функции подключите текстовый AI и генератор изображений.");
+      }
+      openForm("visual", "Создать изображение", "Опишите идею своими словами. AI сам подготовит промпт на английском; изображение создаст "
+        + (state.capabilities?.image_local ? "локальный FLUX на вашем ПК." : "подключённая модель изображений.")
+        + " Канал для этого не нужен.",
+        formField("Что должно быть на картинке?", "request", "textarea", 'maxlength="4000" placeholder="Например: современный дом со стеклянным фасадом в сосновом лесу, мягкий утренний свет"')
+        + '<p class="manual-hint">Можно описать сцену или тему поста. Учитываются материалы и стиль выбранной компании. Разбор идеи выполняет текстовый AI.</p>',
+        "Сгенерировать изображение");
+    } else if (action === "visual-gallery") {
+      if (demo) throw new Error("Галерея сгенерированных изображений доступна в рабочей студии.");
+      const requestedBusiness = businessId;
+      const result = await api("/business/" + path(requestedBusiness) + "/visuals");
+      if (businessId !== requestedBusiness) return;
+      for (const visual of result.items) visualDrafts.set(visual.asset.id, visual);
+      showDialog(dialogHeading("Мои изображения", "Последние 30 изображений выбранной компании.")
+        + (result.items.length ? '<div class="visual-gallery">' + result.items.map(visual =>
+          '<button type="button" class="visual-tile" data-action="open-visual" data-id="' + safe(visual.asset.id) + '">'
+          + postArt({business_id: businessId, image_asset_id: visual.asset.id}) + '<span>' + safe(visual.request) + '</span></button>').join('') + '</div>'
+          : '<p class="dialog-desc">Изображений пока нет. Опишите первую идею — она сохранится здесь после генерации.</p>')
+        + '<div class="dialog-actions">' + button("Создать изображение", "new-visual", "primary", "image") + button("Закрыть", "close", "secondary") + '</div>');
+    } else if (action === "open-visual") {
+      const visual = visualDrafts.get(id);
+      if (!visual) throw new Error("Откройте галерею ещё раз.");
+      showVisual(visual);
+    } else if (action === "visual-post") {
+      const visual = visualDrafts.get(id);
+      if (!visual || visual.asset.business_id !== businessId) throw new Error("Откройте изображение заново.");
+      if (!state.business.profile_confirmed || !state.business.channel_id) {
+        dialog.close(); await navigate("business");
+        notify("Картинка сохранена. Для поста подтвердите профиль и подключите канал, затем выберите её в «Моих изображениях»."); return;
+      }
+      openForm("visual-post", "Пост с готовой картинкой", "Проверьте предложенный текст. Результат сохранится черновиком.",
+        postArt({business_id: businessId, image_asset_id: id}, "preview-art")
+        + '<label class="form-row"><span>Текст публикации</span><textarea name="text" required maxlength="900">' + safe(visual.draft.text)
+        + '</textarea></label><input type="hidden" name="asset_id" value="' + safe(id) + '">', "Сохранить черновик");
+    } else if (action === "generate-post-image") {
+      const form = control.closest('form[data-form="manual-post"]');
+      if (!form) return;
+      await generateImageForForm(form, form.dataset.id);
     } else if (action === "manual-profile") {
       const b = state.business, profile = b.profile || {};
       openForm("manual-profile", "Профиль без AI", "Заполните сведения о компании. После сохранения проверьте и подтвердите профиль.",
@@ -824,11 +893,13 @@ document.addEventListener("click", async (event) => {
       if (!state.business.profile_confirmed || !state.business.channel_id) {
         await navigate("business"); notify("Заполните и подтвердите профиль, затем подключите канал. Это можно сделать без AI."); return;
       }
-      openForm("manual-post", "Новый пост", "Добавьте свой текст и изображение. Пост сохранится черновиком; публикация требует отдельного согласования.",
+      openForm("manual-post", "Новый пост", "Напишите текст. Если своего изображения нет, AI создаст его по смыслу поста. Публикация требует отдельного согласования.",
         formField("Текст публикации", "text", "textarea", 'maxlength="900" placeholder="О чём расскажем аудитории?"')
         + '<span class="manual-text-count" aria-live="polite">0 / 900</span>'
-        + formField("Изображение PNG или JPEG", "image", "file", 'accept="image/png,image/jpeg"')
+        + button("Сгенерировать по тексту поста", "generate-post-image", "secondary", "spark")
+        + '<label class="form-row"><span>Или загрузите своё изображение — необязательно</span><input name="image" type="file" accept="image/png,image/jpeg"></label>'
         + '<div class="manual-image-preview" hidden></div><p class="manual-hint">' + imageUploadHint() + '</p>'
+        + '<p class="manual-hint" data-image-progress aria-live="polite">Если файл не выбран, при сохранении изображение сгенерируется автоматически.</p>'
         + '<label class="form-row"><span>Дата и время (необязательно)</span><input name="scheduled_at" type="datetime-local"></label>'
         + '<p class="manual-hint">Ввод в часовом поясе устройства. Календарь покажет время в ' + safe(state.business.timezone) + '.</p>', "Сохранить черновик");
     } else if (action === "refresh") {
@@ -879,7 +950,7 @@ document.addEventListener("click", async (event) => {
       if (!state.business.profile_confirmed || !state.business.channel_id) {
         await navigate("business"); notify("Подтвердите профиль и подключите канал, чтобы создать первый пост."); return;
       }
-      openForm("prepare", "Новый черновик", "Опишите тему, формат и количество постов.",
+      openForm("prepare", "Пост с текстом и изображением", "Опишите тему. AI подготовит текст и подберёт сцену, затем генератор создаст картинку. Оба материала появятся в черновике.",
         formField("Задание для AI", "request", "textarea", 'maxlength="4000" placeholder="Например: два поста о стекле в архитектуре"'),
         "Поставить в очередь");
     } else if (action === "new-business") {
@@ -957,7 +1028,19 @@ dialog.addEventListener("submit", async (event) => {
   let submittingBusiness = businessId;
   const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
-    if (action === "knowledge-search") {
+    if (action === "visual") {
+      const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
+      submit.textContent = "Создаём изображение…";
+      notify("AI подбирает сцену, затем создаётся изображение. Дождитесь результата — это может занять несколько минут.");
+      const result = await api("/business/" + path(id) + "/visuals", {request: values.request, request_id: requestId});
+      if (currentForm()) showVisual(result);
+      else notify("Изображение готово. Откройте «Мои изображения» нужной компании.");
+    } else if (action === "visual-post") {
+      const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
+      const post = await api("/business/" + path(id) + "/draft", {text: values.text, image_asset_id: values.asset_id, request_id: requestId});
+      if (currentForm()) showPost(post);
+      await refresh(); notify("Черновик сохранён. Проверьте и согласуйте публикацию отдельно.");
+    } else if (action === "knowledge-search") {
       const results = form.querySelector('[data-knowledge-results]');
       results.setAttribute("aria-busy", "true");
       results.textContent = "Ищем в документах…";
@@ -975,6 +1058,7 @@ dialog.addEventListener("submit", async (event) => {
       if (currentForm()) dialog.close(); await refresh(); notify("Профиль сохранён. Проверьте сведения и подтвердите его.");
     } else if (action === "manual-post") {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
+      if (!values.image?.size && !form.dataset.assetId) await generateImageForForm(form, id);
       const assetId = await uploadManualImage(values.image, id, form);
       const payload = {text: values.text, image_asset_id: assetId, request_id: requestId};
       if (values.scheduled_at) payload.scheduled_at = new Date(values.scheduled_at).toISOString();
@@ -1071,8 +1155,8 @@ root.addEventListener("submit", async (event) => {
 });
 async function uploadManualImage(file, business, form) {
   requireWrite();
-  await validateManualImage(file);
   if (form.dataset.assetId) return form.dataset.assetId;
+  await validateManualImage(file);
   let assetId;
   if (demo) {
     assetId = crypto.randomUUID(); preview.addAsset({id: assetId, business_id: business, data_url: await fileData(file)});
@@ -1084,6 +1168,42 @@ async function uploadManualImage(file, business, form) {
   }
   form.dataset.assetId = assetId;
   return assetId;
+}
+async function generateImageForForm(form, business) {
+  requireWrite();
+  const text = form.elements.text.value.trim();
+  if (!text) throw new Error("Сначала напишите текст поста — по нему AI подберёт изображение.");
+  if (demo) throw new Error("Для генерации по тексту откройте рабочую студию из меню бота.");
+  if (form.dataset.imageBusy) throw new Error("Дождитесь уже запущенной генерации.");
+  const saved = [...form.elements].map(field => [field, field.disabled]);
+  for (const [field] of saved) field.disabled = true;
+  form.dataset.imageBusy = "1";
+  const progress = form.querySelector('[data-image-progress]');
+  progress.textContent = "AI подбирает сцену по тексту, затем создаётся картинка. Дождитесь результата — это может занять несколько минут.";
+  if (form.dataset.imageRequestText !== text || !form.dataset.imageRequestId) {
+    form.dataset.imageRequestId = crypto.randomUUID(); form.dataset.imageRequestText = text;
+  }
+  try {
+    const result = await api("/business/" + path(business) + "/visuals", {
+      request: "Создай подходящую иллюстрацию к этому посту, без надписей на изображении:\n" + text,
+      caption: text,
+      request_id: form.dataset.imageRequestId,
+    });
+    if (!form.isConnected || business !== businessId) { notify("Картинка сохранена в «Моих изображениях»."); return; }
+    form.dataset.assetId = result.asset.id;
+    delete form.dataset.imageRequestId;
+    form.elements.image.value = "";
+    const target = form.querySelector('.manual-image-preview');
+    target.innerHTML = postArt({business_id: business, image_asset_id: result.asset.id}); target.hidden = false;
+    await loadImages(target);
+    progress.textContent = "Картинка готова и прикреплена к посту. Можно сохранить черновик или сгенерировать другую.";
+  } catch (error) {
+    progress.textContent = "Картинка не прикреплена. Проверьте «Мои изображения» перед повтором или загрузите свой файл.";
+    throw error;
+  } finally {
+    delete form.dataset.imageBusy;
+    for (const [field, disabled] of saved) field.disabled = disabled;
+  }
 }
 function fileData(file) {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result);

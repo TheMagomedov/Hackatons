@@ -127,7 +127,7 @@ test('home distinguishes AI from manual creation and explains the missing-channe
     data.sources=[{id:'source',name:'Описание',kind:'text'}];
   }});
   const main = app.nodes.get('#main');
-  assert.match(main.innerHTML,/data-action="new-post"[^>]*>.*?Сгенерировать с AI/);
+  assert.match(main.innerHTML,/data-action="new-post"[^>]*>.*?Создать пост с AI/);
   assert.match(main.innerHTML,/data-action="manual-post"[^>]*>.*?Создать вручную/);
   assert.match(main.innerHTML,/Следующий шаг: канал/);
   assert.match(main.innerHTML,/В AI-диалоге уже можно задавать вопросы/);
@@ -151,6 +151,14 @@ test('only synchronous AI POST routes receive 330 seconds; queued jobs and ordin
     await app.run('api(testUrl,{request_id:"test"})');
     assert.equal(app.requests.at(-1).options.timeoutMs,undefined,url);
   }
+});
+
+test('image creation allows time for both scene planning and local FLUX; gallery retains read deadline',async()=>{
+  const app=await application(owner);
+  await app.run('api("/business/one/visuals",{request:"Glass",request_id:"visual"})');
+  assert.equal(app.requests.at(-1).options.timeoutMs,660000);
+  await app.run('api("/business/one/visuals")');
+  assert.equal(app.requests.at(-1).options.timeoutMs,undefined);
 });
 
 test('a slow chat disables repeated submissions and a failure never retries the POST automatically',async()=>{

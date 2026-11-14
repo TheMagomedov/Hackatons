@@ -44,6 +44,7 @@ from app.shared.models import (
     Job,
     MetricSnapshot,
     Notification,
+    PlanItem,
     PostStatus,
     PostView,
     PublicationResult,
@@ -52,6 +53,7 @@ from app.shared.models import (
     SourceInput,
     TaskIntent,
     TextDraft,
+    VisualDraft,
 )
 from app.shared.ports import AIProvider, ImageProvider, Notifier, Publisher, ReportProvider
 from app.shared.time import as_utc, utc_now
@@ -349,14 +351,25 @@ class BackendService:
         from app.media.runtime import UnconfiguredImages
 
         def state(provider, unconfigured):
+            provider = unwrap(provider)
             if provider is None or isinstance(provider, unconfigured):
                 return "unconfigured"
             return "demo" if getattr(provider, "is_demo", False) else "configured_unverified"
+
+        def unwrap(provider):
+            for _ in range(4):
+                child = getattr(provider, "provider", getattr(provider, "_provider", provider))
+                if child is provider:
+                    break
+                provider = child
+            return provider
 
         return {
             "manual_profile": True, "manual_drafts": True,
             "text_generation": state(self.ai, UnconfiguredAI),
             "image_generation": state(self.images, UnconfiguredImages),
+            "image_local": bool(getattr(unwrap(self.images), "_local_flux", False)),
+            "image_model": str(getattr(unwrap(self.images), "_model", "")),
             "external_access_checked": False,
             "image_upload": {"formats": ["image/png", "image/jpeg"],
                              "max_bytes": min(self.settings.max_upload_bytes, 10_000_000),
@@ -889,6 +902,49 @@ class BackendService:
             manual_request_id=request_id, manual_payload_hash=digest, manual_actor_id=actor_id,
             notification=self._notification(business, "draft_ready", "Ручной пост сохранён и ожидает согласования."),
         )[0]
+
+    @actor_action
+    async def generate_visual(self, actor_id: int, business_id: str, request: str, request_id: str,
+                              *, caption: str | None = None) -> VisualDraft:
+        business = self._business(actor_id, business_id)
+        self._plain_text(request, 4000, "Опишите изображение: от 1 до 4000 символов.")
+        guard_input(request)
+        if caption is not None:
+            self._validate_caption(caption)
+            guard_input(caption)
+        await asyncio.to_thread(self.safety.check_text, [request] if caption is None else [request, caption])
+        profile = business.profile or BusinessProfile(name=business.name, description="")
+
+        def check_context():
+            current = self._business(actor_id, business_id)
+            if current.profile_version != business.profile_version:
+                raise Conflict("Профиль изменился во время генерации. Повторите запрос.")
+
+        async def generate():
+            # The text model derives a scene from the complete user's idea and
+            # business style. FLUX receives that scene, never an invented fallback.
+            check_context()
+            item = PlanItem(topic=request[:300], goal="Создать изображение по идее пользователя и краткую подпись.",
+                            brief=request, image_brief=request)
+            draft = self._provider_result(TextDraft, await self._external(self.ai.write_post(profile, item)))
+            if caption is not None:
+                draft = draft.model_copy(update={"text": caption})
+            check_context()
+            image = await self._external(self.images.generate(profile, draft))
+            check_context()
+            asset = self._store_image(business_id, image)
+            return VisualDraft(asset=asset, draft=draft, request=request, profile_version=business.profile_version)
+
+        result = await self._ai_operation(
+            business, "visual", {"request": request, "caption": caption, "profile_version": business.profile_version},
+            VisualDraft, generate, request_id=request_id,
+        )
+        self._business(actor_id, business_id)
+        return result
+
+    def list_visuals(self, actor_id: int, business_id: str) -> list[VisualDraft]:
+        self._business(actor_id, business_id, write=False)
+        return [VisualDraft.model_validate(row) for row in self.repo.list_visual_results(business_id)]
 
     def _store_image(self, business_id: str, image) -> Asset:
         from app.shared.models import GeneratedImage

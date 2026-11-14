@@ -109,6 +109,13 @@ class Asset(Contract):
     is_demo: bool = False
 
 
+class VisualDraft(Contract):
+    asset: Asset
+    draft: TextDraft
+    request: str = Field(min_length=1, max_length=4000)
+    profile_version: int = Field(ge=0)
+
+
 class PostStatus(StrEnum):
     REVIEW = "review"
     EDITING = "editing"

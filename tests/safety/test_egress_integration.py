@@ -21,11 +21,13 @@ async def test_image_transport_masks_external_content_and_preserves_local_conten
     )
     contact = "person@example.org"
     await provider.generate(BusinessProfile(name="Glass", description="Стекло"),
-                            TextDraft(text=f"Стекло. Контакт: {contact}", image_brief="Светлый стеклянный фасад"))
+                            TextDraft(text="Стекло. Контакт: caption@example.org",
+                                      image_brief=f"Светлый стеклянный фасад, контакт {contact}"))
     request = transport.calls[0][0]
     prompt = json.loads(request.data)["prompt"]
     assert (contact in prompt) is local
     assert ("[EMAIL]" in prompt) is not local
+    assert "caption@example.org" not in prompt
     assert "fixture-header-only" not in prompt
     assert request.get_header("Authorization") == "Bearer fixture-header-only"
 

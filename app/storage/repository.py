@@ -1645,6 +1645,14 @@ class Repository(AccessRepository):
             )
             return [dict(row) for row in rows]
 
+    def list_visual_results(self, business_id: str) -> list[dict[str, Any]]:
+        with self._reader() as conn:
+            self._business(conn, business_id)
+            return [json.loads(row["result"]) for row in conn.execute(
+                "SELECT result FROM ai_operations WHERE business_id=? AND kind='visual' AND status='done' "
+                "ORDER BY created_at DESC,id DESC LIMIT 30", (business_id,),
+            )]
+
     def list_jobs(self, business_id: str) -> list[Job]:
         with self._reader() as conn:
             self._business(conn, business_id)

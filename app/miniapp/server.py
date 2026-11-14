@@ -79,6 +79,10 @@ class NewJob(Contract):
     request_id: str = Field(min_length=1, max_length=100)
 
 
+class VisualInput(NewJob):
+    caption: str | None = Field(default=None, min_length=1, max_length=900)
+
+
 class IdentityInput(Contract):
     request_id: str | None = Field(default=None, min_length=1, max_length=100)
 
@@ -499,6 +503,16 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             raise NotFound("Изображение недоступно.")
         return web.Response(body=data, content_type=item.mime_type)
 
+    async def visuals(request):
+        svc, actor = context(request)
+        business_id = request.match_info["id"]
+        if request.method == "GET":
+            return web.json_response({"items": [item.model_dump(mode="json")
+                                               for item in svc.list_visuals(actor, business_id)]})
+        body = VisualInput.model_validate(await json_body(request))
+        return show(await svc.generate_visual(actor, business_id, body.request, caption=body.caption,
+                                              request_id=f"miniapp-visual:{body.request_id}"))
+
     async def report(request):
         svc, actor = context(request)
         business_id = request.match_info["id"]
@@ -530,6 +544,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.post("/mini/api/business/{id}/source", add_source),
         web.post("/mini/api/business/{id}/pdf", upload_pdf),
         web.post("/mini/api/business/{id}/image", upload_image),
+        web.get("/mini/api/business/{id}/visuals", visuals),
+        web.post("/mini/api/business/{id}/visuals", visuals),
         web.post("/mini/api/business/{id}/profile/manual", manual_profile),
         web.post("/mini/api/business/{id}/draft", manual_draft),
         web.post("/mini/api/business/{id}/profile/{action:analyze|confirm}", profile),

@@ -181,7 +181,14 @@ class OpenAIImageProvider:
 
         guard_payload([profile.model_dump(mode="json"), text.model_dump(mode="json"), feedback])
         prompt = build_image_prompt(profile, text, feedback, self._limits)
-        if not self._local_flux:
+        if self._local_flux:
+            # FLUX is an image model, not a chat model: send the derived scene,
+            # rather than asking it to interpret the surrounding JSON document.
+            prompt = text.image_brief.strip()
+            if feedback:
+                prompt += "\nVisual changes: " + feedback
+            prompt += "\nClean professional composition, no lettering, no logos, no watermarks."
+        else:
             prompt = redact_text(prompt)
         body = json.dumps(
             {"model": self._model, "prompt": prompt, "n": 1, "output_format": "png"},

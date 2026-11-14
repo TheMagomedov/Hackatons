@@ -34,8 +34,9 @@ function client(fetch, online = true, timers = {setTimeout, clearTimeout}) {
   await timed.request('/api/state');
   await timed.request('/api/business',{method:'POST'});
   await timed.request('/api/chat',{method:'POST',timeoutMs:330000});
-  assert.deepEqual(deadlines,[20000,150000,330000],'Only explicit long-running calls extend the default budget');
-  await assert.rejects(timed.request('/api/chat',{method:'POST',timeoutMs:330001}),/Invalid request timeout/);
+  await timed.request('/api/visuals',{method:'POST',timeoutMs:660000});
+  assert.deepEqual(deadlines,[20000,150000,330000,660000],'Only explicit long-running calls extend the default budget');
+  await assert.rejects(timed.request('/api/visuals',{method:'POST',timeoutMs:660001}),/Invalid request timeout/);
 
   calls = 0;
   await assert.rejects(client((url, {signal}) => {

@@ -6,6 +6,7 @@ window.TirazhAccess = (() => {
     "close", "theme", "refresh", "open-post", "more", "filter", "clear-search",
     "content-layout", "calendar-day", "calendar-prev", "calendar-next", "calendar-today",
     "slide-prev", "slide-next", "slide-to", "show-workflow", "retry-image", "download-image",
+    "visual-gallery", "open-visual",
   ]);
   const reason = "Доступ для просмотра: изменения, обращения к AI и публикации доступны владельцу и операторам.";
   const previous = new WeakMap();
