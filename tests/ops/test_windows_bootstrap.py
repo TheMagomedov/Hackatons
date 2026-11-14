@@ -51,13 +51,14 @@ def test_windows_native_runtime_variables_survive_without_credentials(monkeypatc
     assert "TELEGRAM_BOT_TOKEN" not in environment
 
 
-def test_private_native_codex_path_changes_only_child_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("factory", ["app.ai.chatgpt:build_provider", "app.ai.agentrouter:build_provider"])
+def test_private_native_codex_path_changes_only_child_path(tmp_path, monkeypatch, factory):
     directory = tmp_path / "native tools"
     directory.mkdir()
     executable = directory / "codex.exe"
     executable.touch()
     monkeypatch.setenv("PATH", "original-path")
-    values = {"AI_PROVIDER_FACTORY": "app.ai.chatgpt:build_provider", "CODEX_CLI_PATH": str(executable)}
+    values = {"AI_PROVIDER_FACTORY": factory, "CODEX_CLI_PATH": str(executable)}
     result = bootstrap.application_environment({"app_env": values}, tmp_path)
     assert result["PATH"] == str(directory) + os.pathsep + "original-path"
     assert os.environ["PATH"] == "original-path" and "PATH" not in values

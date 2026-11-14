@@ -58,7 +58,7 @@ class ChatGPTClient:
         for process in tuple(self._processes):
             await self._stop(process)
 
-    async def _stop(self, process):
+    async def _stop(self, process, *, drain=False):
         """Stop the owned process tree, including children after their launcher exits."""
         if os.name == "nt":
             job = self._jobs.pop(process, None)
@@ -74,12 +74,22 @@ class ChatGPTClient:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        async def reap():
+            # A full pipe pauses its transport. After killing the owned tree,
+            # drain it without retaining bytes so wait() can observe EOF.
+            # Only _run's finally uses this, after its reader has stopped.
+            if drain and getattr(process, "stdout", None) is not None:
+                while await process.stdout.read(65536):
+                    pass
+            await process.wait()
+
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
+            await asyncio.wait_for(reap(), timeout=5)
         except TimeoutError:
             raise ProviderUnavailable("Не удалось завершить локальный процесс ChatGPT CLI.") from None
 
-    async def _run(self, arguments, *, cwd=None, prompt=None, capture=False):
+    async def _run(self, arguments, *, cwd=None, prompt=None, capture=False, env=None,
+                   max_output_bytes=4096):
         if self._closed:
             raise ProviderUnavailable("Локальный процесс ChatGPT CLI остановлен.")
         command = [self.executable, *arguments]
@@ -97,7 +107,7 @@ class ChatGPTClient:
             input_bytes = b"\0" + (input_bytes or b"")
         try:
             process = await asyncio.create_subprocess_exec(
-                *command, cwd=cwd, env=self.env, **options,
+                *command, cwd=cwd, env=self.env if env is None else env, **options,
                 stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.STDOUT if capture else asyncio.subprocess.DEVNULL,
@@ -111,13 +121,41 @@ class ChatGPTClient:
             if job is not None:
                 self._jobs[process] = job
                 job.assign(process.pid)
-            output, _ = await process.communicate(input_bytes)
+            if capture:
+                async def read_output():
+                    output = bytearray()
+                    while chunk := await process.stdout.read(65536):
+                        output.extend(chunk)
+                        if len(output) > max_output_bytes:
+                            raise ProviderUnavailable("Codex CLI превысил допустимый размер ответа.")
+                    return bytes(output)
+
+                async def feed_input():
+                    if input_bytes is not None:
+                        try:
+                            process.stdin.write(input_bytes)
+                            await process.stdin.drain()
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                        finally:
+                            process.stdin.close()
+
+                try:
+                    async with asyncio.TaskGroup() as group:
+                        reader = group.create_task(read_output())
+                        group.create_task(feed_input())
+                        group.create_task(process.wait())
+                except ExceptionGroup:
+                    raise ProviderUnavailable("Не удалось прочитать допустимый ответ Codex CLI.") from None
+                output = reader.result()
+            else:
+                output, _ = await process.communicate(input_bytes)
             if self._closed or process.returncode:
                 raise ProviderUnavailable("ChatGPT CLI не выполнил запрос. Проверьте вход, лимит и версию Codex.")
-            return (output or b"")[:4096].decode("utf-8", errors="replace")
+            return (output or b"").decode("utf-8", errors="replace")
         finally:
             try:
-                await self._stop(process)
+                await self._stop(process, drain=True)
             finally:
                 self._processes.discard(process)
 

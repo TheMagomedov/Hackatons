@@ -1,13 +1,15 @@
-"""The shipped AI, image and report adapters together, with HTTP simulated."""
+"""The shipped AI, image and report adapters, with HTTP/process transport simulated."""
 
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
 
+from app.ai.agentrouter import BASE_URL, AgentRouterClient, AgentRouterSettings
 from app.ai.client import SYSTEM, AISettings, ChatJSONClient
 from app.ai.local import LocalAISettings, OllamaJSONClient
 from app.ai.provider import ModelAI
@@ -18,7 +20,7 @@ from app.media import DemoImageProvider, MediaLimits
 from app.media.validation import validate_png
 from app.reports.provider import build_provider as build_report_provider
 from app.reports.service import build_report
-from app.shared.models import PostStatus, TextDraft
+from app.shared.models import BusinessProfile, ContentPlan, PostStatus, TextDraft
 from app.storage import FileStore, Repository
 from tests.ai.test_integration import ModelFixture
 
@@ -92,20 +94,67 @@ class ResponsesModelFixture(ModelFixture):
         })
 
 
-@pytest.mark.parametrize("client_kind", ["chat_completions", "responses", "ollama"])
+class AgentRouterModelFixture(ModelFixture):
+    """Simulate only CLI execution; real client parses events and validates output."""
+
+    def __init__(self):
+        super().__init__()
+        self.version_checks = 0
+        self.schemas = []
+        self.homes = []
+
+    async def run(self, arguments, *, cwd, capture, env, prompt=None, max_output_bytes=4096):
+        assert capture and list(Path(cwd).iterdir()) == []
+        home = Path(env["CODEX_HOME"])
+        assert home.parent == Path(cwd).parent and home.is_dir()
+        assert env["AGENTROUTER_API_KEY"] == "offline-test-key"
+        assert "offline-test-key" not in json.dumps(arguments)
+        if arguments == ["--version"]:
+            self.version_checks += 1
+            self.homes.append(home)
+            return "codex-cli 0.167.0-alpha.4.1"
+        assert arguments[0] == "exec" and max_output_bytes == 1_000_000
+        assert 'model="offline-test-model"' in arguments
+        shape = Path(arguments[arguments.index("--output-schema") + 1])
+        schema = json.loads(shape.read_text(encoding="utf-8"))
+        self.schemas.append(schema)
+        assert schema["additionalProperties"] is False
+        assert set(schema["required"]) == set(schema["properties"])
+        assert shape.with_name("instructions.txt").read_text(encoding="utf-8").startswith(SYSTEM)
+        assert prompt.startswith("Задание: ") and "offline-test-key" not in prompt
+        payload = prompt.rsplit("\n", 1)[1]
+        assert set(json.loads(payload)) == {"input"}
+        request = httpx.Request("POST", "https://fixture.invalid", json={"messages": [
+            {"role": "system", "content": SYSTEM}, {"role": "user", "content": payload},
+        ]})
+        content = super().__call__(request).json()["choices"][0]["message"]["content"]
+        contracts = {contract.__name__: contract for contract in (BusinessProfile, ContentPlan, TextDraft)}
+        # Include defaulted fields required by the strict CLI schema, while
+        # retaining the same synthetic facts used by the HTTP fixtures.
+        content = contracts[schema["title"]].model_validate_json(content).model_dump_json()
+        return "\n".join(json.dumps(event, ensure_ascii=False) for event in [
+            {"type": "thread.started"}, {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "reasoning", "text": "fixture"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": content}},
+            {"type": "turn.completed"},
+        ])
+
+
+@pytest.mark.parametrize("client_kind", ["chat_completions", "responses", "ollama", "agentrouter_cli"])
 async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort(
     tmp_path, monkeypatch, client_kind,
 ):
     root = tmp_path.resolve()  # Resolve macOS's /var -> /private/var storage alias.
     owner = 51
     now = datetime(2026, 11, 9, 9, tzinfo=UTC)
-    fixtures = {"ollama": OllamaModelFixture, "responses": ResponsesModelFixture}
-    model_http = fixtures.get(client_kind, ModelFixture)()
+    fixtures = {"ollama": OllamaModelFixture, "responses": ResponsesModelFixture,
+                "agentrouter_cli": AgentRouterModelFixture}
+    model_fixture = fixtures.get(client_kind, ModelFixture)()
     network_attempts = []
 
     def deny_network(*args, **kwargs):
         network_attempts.append(True)
-        raise AssertionError("Only the injected HTTP mock may serve model requests")
+        raise AssertionError("Only the injected transport fixture may serve model requests")
 
     # MockTransport dispatches directly, so these guards detect accidentally
     # constructing a real network transport without disabling the actual AI client.
@@ -114,11 +163,20 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
     monkeypatch.setattr("socket.create_connection", deny_network)
     monkeypatch.setattr("socket.socket.connect", deny_network)
     monkeypatch.setattr("socket.socket.connect_ex", deny_network)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", deny_network)
+    monkeypatch.setattr("asyncio.create_subprocess_shell", deny_network)
+    monkeypatch.setattr("subprocess.Popen", deny_network)
 
-    if client_kind == "ollama":
+    if client_kind == "agentrouter_cli":
+        client = AgentRouterClient("unused-offline-fixture", AgentRouterSettings(
+            api_key="offline-test-key", model="offline-test-model", base_url=BASE_URL,
+            wire_api="responses", reasoning_effort="low", max_retries=0,
+        ))
+        monkeypatch.setattr(client, "_run", model_fixture.run)
+    elif client_kind == "ollama":
         client = OllamaJSONClient(
             LocalAISettings(model="offline-test-model", max_retries=0),
-            transport=httpx.MockTransport(model_http),
+            transport=httpx.MockTransport(model_fixture),
         )
     else:
         wire_settings = ({"wire_api": "responses", "reasoning_effort": "low",
@@ -126,7 +184,7 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
                          if client_kind == "responses" else {})
         client = ChatJSONClient(
             AISettings(api_key="offline-test-key", model="offline-test-model", max_retries=0, **wire_settings),
-            transport=httpx.MockTransport(model_http),
+            transport=httpx.MockTransport(model_fixture),
         )
     ai = ModelAI(client)
     images = DemoImageProvider()
@@ -153,7 +211,7 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
         analyzed = await service.analyze_business(owner, business.id)
         assert not analyzed.profile_confirmed
         assert analyzed.profile.facts[0].source_ids == [source.id]
-        assert model_http.inputs[0]["sources"] == [{"id": source.id, "text": notes}]
+        assert model_fixture.inputs[0]["sources"] == [{"id": source.id, "text": notes}]
         service.confirm_profile(owner, business.id, analyzed.profile_version)
         business = await service.connect_channel(owner, business.id, "@demo_channel")
 
@@ -163,15 +221,22 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
             job = service.request_preparation(owner, business.id, "Подготовь один пост", "role4-ai-1")
             assert await service.prepare_next_job()
         assert service.get_job(owner, job.id).status == "done"
-        assert len(model_http.inputs) == 3  # Actual client: profile -> plan -> text.
+        assert len(model_fixture.inputs) == 3  # Actual client: profile -> plan -> text.
         if client_kind == "ollama":
-            assert [(request.method, request.url.path) for request in model_http.requests] == [
+            assert [(request.method, request.url.path) for request in model_fixture.requests] == [
                 ("GET", "/api/status"), ("POST", "/api/show"), ("POST", "/api/chat"),
             ] * 3
         elif client_kind == "responses":
-            assert len(model_http.requests) == 3
+            assert len(model_fixture.requests) == 3
             assert [json.loads(json.loads(request.content)["input"][0]["content"])["schema"]["title"]
-                    for request in model_http.requests] == ["BusinessProfile", "ContentPlan", "TextDraft"]
+                    for request in model_fixture.requests] == ["BusinessProfile", "ContentPlan", "TextDraft"]
+        elif client_kind == "agentrouter_cli":
+            assert model_fixture.version_checks == 3
+            assert [schema["title"] for schema in model_fixture.schemas] == [
+                "BusinessProfile", "ContentPlan", "TextDraft",
+            ]
+            assert len(set(model_fixture.homes)) == 3
+            assert all(not home.parent.exists() for home in model_fixture.homes)
         generate.assert_awaited_once()
         image_profile, image_text = generate.await_args.args
         assert image_profile == business.profile
@@ -180,7 +245,7 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
         assert image_text.image_brief == "Сырники рядом с чашкой кофе, без надписей"
         plan = service.get_plan(owner, job.id)
         assert len(plan.items) == 1
-        assert model_http.inputs[2]["item"]["image_brief"] == plan.items[0].image_brief
+        assert model_fixture.inputs[2]["item"]["image_brief"] == plan.items[0].image_brief
 
         posts = service.get_job_posts(owner, job.id)
         assert len(posts) == 1
@@ -226,4 +291,7 @@ async def test_real_ai_to_demo_image_and_report_preserves_source_and_demo_cohort
     finally:
         await ai.close()
         repository.close()
-    assert client._http.is_closed
+    if client_kind == "agentrouter_cli":
+        assert client._closed and not client._processes and not client._jobs
+    else:
+        assert client._http.is_closed

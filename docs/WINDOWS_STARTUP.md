@@ -1,6 +1,6 @@
 # Один запуск после перезагрузки Windows
 
-Для текущего режима [AgentRouter](AGENTROUTER.md) Ollama не требуется: bootstrap пропускает его при `AI_PROVIDER_FACTORY=app.ai.provider:build_provider`. Описанный ниже LOCAL_TEXT относится к альтернативному локальному режиму.
+Для текущего режима [AgentRouter](AGENTROUTER.md) Ollama не требуется: bootstrap пропускает его при `AI_PROVIDER_FACTORY=app.ai.agentrouter:build_provider` и проверяет путь к нативному Codex CLI. Описанный ниже LOCAL_TEXT относится к альтернативному локальному режиму.
 
 
 `scripts/start-demo.cmd` запускает уже установленную локальную систему: проверяет локальный Ollama, ComfyUI, серверную защиту, переводчик и модератор; при необходимости запускает Ollama и штатный FLUX starter без браузера; затем проверяет или запускает packaged gateway и Windows-хост бота/Mini App.

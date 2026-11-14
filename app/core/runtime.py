@@ -57,6 +57,7 @@ class Runtime:
     service: BackendService
     resources: list
     bot: object | None = None
+    vk: object | None = None
 
     async def close(self):
         seen = set()
@@ -131,8 +132,9 @@ async def build_runtime(settings: Settings) -> Runtime:
                     clients.append(OllamaJSONClient(selected))
                 ai.client = InferenceRouter(clients, telemetry)
             elif isinstance(ai, ModelAI):
+                from app.ai.agentrouter import AgentRouterClient
                 from app.ai.client import ChatJSONClient
-                if isinstance(ai.client, ChatJSONClient):
+                if isinstance(ai.client, (ChatJSONClient, AgentRouterClient)):
                     # One explicitly selected external provider; never silently
                     # switch to another model, account or local fallback.
                     ai.client = InferenceRouter([ai.client], telemetry)
@@ -162,6 +164,12 @@ async def build_runtime(settings: Settings) -> Runtime:
                 )
             runtime.bot = bot
             runtime.service.notifier = bot
+        if settings.vk_group_id:
+            from app.vk.adapter import VKBotAdapter, VKNotifications
+            runtime.vk = VKBotAdapter(runtime.service)
+            resources.append(runtime.vk)
+            runtime.service.vk = runtime.vk
+            runtime.service.notifier = VKNotifications(runtime.service.notifier, runtime.vk)
         return runtime
     except BaseException:
         await runtime.close()
@@ -206,6 +214,8 @@ async def run_application(settings: Settings, *, once: bool = False) -> None:
                 tasks.append(asyncio.create_task(Scheduler(service).run(stop), name="scheduler"))
                 if runtime.bot:
                     tasks.append(asyncio.create_task(runtime.bot.run(stop), name="telegram-ui"))
+                if runtime.vk:
+                    tasks.append(asyncio.create_task(runtime.vk.run(stop), name="vk-ui"))
                 if settings.mini_app_url:
                     tasks.append(asyncio.create_task(run_mini_app(service, settings, stop), name="mini-app"))
                 done, _ = await asyncio.wait([*tasks, stopped], return_when=asyncio.FIRST_COMPLETED)

@@ -11,6 +11,7 @@ import socket
 from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock
 
 from aiohttp import web
 
@@ -77,7 +78,7 @@ def add_local_bridge(app, service, actor):
     app.router.add_get("/mini/test-telegram.js", telegram_script)
 
 
-async def main(*, role=None, port=0) -> None:
+async def main(*, role=None, port=0, vk=False) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -102,13 +103,27 @@ async def main(*, role=None, port=0) -> None:
         selected = ""
         if role:
             actor, selected = await seed_role_preview(runtime.service, role)
-            add_local_bridge(app, runtime.service, actor)
+            if not vk:
+                add_local_bridge(app, runtime.service, actor)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", port))
         port = sock.getsockname()[1]
         await web.SockSite(runner, sock).start()
+        if vk:
+            from app.vk.adapter import VKBotAdapter
+            from app.vk.store import VKStore
+            service = runtime.service
+            service.settings = service.settings.model_copy(update={
+                "mini_app_url": f"http://127.0.0.1:{port}/mini/", "vk_group_id": 123,
+            })
+            adapter = VKBotAdapter(service, client=AsyncMock(), store=VKStore(Path(destination) / "vk.sqlite3", 123))
+            service.vk = adapter
+            runtime.resources.append(adapter)
+            actor = actor if role else OWNER
+            adapter.store.claim_link(9001, adapter.issue_link(actor), service.require_access)
+            print("UI_VK_READY " + adapter.launch(actor, 9001), flush=True)
         print(f"UI_BACKEND_READY http://127.0.0.1:{port}/mini/", flush=True)
         if selected:
             print(f"UI_ROLE_PREVIEW {role}; selected workspace: {selected}", flush=True)
@@ -129,5 +144,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=["owner", "operator", "reviewer"])
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--vk", action="store_true", help="Use an isolated, synthetic VK login ticket")
     args = parser.parse_args()
-    asyncio.run(main(role=args.role, port=args.port))
+    asyncio.run(main(role=args.role, port=args.port, vk=args.vk))

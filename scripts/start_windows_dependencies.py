@@ -351,7 +351,7 @@ def child_environment(extra=None):
 
 def application_environment(config, root):
     values = dict(config["app_env"])
-    if values.get("AI_PROVIDER_FACTORY") == "app.ai.chatgpt:build_provider":
+    if values.get("AI_PROVIDER_FACTORY") in {"app.ai.chatgpt:build_provider", "app.ai.agentrouter:build_provider"}:
         supplied = values.get("CODEX_CLI_PATH")
         executable = (root / supplied).resolve() if supplied else None
         if executable is None:

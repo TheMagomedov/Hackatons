@@ -189,11 +189,12 @@ def _time_range(first: datetime, last: datetime) -> str:
 
 
 def render_report_text(report: Report) -> str:
-    """Render plain Telegram text; caller must set parse_mode=None.
+    """Render plain text for Telegram and VK; disable transport markup parsing.
 
     User post text, errors and IDs never enter the output. Source names are
     JSON quoted to escape controls. Refuse an oversized result without hiding
-    caveats. No transport calls or historical-state claims are made here.
+    caveats. The shared 4000 UTF-16-unit budget also fits VK's character limit.
+    No transport calls or historical-state claims are made here.
     """
     if not isinstance(report, Report):
         raise InvalidInput("Ожидался структурированный отчёт.")
@@ -248,6 +249,6 @@ def render_report_text(report: Report) -> str:
     if report.warnings:
         lines.extend(("", *report.warnings))
     result = "\n".join(lines)
-    if len(result.encode("utf-16-le")) // 2 > 4096:
-        raise InvalidInput("Отчёт превышает лимит одного сообщения Telegram.")
+    if len(result.encode("utf-16-le")) // 2 > 4000:
+        raise InvalidInput("Отчёт превышает лимит одного сообщения.")
     return result
