@@ -163,7 +163,10 @@ function api(url, method, body, dayKey) {
       }
       if (parts[2] === "revise-text" || parts[2] === "revise-image") {
         if (parts[2] === "revise-text") post.text += "\nДемо-правка: " + body.feedback;
-        else post.art = post.art === "pattern-1" ? "pattern-2" : "pattern-1";
+        else {
+          post.art = post.art === "pattern-1" ? "pattern-2" : "pattern-1";
+          delete post.image_asset_id;
+        }
         post.revision++; post.status = "review";
       }
       if (parts[2] === "refresh-context") {

@@ -370,7 +370,7 @@ function diagnosticsView() {
       return '<li id="' + safe(anchor) + '"><strong>' + safe(events[trace.event] || 'Событие AI')
         + ' · ' + safe(kinds[trace.kind] || trace.kind || 'Операция') + '</strong><span>'
         + safe(trace.model || 'Обработка задания') + ' · ' + safe(elapsed) + ' · ' + safe(date) + '</span>'
-        + '<small>Запись: <a href="#' + safe(anchor) + '">' + safe(trace.id || '—') + '</a></small></li>';
+        + '<small>Запись: <a data-trace href="#' + safe(anchor) + '">' + safe(trace.id || '—') + '</a></small></li>';
     }).join('') + '</ol>' : '<p class="dialog-desc">Записей пока нет. Они появятся после следующего обращения к AI.</p>')
     + '</details>';
 }
@@ -571,6 +571,7 @@ function render() {
   else workspace.value = b.id;
   updateNavigation();
   root.setAttribute("aria-busy", "false");
+  delete root.dataset.loadingBusiness;
   root.dataset.business = b?.id || "";
   delete root.dataset.requestedScreen;
   const nextScreen = b ? view : "empty";
@@ -636,7 +637,10 @@ async function refresh({transition = false} = {}) {
   const epoch = ++stateRequest;
   // Invalidate page responses immediately, including while the new state is in flight.
   ++pageRequest;
-  if (transition) showPageState();
+  const changingBusiness = Boolean(businessId && (businessId !== state.business?.id || root.dataset.loadingBusiness));
+  const showTransition = transition || changingBusiness;
+  if (changingBusiness) root.dataset.loadingBusiness = businessId;
+  if (showTransition) showPageState();
   try {
     const result = await api("/state" + (businessId ? "?business=" + path(businessId) : ""));
     if (epoch !== stateRequest) return false;
@@ -647,7 +651,11 @@ async function refresh({transition = false} = {}) {
     businessId = state.business?.id || "";
     persistDemo();
     return await loadPage();
-  } catch (error) { if (epoch !== stateRequest) return false; if (transition) showPageState(error); throw error; }
+  } catch (error) {
+    if (epoch !== stateRequest) return false;
+    if (showTransition) showPageState(error);
+    throw error;
+  }
 }
 async function navigate(next, filter = "") {
   if (!views.has(next)) return;
@@ -752,9 +760,19 @@ async function watchJob(job, business) {
   notify("Задание в работе. Бот сообщит о результате.");
 }
 document.addEventListener("click", async (event) => {
-  const control = event.target.closest("[data-view], [data-action]");
+  const control = event.target.closest("[data-view], [data-action], [data-trace]");
   if (!control || control.disabled) return;
   event.preventDefault();
+  if (control.dataset.trace !== undefined) {
+    // Keep signed Telegram launch parameters available to a late SDK and reload.
+    const entry = control.closest("li[id]");
+    if (entry) {
+      entry.setAttribute("tabindex", "-1");
+      entry.focus({preventScroll: true});
+      entry.scrollIntoView({block: "nearest"});
+    }
+    return;
+  }
   if (control.dataset.view) {
     try { await navigate(control.dataset.view); } catch (error) { announceError(error); }
     return;

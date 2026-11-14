@@ -509,9 +509,10 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         start = min(first, end - timedelta(seconds=1))
         data = svc.report_data(actor, business_id, start, end)
         dates = [(first + timedelta(days=index)).date() for index in range(7)]
-        created = Counter(p.created_at.astimezone(local.tzinfo).date() for p in data.posts if not p.is_demo)
+        created = Counter(p.created_at.astimezone(local.tzinfo).date() for p in data.posts
+                          if not p.is_demo and start <= p.created_at <= end)
         sent = Counter(p.published_at.astimezone(local.tzinfo).date() for p in data.posts
-                       if p.published_at and not p.is_demo)
+                       if p.published_at and not p.is_demo and start <= p.published_at <= end)
         detail = svc.build_report(actor, business_id, start, end) if svc.reporter else ""
         return web.json_response({
             "series": [{"label": d.strftime("%d.%m"), "created": created[d], "sent": sent[d]} for d in dates],

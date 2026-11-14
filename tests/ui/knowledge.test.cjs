@@ -102,5 +102,28 @@ test('collapsed diagnostics show metadata only, including cache/failure/time and
   assert.match(html,/Модель недоступна/);
   assert.match(html,/1.50 с/);
   assert.match(html,/href="#ai-trace-trace%22one"/);
+  assert.match(html,/<a data-trace href="#ai-trace-/);
   assert.match(html,/&lt;script&gt;model/);
+});
+
+test('trace links focus their record without replacing signed launch data or making requests',async()=>{
+  const launch='#'+new URLSearchParams({tgWebAppData:'signed-data',tgWebAppVersion:'8.0'});
+  for (const hash of [launch,'#work']) {
+    const app=await application({role:'reviewer',can_write:false},false,{sdk:false,hash:launch});
+    app.context.location.hash=hash;
+    const before=app.requests.length;
+    const calls=[];
+    const entry={setAttribute:(...args)=>calls.push(['attribute',...args]),
+      focus:options=>calls.push(['focus',options.preventScroll]),
+      scrollIntoView:options=>calls.push(['scroll',options.block])};
+    const link={dataset:{trace:''},closest:selector=>selector==='li[id]'?entry:null};
+    let prevented=false;
+    const event={target:{closest:selector=>selector.includes('[data-trace]')?link:null},
+      preventDefault(){prevented=true;}};
+    await app.listeners.get('document:click')(event);
+    assert.equal(prevented,true,'Stop the native fragment navigation for pointer and keyboard clicks');
+    assert.equal(app.context.location.hash,hash);
+    assert.deepEqual(calls,[['attribute','tabindex','-1'],['focus',true],['scroll','nearest']]);
+    assert.equal(app.requests.length,before,'Diagnostics navigation is read-only and local');
+  }
 });

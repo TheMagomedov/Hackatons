@@ -51,6 +51,20 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(report.activities[0].published_posts, 0)
         self.assertEqual(report.metrics, ())
         self.assertIn("Реакции и подписчики: нет данных", render_report_text(report))
+        self.assertIn("редактируются 0", render_report_text(report))
+
+    def test_editing_post_renders_current_state_without_inventing_period_events(self):
+        report_input = data([post(status=PostStatus.EDITING, published_at=None)])
+        report = build_report(report_input)
+        activity = report.activities[0]
+        self.assertEqual(dict(activity.current_states)[PostStatus.EDITING], 1)
+        self.assertEqual(activity.created_posts, 0)
+        self.assertEqual(activity.published_posts, 0)
+        text = build_provider(None).build(report_input)
+        self.assertIn("редактируются 1", text)
+        self.assertIn("Создано за период: 0", text)
+        self.assertIn("Опубликовано за период: 0", text)
+        self.assertIn("Число ошибок и изменений версий за период: нет данных", text)
 
     def test_inclusive_boundaries_and_old_creation_new_publication(self):
         rows = [

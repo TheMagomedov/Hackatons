@@ -1,5 +1,6 @@
 """Offline checks of real role 4 adapters at the BackendService boundary."""
 
+import asyncio
 import base64
 import json
 import tempfile
@@ -139,6 +140,58 @@ class Role4IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Демо-посты:", text)
         self.assertIn("ДЕМО: 42", text)
         self.assertIn("Просмотры, охват, пересылки, клики и продажи: нет данных.", text)
+
+    async def test_slow_media_revision_remains_unapproved_and_reportable(self):
+        approved = self.schedule_and_approve(await self.prepare())
+
+        class PausedImageProvider:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def generate(self, profile, text, feedback=None):
+                self.entered.set()
+                await self.release.wait()
+                return await self.delegate.generate(profile, text, feedback)
+
+        images = PausedImageProvider(self.images)
+        self.service.images = images
+        task = asyncio.create_task(self.service.revise_image(
+            OWNER, approved.id, approved.revision, "Больше свободного места",
+        ))
+        try:
+            await asyncio.wait_for(images.entered.wait(), timeout=1)
+            editing = self.service.get_post(OWNER, approved.id)
+            self.assertEqual(editing.status, PostStatus.EDITING)
+            self.assertGreater(editing.revision, approved.revision)
+            self.assertEqual(editing.image_asset_id, approved.image_asset_id)
+            self.assertIsNone(editing.approved_revision)
+            self.assertIsNone(editing.approved_by)
+            self.now += timedelta(minutes=2)
+            self.assertFalse(await self.service.publish_due_once())
+            self.assertEqual(self.publisher.sent, [])
+
+            start, end = self.now - timedelta(days=1), self.now
+            text = self.service.build_report(OWNER, self.business.id, start, end)
+            report = build_report(self.service.report_data(OWNER, self.business.id, start, end))
+            demo = next(activity for activity in report.activities if activity.is_demo)
+            self.assertEqual(dict(demo.current_states)[PostStatus.EDITING], 1)
+            self.assertIn("редактируются 1", text)
+        finally:
+            images.release.set()
+            revised = await asyncio.wait_for(task, timeout=1)
+
+        self.assertEqual(revised.status, PostStatus.REVIEW)
+        self.assertGreater(revised.revision, editing.revision)
+        self.assertEqual(self.service.get_post(OWNER, revised.id).revision, revised.revision)
+        self.assertNotEqual(revised.image_asset_id, approved.image_asset_id)
+        self.assertIsNone(revised.approved_revision)
+        self.assertTrue(self.service.read_asset(OWNER, revised.image_asset_id)[0].is_demo)
+        with self.assertRaises(Conflict):
+            self.service.approve_post(OWNER, revised.id, approved.revision)
+        self.assertFalse(await self.service.publish_due_once())
+        self.assertEqual(self.publisher.sent, [])
 
     async def test_live_image_factory_mocked_transport_returns_backend_usable_bytes(self):
         transport = InlineImageTransport()

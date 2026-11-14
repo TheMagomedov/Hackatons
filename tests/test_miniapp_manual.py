@@ -15,6 +15,7 @@ from app.config import Settings
 from app.core.service import BackendService
 from app.media.runtime import UnconfiguredImages
 from app.miniapp.server import create_app
+from app.reports.provider import PlainTextReportProvider
 from app.shared.errors import ProviderUnavailable
 from app.storage import FileStore, Repository
 from tests.core.test_service import FakeNotifier, FakePublisher
@@ -37,7 +38,8 @@ async def manual(tmp_path):
     now = [datetime(2026, 11, 13, 10, tzinfo=UTC)]
     publisher = FakePublisher()
     service = BackendService(repo, FileStore(tmp_path / "assets"), settings, UnconfiguredAI(),
-                             UnconfiguredImages(), publisher, FakeNotifier(), clock=lambda: now[0])
+                             UnconfiguredImages(("IMAGE_API_KEY", "IMAGE_MODEL")), publisher, FakeNotifier(),
+                             clock=lambda: now[0])
     try:
         async with TestClient(TestServer(create_app(service, token=TOKEN))) as client:
             client.session.headers.update({"X-Telegram-Init-Data": signed_data(now[0])})
@@ -264,3 +266,20 @@ async def test_demo_image_cannot_enter_live_manual_creation_or_replacement(manua
     })).status == 400
     current = manual.service.get_post(OWNER, post["id"])
     assert current.revision == post["revision"] and current.image_asset_id == asset["id"]
+
+
+async def test_manual_draft_is_counted_in_real_report_without_ai_or_publication(manual):
+    manual.service.reporter = PlainTextReportProvider()
+    await setup_profile(manual)
+    asset = await (await upload(manual)).json()
+    assert (await draft(manual, asset["id"])).status == 200
+    response = await manual.client.get(manual.prefix + "/report")
+    assert response.status == 200
+    report = await response.json()
+    assert sum(row["created"] for row in report["series"]) == 1
+    assert sum(row["sent"] for row in report["series"]) == 0
+    assert "Реальные посты:\nСоздано за период: 1\nОпубликовано за период: 0" in report["detail"]
+    assert "Демо-посты:" not in report["detail"]
+    assert "Реакции и подписчики: нет данных." in report["detail"]
+    assert manual.service.ai_usage(OWNER)["used_today"] == 0
+    assert manual.publisher.calls == []

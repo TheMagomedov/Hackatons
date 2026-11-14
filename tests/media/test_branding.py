@@ -161,7 +161,9 @@ class BrandingProviderTests(unittest.IsolatedAsyncioTestCase):
         settings = Settings(mode="live", owner_id=1, telegram_bot_token="unused-test-token",
                             ai_factory="test:ai", image_factory="app.media.runtime:build_provider")
         source = StaticProvider(None)
-        with patch.dict(os.environ, {"IMAGE_API_KEY": "unused-test-key"}), patch.object(
+        with patch.dict(os.environ, {
+            "IMAGE_API_KEY": "unused-test-key", "IMAGE_MODEL": "fixture-image-model",
+        }), patch.object(
             runtime, "configured_provider", return_value=source
         ):
             self.assertIsInstance(runtime.build_provider(settings), SalavatBrandingProvider)

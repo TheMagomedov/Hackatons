@@ -179,8 +179,9 @@ class OpenAIImageProvider:
         from app.safety.input_guard import guard_payload
         from app.safety.privacy import redact_text
 
-        guard_payload([profile.model_dump(mode="json"), text.model_dump(mode="json"), feedback])
+        # Validate shared inputs and limits before serializing them for the guard.
         prompt = build_image_prompt(profile, text, feedback, self._limits)
+        guard_payload([profile.model_dump(mode="json"), text.model_dump(mode="json"), feedback])
         if not self._local_flux:
             prompt = redact_text(prompt)
         body = json.dumps(

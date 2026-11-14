@@ -1,6 +1,7 @@
 """Telegram UI exercised through real Dispatcher and backend, without network calls."""
 
 import asyncio
+import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
@@ -294,9 +295,13 @@ async def test_complete_bot_workflow_sources_edit_pause_publish_and_report(harne
     assert len(metrics) == 1
     assert metrics[0].value == 2
     assert metrics[0].event_id == f"reactions:telegram:{h.bot.id}:update:{h.uid}"
+    previous_messages = len(h.messages)
     await h.send(button=f"report:{business.id}")
-    assert any("1" in message.text for message in h.messages[-3:])
-    assert "ДЕМО" in "\n".join(message.text for message in h.messages[-3:]).upper()
+    report = "\n".join(message.text for message in h.messages[previous_messages:])
+    assert "Отчёт" in report
+    assert "Демо-посты:\nСоздано за период: 1\nОпубликовано за период: 1" in report
+    assert "Реальные посты:\nСоздано за период: 0\nОпубликовано за период: 0" in report
+    assert f"Реакции, источник {json.dumps(metrics[0].source)}, ДЕМО: 2" in report
 
 
 async def test_queue_progress_cancel_usage_and_owner_access(harness):

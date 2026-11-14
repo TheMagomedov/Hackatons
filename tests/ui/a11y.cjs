@@ -49,6 +49,54 @@ async function paletteContrast(page) {
   });
   assert.deepEqual(ratios.filter(item => item.ratio < 4.5), [], 'Palette text meets 4.5:1 on its base surfaces');
 }
+async function chartContrast(page, context) {
+  const observed = await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    // Resolve actual computed CSS colors, including color-mix(), through the browser.
+    function rgba(color) {
+      ctx.clearRect(0,0,1,1); ctx.fillStyle = color; ctx.fillRect(0,0,1,1);
+      return [...ctx.getImageData(0,0,1,1).data];
+    }
+    function background(element) {
+      for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        const color = rgba(getComputedStyle(ancestor).backgroundColor);
+        if (color[3] === 255) return color;
+        if (color[3] !== 0) throw new Error('Chart background must be checked with alpha compositing');
+      }
+      throw new Error('Chart has no explicit opaque background');
+    }
+    function luminance(color) {
+      const channels = color.slice(0,3).map(value => value / 255)
+        .map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
+      return channels[0] * .2126 + channels[1] * .7152 + channels[2] * .0722;
+    }
+    const created = [...document.querySelectorAll('.chart .created')].find(bar => Number(bar.getAttribute('height')) > 0);
+    const sent = [...document.querySelectorAll('.chart .sent')].find(bar => Number(bar.getAttribute('height')) > 0);
+    const legends = [...document.querySelectorAll('.chart .legend i')];
+    const elements = [created,sent,...legends];
+    const colors = [getComputedStyle(created).fill,getComputedStyle(sent).stroke,
+      getComputedStyle(legends[0]).backgroundColor,getComputedStyle(legends[1]).borderTopColor].map(rgba);
+    return {
+      marks:elements.map((element,index) => {
+        const backdrop = background(element), a = luminance(colors[index]), b = luminance(backdrop);
+        return {name:['created fill','sent stroke','created legend','sent legend border'][index],
+          color:colors[index],background:backdrop,ratio:(Math.max(a,b)+.05)/(Math.min(a,b)+.05)};
+      }),
+      sentFill:rgba(getComputedStyle(sent).fill)[3],
+      sentLegendFill:rgba(getComputedStyle(legends[1]).backgroundColor)[3],
+      strokeWidth:parseFloat(getComputedStyle(sent).strokeWidth),
+      borderWidth:parseFloat(getComputedStyle(legends[1]).borderTopWidth),
+    };
+  });
+  assert.ok(observed.marks.every(mark => mark.color[3] === 255), `${context}: chart marks are opaque`);
+  assert.deepEqual(observed.marks.filter(mark => mark.ratio < 3), [], `${context}: chart graphics meet 3:1 against their rendered background`);
+  assert.deepEqual(observed.marks[0].color,observed.marks[2].color,`${context}: created legend matches the bars`);
+  assert.deepEqual(observed.marks[1].color,observed.marks[3].color,`${context}: sent legend matches the outlines`);
+  assert.equal(observed.sentFill,0,`${context}: sent bars remain outlined`);
+  assert.equal(observed.sentLegendFill,0,`${context}: sent legend remains outlined`);
+  assert.ok(observed.strokeWidth >= 2 && observed.borderWidth >= 2,`${context}: outlines remain visible`);
+}
 async function brandPresentation(page, theme, width) {
   await page.evaluate(() => document.fonts.ready);
   const observed = await page.evaluate(() => {
@@ -158,6 +206,7 @@ async function keyboardReachability(page, context) {
           await navigate(page,view);
           await noOverflow(page,`${theme}/${width}/${view}`);
           await targetSizes(page,`${theme}/${width}/${view}`);
+          if (view === 'reports') await chartContrast(page,`${theme}/${width}`);
           await snapshot(page,`${theme}-${width}-${view}`);
           inspected++;
         }

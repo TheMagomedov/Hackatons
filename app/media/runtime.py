@@ -13,23 +13,36 @@ from .provider import build_provider as configured_provider
 
 
 class UnconfiguredImages:
+    """Keep menus available while reporting only missing configuration names."""
+
+    def __init__(self, missing: tuple[str, ...]):
+        self._message = "Укажите " + ", ".join(missing) + " в локальной конфигурации."
+
     async def generate(
         self, profile: BusinessProfile, text: TextDraft, feedback: str | None = None
     ) -> GeneratedImage:
-        raise ProviderUnavailable("Укажите IMAGE_API_KEY в локальной конфигурации.")
+        raise ProviderUnavailable(self._message)
 
 
 def build_provider(settings: Settings) -> ImageProvider:
-    key = os.getenv("IMAGE_API_KEY", "").strip()
+    """Preserve explicit model choice; defer missing live settings until use."""
+    if settings.mode == "demo":
+        return configured_provider(settings)
+    key = os.getenv("IMAGE_API_KEY", "")
+    model = os.getenv("IMAGE_MODEL", "")
     local_flux = os.getenv("IMAGE_LOCAL_FLUX", "0")
     if settings.mode == "live" and local_flux not in ("0", "1"):
         raise MediaConfigurationError("IMAGE_LOCAL_FLUX must be exactly 0 or 1.")
-    if settings.mode == "live" and not key:
-        return UnconfiguredImages()
+    missing = tuple(
+        name for name, value in (("IMAGE_API_KEY", key), ("IMAGE_MODEL", model))
+        if not value.strip()
+    )
+    if settings.mode == "live" and missing:
+        return UnconfiguredImages(missing)
     base = os.getenv("IMAGE_API_BASE", "https://api.openai.com/v1").rstrip("/")
     provider = configured_provider(
-        settings, api_key=key, model=os.getenv("IMAGE_MODEL") or "gpt-image-1",
+        settings, api_key=key, model=model,
         endpoint=f"{base}/images/generations",
         allow_local_flux=settings.mode == "live" and local_flux == "1",
     )
-    return provider if settings.mode == "demo" else SalavatBrandingProvider(provider)
+    return SalavatBrandingProvider(provider)

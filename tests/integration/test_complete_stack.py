@@ -84,6 +84,7 @@ async def test_all_live_adapters_bot_to_publication_report_and_restart(tmp_path,
     monkeypatch.setenv("AI_API_KEY", "fixture-ai-key")
     monkeypatch.setenv("AI_MODEL", "fixture-text-model")
     monkeypatch.setenv("IMAGE_API_KEY", "fixture-image-key")
+    monkeypatch.setenv("IMAGE_MODEL", "fixture-image-model")
     monkeypatch.setenv("MODERATION_API_BASE", "https://moderator.example.test/v1")
     monkeypatch.setenv("MODERATION_API_KEY", "fixture-safety-key")
     monkeypatch.setattr(

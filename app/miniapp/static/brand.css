@@ -420,10 +420,14 @@ body[data-theme="light"] .metric-card :is(.metric-heading,.metric-link) {color:v
 .business-layout>.business-panel {border-top:4px solid var(--brand-coral)}
 .business-layout>div>.business-panel:first-child {border-top:4px solid var(--brand-cyan)}
 .business-layout>div>.business-panel:last-child {border-top:4px solid var(--brand-green)}
-.chart {border-top:4px solid var(--brand-cyan)}
-.chart .created,.chart .legend i {fill:var(--brand-cyan);background:var(--brand-cyan)}
-.chart .sent {fill:transparent;stroke:var(--brand-green);stroke-width:3}
-.chart .legend span+span i {background:transparent;border:2px solid var(--brand-green)}
+.chart {--chart-created:var(--brand-cyan);--chart-sent:var(--brand-green);border-top:4px solid var(--brand-cyan)}
+body:not([data-theme="light"]) .chart {
+  --chart-created:color-mix(in srgb,var(--brand-cyan) 75%,#FFFFFF);
+  --chart-sent:color-mix(in srgb,var(--brand-green) 75%,#FFFFFF);
+}
+.chart .created,.chart .legend i {fill:var(--chart-created);background:var(--chart-created)}
+.chart .sent {fill:transparent;stroke:var(--chart-sent);stroke-width:3}
+.chart .legend span+span i {background:transparent;border:2px solid var(--chart-sent)}
 .report-detail {border-left:4px solid var(--brand-coral)}
 .cal-dots .review,.cal-legend .review {background:var(--brand-peach);border:0}
 .cal-dots .approved,.cal-legend .approved {background:var(--brand-cyan)}
