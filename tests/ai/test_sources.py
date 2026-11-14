@@ -90,6 +90,38 @@ async def test_request_connects_to_checked_ip_with_original_host_and_tls_name():
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("url", ["https://example.com\n", " \t\r\nhttps://example.com\r\n "])
+async def test_pasted_and_previously_saved_urls_trim_outer_whitespace(url):
+    async def handler(request):
+        assert request.url.host == "93.184.216.34"
+        assert request.headers["host"] == "example.com"
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>Company</p>")
+
+    assert await fetch_public_page(
+        url, transport=httpx.MockTransport(handler), resolver=public_resolver,
+    ) == "Company"
+
+
+async def test_large_page_markup_with_small_business_text_uses_bounded_default():
+    body = b"<svg>" + b"x" * (1024 * 1024) + b"</svg><p>Company information</p>"
+
+    async def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=body)
+
+    assert await fetch_public_page(
+        "https://example.com", transport=httpx.MockTransport(handler), resolver=public_resolver,
+    ) == "Company information"
+
+    async def too_large(request):
+        return httpx.Response(200, headers={"content-type": "text/html",
+                                           "content-length": str(SourceLimits().max_html_bytes + 1)})
+
+    with pytest.raises(InvalidInput, match="размер"):
+        await fetch_public_page(
+            "https://example.com", transport=httpx.MockTransport(too_large), resolver=public_resolver,
+        )
+
+
 @pytest.mark.asyncio
 async def test_mixed_public_and_private_dns_answer_is_rejected():
     async def resolver(host, port):

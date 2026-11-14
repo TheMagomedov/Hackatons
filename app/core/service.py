@@ -429,8 +429,11 @@ class BackendService:
     @actor_action
     def add_url_source(self, actor_id: int, business_id: str, url: str) -> Source:
         self._business(actor_id, business_id)
+        url = url.strip()
         # This boundary does not fetch URLs. Role 1 must revalidate DNS + every redirect at fetch time.
         try:
+            if any(ord(char) < 32 or ord(char) == 127 for char in url):
+                raise ValueError
             parsed = urlsplit(url)
             hostname = (parsed.hostname or "").rstrip(".").lower()
             if (

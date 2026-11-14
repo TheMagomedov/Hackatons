@@ -22,7 +22,9 @@ from app.shared.models import SourceInput
 @dataclass(frozen=True)
 class SourceLimits:
     max_pdf_bytes: int = 8 * 1024 * 1024
-    max_html_bytes: int = 1024 * 1024
+    # Corporate pages often embed large SVG/style payloads; extracted text has
+    # its own smaller limit below, and streamed HTML remains strictly bounded.
+    max_html_bytes: int = 4 * 1024 * 1024
     max_text_chars: int = 20_000
     max_pdf_pages: int = 24
     timeout_seconds: float = 15
@@ -67,6 +69,9 @@ async def _resolve(host: str, port: int) -> list[str]:
 
 def _public_url(value: str) -> httpx.URL:
     try:
+        # Pasted URLs (including existing stored sources) may have surrounding
+        # whitespace. Embedded controls still fail before any network request.
+        value = value.strip()
         if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
             raise ValueError
         url = httpx.URL(value)

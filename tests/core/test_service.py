@@ -656,6 +656,15 @@ class BackendServiceTests(unittest.IsolatedAsyncioTestCase):
             self.service.edit_post(OWNER, post.id, post.revision, image_asset_id=image.id)
         self.assertEqual(self.repo.get_post(post.id).image_asset_id, post.image_asset_id)
 
+    async def test_url_source_trims_copy_paste_whitespace_before_saving(self):
+        source = self.service.add_url_source(OWNER, self.business.id, " \thttps://example.com\r\n")
+        assert source.url == source.name == "https://example.com"
+        saved = self.service.list_sources(OWNER, self.business.id)
+        assert next(item for item in saved if item.id == source.id).url == source.url
+        with self.assertRaises(InvalidInput):
+            self.service.add_url_source(OWNER, self.business.id, "https://example.com\n/private")
+        assert len(self.service.list_sources(OWNER, self.business.id)) == len(saved)
+
     async def test_unsupported_urls_are_rejected_without_creating_source(self):
         invalid = (
             "file:///etc/passwd",
