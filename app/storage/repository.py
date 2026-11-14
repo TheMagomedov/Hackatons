@@ -37,8 +37,9 @@ from app.shared.models import (
     TaskIntent,
 )
 from app.storage.access import AccessRepository
+from app.storage.api_keys import APIKeyRepository
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
@@ -60,7 +61,7 @@ def _new_id() -> str:
     return str(uuid4())
 
 
-class Repository(AccessRepository):
+class Repository(AccessRepository, APIKeyRepository):
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
         self._uri = self.db_path == ":memory:"
@@ -90,11 +91,17 @@ class Repository(AccessRepository):
         return conn
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(self, *, schema_change: bool = False) -> Iterator[sqlite3.Connection]:
         conn = self._connect()
         try:
+            if schema_change:
+                # Only this migration connection suspends FK enforcement. The
+                # entire rebuilt schema is checked before the atomic commit.
+                conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("BEGIN IMMEDIATE")
             yield conn
+            if schema_change and conn.execute("PRAGMA foreign_key_check").fetchone():
+                raise Conflict("Миграция нарушает связи данных")
             conn.commit()
         except sqlite3.IntegrityError as exc:
             conn.rollback()
@@ -122,7 +129,7 @@ class Repository(AccessRepository):
                 raise Conflict("Версия базы новее поддерживаемой приложением")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = FULL")
-        with self._transaction() as conn:
+        with self._transaction(schema_change=True) as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise Conflict("Версия базы новее поддерживаемой приложением")
@@ -142,6 +149,9 @@ class Repository(AccessRepository):
                 version = 5
             if version == 5:
                 self._migrate_v5_to_v6(conn)
+                version = 6
+            if version == 6:
+                self._migrate_v6_to_v7(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if version != 0:
@@ -175,7 +185,20 @@ class Repository(AccessRepository):
             self._migrate_v3_to_v4(conn)
             self._migrate_v4_to_v5(conn)
             self._migrate_v5_to_v6(conn)
+            self._migrate_v6_to_v7(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+        # SQLite's documented create/copy/drop/rename procedure preserves child
+        # rows and their references to posts (including immutable revisions).
+        conn.execute("CREATE TABLE posts_v7 (id TEXT PRIMARY KEY, business_id TEXT NOT NULL REFERENCES businesses(id), revision INTEGER NOT NULL CHECK(revision > 0), status TEXT NOT NULL, scheduled_at TEXT, channel_id TEXT NOT NULL, image_asset_id TEXT REFERENCES assets(id), data TEXT NOT NULL)")
+        conn.execute("INSERT INTO posts_v7 SELECT * FROM posts")
+        conn.execute("DROP TABLE posts")
+        conn.execute("ALTER TABLE posts_v7 RENAME TO posts")
+        conn.execute("CREATE INDEX posts_due ON posts(status, scheduled_at)")
+        conn.execute("CREATE INDEX posts_business ON posts(business_id)")
+        APIKeyRepository.initialize_api_keys(conn)
 
     @staticmethod
     def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -792,8 +815,9 @@ class Repository(AccessRepository):
         channel_id = data.get("channel_id")
         if not isinstance(channel_id, str) or channel_id != (business.channel_id or ''):
             raise InvalidInput("Публикация должна быть адресована текущему каналу бизнеса")
-        asset = Repository._asset(conn, data.get("image_asset_id", ""), business.id)
-        if asset.mime_type not in {"image/png", "image/jpeg"}:
+        image_id = data.get("image_asset_id")
+        asset = Repository._asset(conn, image_id, business.id) if image_id is not None else None
+        if asset and asset.mime_type not in {"image/png", "image/jpeg"}:
             raise InvalidInput("Для публикации требуется PNG или JPEG")
         scheduled = data.get("scheduled_at")
         if scheduled is not None:
@@ -828,10 +852,10 @@ class Repository(AccessRepository):
             raise InvalidInput("Некорректные предупреждения публикации") from None
         return {
             "text": text,
-            "image_asset_id": asset.id,
+            "image_asset_id": asset.id if asset else None,
             "channel_id": channel_id,
             "scheduled_at": scheduled,
-            "is_demo": bool(data.get("is_demo", False) or asset.is_demo),
+            "is_demo": bool(data.get("is_demo", False) or (asset and asset.is_demo)),
             "profile_version": profile_version,
             "used_source_ids": list(dict.fromkeys(source_ids)),
             "warnings": list(warnings),
@@ -963,6 +987,13 @@ class Repository(AccessRepository):
     def get_post(self, post_id: str) -> PostView:
         with self._reader() as conn:
             return self._post(conn, post_id)
+
+    def post_revisions(self, post_id: str) -> list[PostView]:
+        with self._reader() as conn:
+            self._post(conn, post_id)
+            return [PostView.model_validate_json(row['data']) for row in conn.execute(
+                "SELECT data FROM post_revisions WHERE post_id=? ORDER BY revision DESC LIMIT 100", (post_id,)
+            )]
 
     def list_posts(self, business_id: str) -> list[PostView]:
         with self._reader() as conn:
@@ -1553,6 +1584,13 @@ class Repository(AccessRepository):
             ).fetchone()[0]
             if used >= daily_limit:
                 raise Conflict("Достигнут дневной лимит AI-операций владельца (сутки UTC)")
+            if business.ai_daily_limit is not None:
+                company_used = conn.execute(
+                    'SELECT COUNT(*) FROM ai_operations WHERE business_id=? AND created_at>=? AND created_at<?',
+                    (business_id, _stamp(start), _stamp(start+timedelta(days=1))),
+                ).fetchone()[0]
+                if company_used >= business.ai_daily_limit:
+                    raise Conflict('Достигнут дневной лимит AI-операций компании (сутки UTC).')
             running = conn.execute(
                 "SELECT COUNT(*) FROM ai_operations WHERE owner_id=? AND status='running'", (owner_id,)
             ).fetchone()[0]
@@ -1687,13 +1725,33 @@ class Repository(AccessRepository):
             )
             return [dict(row) for row in rows]
 
-    def list_visual_results(self, business_id: str) -> list[dict[str, Any]]:
+    def archive_asset(self, asset_id: str, archived: bool, actor_id: int, now: datetime) -> Asset:
+        with self._transaction() as conn:
+            asset = self._asset(conn, asset_id)
+            business = self._business(conn, asset.business_id)
+            if not self._may_operate(conn, business.owner_id, actor_id, business.id) or business.archived:
+                raise Forbidden('Нет доступа к галерее.')
+            if type(archived) is not bool or asset.mime_type not in {'image/png', 'image/jpeg'}:
+                raise InvalidInput('Выберите изображение для архива.')
+            updated = asset.model_copy(update={'archived': archived})
+            conn.execute('UPDATE assets SET data=? WHERE id=?', (_dump(updated), asset_id))
+            self._audit(conn, 'asset', asset_id, 'archived' if archived else 'restored', now, actor_id=actor_id)
+            return updated
+
+    def list_visual_results(self, business_id: str, *, archived: bool = False) -> list[dict[str, Any]]:
         with self._reader() as conn:
             self._business(conn, business_id)
-            return [json.loads(row["result"]) for row in conn.execute(
-                "SELECT result FROM ai_operations WHERE business_id=? AND kind='visual' AND status='done' "
-                "ORDER BY created_at DESC,id DESC LIMIT 30", (business_id,),
-            )]
+            results = []
+            for row in conn.execute(
+                "SELECT o.result,a.data FROM ai_operations o JOIN assets a ON a.id=json_extract(o.result,'$.asset.id') "
+                "WHERE o.business_id=? AND a.business_id=? AND o.kind='visual' AND o.status='done' "
+                "AND COALESCE(json_extract(a.data,'$.archived'),0)=? ORDER BY o.created_at DESC,o.id DESC LIMIT 30",
+                (business_id, business_id, int(archived)),
+            ):
+                item = json.loads(row['result'])
+                item['asset'] = json.loads(row['data'])
+                results.append(item)
+            return results
 
     def list_jobs(self, business_id: str) -> list[Job]:
         with self._reader() as conn:

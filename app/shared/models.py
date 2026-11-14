@@ -18,7 +18,7 @@ class Fact(Contract):
 class Source(Contract):
     id: str
     business_id: str
-    kind: Literal["text", "pdf", "url"]
+    kind: Literal["text", "pdf", "url", "docx"]
     name: str
     asset_id: str | None = None
     text: str | None = None
@@ -49,6 +49,7 @@ class Business(Contract):
     id: str
     owner_id: int
     archived: bool = False
+    ai_daily_limit: int | None = Field(default=None, ge=0, le=10000)
     name: str
     timezone: str
     channel_id: str | None = None
@@ -108,6 +109,7 @@ class Asset(Contract):
     sha256: str
     created_at: AwareDatetime
     is_demo: bool = False
+    archived: bool = False
 
 
 class VisualDraft(Contract):
@@ -134,7 +136,7 @@ class PostView(Contract):
     job_id: str | None = None
     revision: int
     text: str
-    image_asset_id: str
+    image_asset_id: str | None
     channel_id: str
     scheduled_at: AwareDatetime | None
     status: PostStatus

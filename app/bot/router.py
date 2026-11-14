@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 import json
@@ -423,14 +424,18 @@ def build_router(service: BackendService) -> Router:
         guard_public_output(post.text)
         for warning in post.warnings:
             guard_public_output(warning)
-        try:
-            asset, content = service.read_asset(actor, post.image_asset_id)
-        except AppError:
-            image_available = False
-            await reply(message, f"{post.text}\n\nФото недоступно. Для черновика можно запросить новое.")
-        else:
+        if post.image_asset_id is None:
             image_available = True
-            await message.answer_photo(BufferedInputFile(content, asset.filename), caption=post.text)
+            await reply(message, post.text)
+        else:
+            try:
+                asset, content = service.read_asset(actor, post.image_asset_id)
+            except AppError:
+                image_available = False
+                await reply(message, f"{post.text}\n\nФото недоступно. Для черновика можно запросить новое.")
+            else:
+                image_available = True
+                await message.answer_photo(BufferedInputFile(content, asset.filename), caption=post.text)
         suffix = f"{post.id}:{post.revision}"
         stale_profile = post.profile_version != business.profile_version or not business.profile_confirmed
         rows = []
@@ -797,8 +802,8 @@ def build_router(service: BackendService) -> Router:
         business = service.get_business(actor, context.object_id) if context else active(actor)
         file = message.document
         limit = min(8 * 1024 * 1024, service.settings.max_upload_bytes)
-        if not (file.file_name or "").lower().endswith(".pdf") or (file.file_size or 0) > limit:
-            raise InvalidInput("Пришлите PDF до 8 МиБ.")
+        if not (file.file_name or "").lower().endswith((".pdf", ".docx")) or (file.file_size or 0) > limit:
+            raise InvalidInput("Пришлите PDF или DOCX до 8 МиБ.")
         state().pending = None  # Consume before downloading; later callbacks can safely set a new prompt.
         state().context_epoch += 1
         epoch = state().context_epoch
@@ -806,7 +811,8 @@ def build_router(service: BackendService) -> Router:
         try:
             with LimitedFile(limit) as destination:
                 await message.bot.download(file, destination=destination, timeout=20)
-                service.add_pdf_source(actor, business.id, file.file_name, destination.getvalue())
+                add = service.add_docx_source if file.file_name.lower().endswith('.docx') else service.add_pdf_source
+                await asyncio.to_thread(add, actor, business.id, file.file_name, destination.getvalue())
         except AppError:
             restore_prompt(context, epoch, actor)
             raise

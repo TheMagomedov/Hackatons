@@ -209,7 +209,7 @@ class TelegramPublisher(_TelegramClient):
             raise Forbidden("The owner must be an administrator of this channel.")
         return ChannelInfo(id=canonical_id, title=title)
 
-    async def publish(self, post: PostView, image: bytes, mime_type: str) -> PublicationResult:
+    async def publish(self, post: PostView, image: bytes | None, mime_type: str | None) -> PublicationResult:
         from app.safety.privacy import guard_public_output
 
         guard_public_output(post.text)
@@ -217,9 +217,14 @@ class TelegramPublisher(_TelegramClient):
             raise DeliveryRejected("Demo posts cannot be published by the real Telegram adapter.")
         if not _plain_text_valid(post.text, 900, 1024):
             raise DeliveryRejected("The photo caption exceeds the supported limits or is invalid.")
-        if not isinstance(image, bytes) or not 0 < len(image) <= _MAX_IMAGE_BYTES:
+        text_only = post.image_asset_id is None
+        if text_only and (image is not None or mime_type is not None):
+            raise DeliveryRejected("Text-only publication must not contain an image.")
+        if not text_only and (not isinstance(image, bytes) or not 0 < len(image) <= _MAX_IMAGE_BYTES):
             raise DeliveryRejected("The publication image has an invalid size.")
-        if mime_type == "image/png" and image.startswith(b"\x89PNG\r\n\x1a\n"):
+        if text_only:
+            filename = None
+        elif mime_type == "image/png" and image.startswith(b"\x89PNG\r\n\x1a\n"):
             filename = "publication.png"
         elif mime_type == "image/jpeg" and image.startswith(b"\xff\xd8\xff"):
             filename = "publication.jpg"
@@ -229,12 +234,14 @@ class TelegramPublisher(_TelegramClient):
             channel_id = _channel_argument(post.channel_id, canonical_only=True)
         except InvalidInput:
             raise DeliveryRejected("A verified numeric channel identifier is required.") from None
-        result = await self._call(
-            "sendPhoto",
-            {"chat_id": channel_id, "caption": post.text},
-            files={"photo": (filename, image, mime_type)},
-            delivery=True,
-        )
+        if text_only:
+            result = await self._call("sendMessage", {"chat_id": channel_id, "text": post.text,
+                "link_preview_options": {"is_disabled": True}}, delivery=True)
+        else:
+            result = await self._call(
+                "sendPhoto", {"chat_id": channel_id, "caption": post.text},
+                files={"photo": (filename, image, mime_type)}, delivery=True,
+            )
         try:
             if not isinstance(result, dict) or not _positive_id(result.get("message_id")):
                 raise ValueError

@@ -7,6 +7,7 @@ import importlib.util
 import io
 import ipaddress
 import multiprocessing
+import os
 import re
 import socket
 from collections.abc import Awaitable, Callable
@@ -241,8 +242,14 @@ def extract_pdf_text(data: bytes, limits: SourceLimits = SourceLimits()) -> str:
             if count > limits.max_text_chars + 1:
                 raise InvalidInput("В PDF слишком много текста. Пришлите более короткий документ.")
             parts.append(part)
+        missing = [index for index, part in enumerate(parts) if not part]
+        if missing and os.environ.get('OCR_TESSDATA_DIR'):
+            from app.ai.ocr import ocr_pages
+
+            for index, text in ocr_pages(data, missing, limits.max_text_chars - count).items():
+                parts[index] = f'[Страница {index+1}, OCR — проверьте распознавание]\n{text}' if text else ''
         if not any(parts):
-            raise InvalidInput("В PDF нет текстового слоя. OCR не поддерживается; пришлите текстовый PDF.")
+            raise InvalidInput("В PDF нет текстового слоя или распознаваемого текста. Пришлите более чёткий скан.")
         return _checked_text("\n".join(parts), limits)
     except InvalidInput:
         raise
@@ -266,7 +273,7 @@ def _pdf_in_process(data: bytes, limits: SourceLimits) -> str:
     try:
         process.start()
         child.close()
-        if not parent.poll(limits.timeout_seconds):
+        if not parent.poll(max(limits.timeout_seconds, 60) if os.environ.get('OCR_TESSDATA_DIR') else limits.timeout_seconds):
             raise InvalidInput("Разбор PDF занял слишком много времени. Пришлите более простой документ.")
         success, value = parent.recv()
         if not success:
@@ -300,6 +307,10 @@ async def extract_source(
         text = await fetch_public_page(
             source.source.url or "", limits=limits, resolver=resolver, transport=transport,
         )
+    elif source.source.kind == "docx":
+        from app.ai.documents import extract_docx_text
+
+        text = await asyncio.to_thread(extract_docx_text, source.content or b'', max_chars=limits.max_text_chars)
     else:
         data = source.content
         if not data or not data.startswith(b"%PDF-") or len(data) > limits.max_pdf_bytes:

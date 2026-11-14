@@ -1,8 +1,7 @@
-"""Persistent local chunks and bounded, business-scoped BM25 retrieval.
+"""Business-scoped BM25 with optional offline multilingual embeddings.
 
-No embeddings, model calls or network requests occur during search. Ingestion
-uses the existing bounded source extractor; only explicitly supplied URL
-sources can cause a network read. Authentication belongs to the service layer.
+Documents and vectors remain local. Ingestion fetches only user-supplied public
+URLs. Authentication and current-source allowlists belong to the service layer.
 """
 
 from __future__ import annotations
@@ -117,12 +116,13 @@ class IndexStats:
 
 
 class KnowledgeIndex:
-    def __init__(self, path: str | Path, *, extractor: Extractor = extract_source):
+    def __init__(self, path: str | Path, *, extractor: Extractor = extract_source, embedder=None):
         self.path = Path(os.path.abspath(path))
         self._check_path()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._check_path()
         self.extractor = extractor
+        self.embedder = embedder
         self._lock = threading.RLock()
         self._index_lock = asyncio.Lock()
         self._db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
@@ -145,6 +145,11 @@ class KnowledgeIndex:
                     ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS rag_chunk_source ON rag_chunks(business_id, source_id);
+            CREATE TABLE IF NOT EXISTS rag_vectors (
+                business_id TEXT NOT NULL, chunk_id TEXT NOT NULL, model TEXT NOT NULL, vector TEXT NOT NULL,
+                PRIMARY KEY (business_id,chunk_id,model),
+                FOREIGN KEY (business_id,chunk_id) REFERENCES rag_chunks(business_id,chunk_id) ON DELETE CASCADE
+            );
         """)
 
     def _check_path(self) -> None:
@@ -179,7 +184,7 @@ class KnowledgeIndex:
 
     def fingerprint(self, business_id: str, *, allowed_source_ids: Collection[str] | None = None) -> str:
         rows = self._source_rows(business_id, allowed_source_ids)
-        material = [INDEX_VERSION, business_id, [(row["source_id"], row["input_hash"], row["content_hash"])
+        material = [INDEX_VERSION, self.embedder.model_id if self.embedder else 'lexical', business_id, [(row["source_id"], row["input_hash"], row["content_hash"])
                                                for row in rows]]
         return hashlib.sha256(json.dumps(material, ensure_ascii=False).encode()).hexdigest()
 
@@ -248,6 +253,17 @@ class KnowledgeIndex:
                         chunk_id = f"{source.id}:{content_hash[:16]}:{ordinal}"
                         self._db.execute("INSERT INTO rag_chunks VALUES (?,?,?,?,?)",
                                          (business_id, source.id, chunk_id, ordinal, chunk))
+            if self.embedder:
+                with self._lock:
+                    missing = self._db.execute('SELECT c.chunk_id,c.text FROM rag_chunks c LEFT JOIN rag_vectors v '
+                        'ON c.business_id=v.business_id AND c.chunk_id=v.chunk_id AND v.model=? '
+                        'WHERE c.business_id=? AND v.chunk_id IS NULL', (self.embedder.model_id, business_id)).fetchall()
+                if missing:
+                    vectors = await asyncio.to_thread(self.embedder.embed, [row['text'] for row in missing])
+                    with self._lock, self._db:
+                        for row, vector in zip(missing, vectors, strict=True):
+                            self._db.execute('INSERT INTO rag_vectors VALUES(?,?,?,?)',
+                                (business_id, row['chunk_id'], self.embedder.model_id, json.dumps(vector)))
             state = self.status(business_id)
             return IndexStats(state.sources, state.chunks, len(updates), state.fingerprint)
 
@@ -279,6 +295,16 @@ class KnowledgeIndex:
         average = sum(lengths) / len(lengths) or 1
         frequencies = {term: sum(term in document for document in documents) for term in query_terms}
         ranked = []
+        semantic = {}
+        if self.embedder:
+            query_vector = self.embedder.embed([query])[0]
+            with self._lock:
+                stored = {row['chunk_id']: json.loads(row['vector']) for row in self._db.execute(
+                    'SELECT chunk_id,vector FROM rag_vectors WHERE business_id=? AND model=?',
+                    (business_id, self.embedder.model_id))}
+            for row in rows:
+                if row['chunk_id'] in stored:
+                    semantic[row['chunk_id']] = sum(a*b for a,b in zip(query_vector, stored[row['chunk_id']], strict=True))
         for row, counts, length in zip(rows, documents, lengths, strict=True):
             score = 0.0
             for term in query_terms:
@@ -286,6 +312,10 @@ class KnowledgeIndex:
                 if frequency:
                     inverse = math.log(1 + (len(rows) - frequencies[term] + 0.5) / (frequencies[term] + 0.5))
                     score += inverse * frequency * 2.2 / (frequency + 1.2 * (0.25 + 0.75 * length / average))
+            similarity = semantic.get(row['chunk_id'], 0)
+            if self.embedder:
+                # A semantic score is a retrieval signal, never factual confidence.
+                score = 0.55 * score/(score+1) + 0.45 * max(0, similarity) if score > 0 or similarity >= 0.5 else 0
             if score > 0:
                 ranked.append((score, row))
         ranked.sort(key=lambda item: (-item[0], item[1]["source_id"], item[1]["ordinal"]))

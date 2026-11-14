@@ -91,7 +91,10 @@ async def build_runtime(settings: Settings) -> Runtime:
         # existing unbound database requires explicit operator adoption.
         repository.bind_runtime(settings.mode, settings.owner_id)
         files = FileStore(settings.data_dir / "assets", max_bytes=settings.max_upload_bytes)
-        knowledge = KnowledgeIndex(settings.data_dir / "knowledge.sqlite3")
+        from app.knowledge.embeddings import LocalEmbeddings
+
+        embeddings = LocalEmbeddings(settings.rag_embeddings_dir) if settings.rag_embeddings_dir else None
+        knowledge = KnowledgeIndex(settings.data_dir / "knowledge.sqlite3", embedder=embeddings)
         telemetry = InferenceStore(settings.data_dir / "ai-runtime.sqlite3",
                                    ttl_seconds=settings.ai_cache_ttl_seconds)
         resources.extend([knowledge, telemetry])

@@ -458,5 +458,8 @@ body[data-theme="light"] .metric-card :is(.metric-heading,.metric-link) {color:v
 .visual-tile span {display:block;padding:12px;overflow-wrap:anywhere}
 .visual-tile .post-art {aspect-ratio:1;min-height:0}
 .visual-tile img {width:100%;height:100%;object-fit:cover}
+.text-only-art {display:flex;align-items:center;gap:12px;padding:20px;color:var(--ink);background:var(--raised);border-left:4px solid #8ACCD9;border-radius:10px}
+.text-only-art .icon {width:24px;height:24px;flex:none}
+.post-card .text-only-art {max-width:160px;font-size:12px;padding:12px}
 [data-image-progress] {padding:12px;border-left:3px solid #0094A8}
 @media(max-width:550px) {.visual-studio {padding:20px}.visual-studio .press-actions {display:grid}.visual-gallery {gap:10px}}

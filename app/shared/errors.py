@@ -17,6 +17,10 @@ class Conflict(AppError):
     code = "conflict"
 
 
+class RateLimited(Conflict):
+    code = 'rate_limited'
+
+
 class InvalidInput(AppError):
     code = "invalid_input"
 

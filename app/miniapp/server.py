@@ -8,7 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiohttp import BodyPartReader, web
-from pydantic import AwareDatetime, Field, ValidationError
+from pydantic import AwareDatetime, Field, ValidationError, field_validator
 
 from app.config import Settings
 from app.core.service import BackendService
@@ -20,6 +20,7 @@ from app.shared.errors import (
     InvalidInput,
     NotFound,
     ProviderUnavailable,
+    RateLimited,
     SafetyBlocked,
     SafetyUnavailable,
 )
@@ -53,6 +54,7 @@ class RevisionInput(Contract):
 
 
 class PostEdit(RevisionInput):
+    remove_image: bool = Field(default=False, strict=True)
     channel_id: str | None = Field(default=None, min_length=1, max_length=128)
     scheduled_at: AwareDatetime | None = None
     text: str | None = Field(default=None, min_length=1, max_length=900)
@@ -69,7 +71,7 @@ class ManualProfileInput(RevisionInput):
 
 class ManualDraftInput(Contract):
     text: str = Field(min_length=1, max_length=900)
-    image_asset_id: str = Field(min_length=1, max_length=100)
+    image_asset_id: str | None = Field(default=None, min_length=1, max_length=100)
     request_id: str = Field(min_length=1, max_length=100)
     scheduled_at: AwareDatetime | None = None
     source_ids: list[str] = Field(default_factory=list, max_length=100)
@@ -83,6 +85,10 @@ class NewJob(Contract):
 class ArchiveInput(Contract):
     archived: bool
     confirmation: str = Field(min_length=1, max_length=200)
+
+
+class AssetArchiveInput(Contract):
+    archived: bool = Field(strict=True)
 
 
 class CompanyAccessInput(Contract):
@@ -100,6 +106,9 @@ class RetryJobInput(Contract):
 
 
 class FormDraftData(Contract):
+    fields: dict[str, str] = Field(default_factory=dict, max_length=12)
+    context_revision: int = Field(default=0, ge=0)
+    text_only: bool = Field(default=False, strict=True)
     text: str = Field(default='', max_length=900)
     request: str = Field(default='', max_length=4000)
     scheduled_at: str = Field(default='', max_length=32)
@@ -108,6 +117,15 @@ class FormDraftData(Contract):
     image_caption: str = Field(default='', max_length=900)
     image_request_id: str = Field(default='', max_length=100)
     image_request_text: str = Field(default='', max_length=900)
+
+    @field_validator('fields')
+    @classmethod
+    def bounded_fields(cls, fields):
+        allowed = {'description', 'products', 'audience', 'tone', 'constraints', 'request',
+                   'kind', 'value', 'enabled', 'interval_hours', 'first_run_at'}
+        if set(fields) - allowed or sum(len(v) for v in fields.values()) > 20_000:
+            raise ValueError('Недопустимый или слишком большой черновик формы.')
+        return fields
 
 
 class FormDraftInput(RevisionInput):
@@ -206,6 +224,7 @@ async def guard(request, handler):
         status = {
             Forbidden: 403, NotFound: 404, Conflict: 409, ProviderUnavailable: 502,
             SafetyBlocked: 422, SafetyUnavailable: 503,
+            RateLimited: 429,
         }.get(type(exc), 400)
         response = web.json_response({"error": str(exc)}, status=status)
     except web.HTTPException as exc:
@@ -403,8 +422,10 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         business_id = request.match_info["id"]
         svc.get_business(actor, business_id)
         filename, content = await file_body(request, svc.settings.max_upload_bytes)
+        if filename.lower().endswith('.docx'):
+            return show(await asyncio.to_thread(svc.add_docx_source, actor, business_id, filename, content))
         if not filename.lower().endswith(".pdf"):
-            raise InvalidInput("Выберите PDF-файл.")
+            raise InvalidInput("Выберите PDF или DOCX-файл.")
         return show(svc.add_pdf_source(actor, business_id, filename, content))
 
     async def upload_image(request):
@@ -557,6 +578,11 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         svc, actor = context(request)
         return show(svc.get_post(actor, request.match_info["id"]))
 
+    async def post_revisions(request):
+        svc, actor = context(request)
+        return web.json_response({'items': [item.model_dump(mode='json') for item in
+            svc.post_revisions(actor, request.match_info['id'])]})
+
     async def change_post(request):
         svc, actor = context(request)
         post_id, action = request.match_info["id"], request.match_info["action"]
@@ -566,6 +592,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             return show(await asyncio.to_thread(
                 svc.edit_post, actor, post_id, edit.revision, text=edit.text,
                 scheduled_at=edit.scheduled_at, image_asset_id=edit.image_asset_id, channel_id=edit.channel_id,
+                remove_image=edit.remove_image,
             ))
         body = RevisionInput.model_validate(payload)
         change = svc.approve_post if action == "approve" else svc.reject_post
@@ -590,12 +617,18 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             raise NotFound("Изображение недоступно.")
         return web.Response(body=data, content_type=item.mime_type)
 
+    async def archive_asset(request):
+        svc, actor = context(request)
+        body = AssetArchiveInput.model_validate(await json_body(request))
+        return show(svc.archive_asset(actor, request.match_info['id'], body.archived))
+
     async def visuals(request):
         svc, actor = context(request)
         business_id = request.match_info["id"]
         if request.method == "GET":
             return web.json_response({"items": [item.model_dump(mode="json")
-                                               for item in svc.list_visuals(actor, business_id)]})
+                                               for item in svc.list_visuals(actor, business_id,
+                                                   archived=request.query.get('archived') == 'true')]})
         body = VisualInput.model_validate(await json_body(request))
         return show(await svc.generate_visual(actor, business_id, body.request, caption=body.caption,
                                               request_id=f"miniapp-visual:{body.request_id}"))
@@ -634,8 +667,8 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.post('/mini/api/business/{id}/team', company_team),
         web.post('/mini/api/business/{id}/team/invite', invite_member),
         web.post('/mini/api/business/{id}/visual-jobs', visual_jobs),
-        web.get('/mini/api/business/{id}/form-draft/{kind:manual-post|visual}', form_draft),
-        web.post('/mini/api/business/{id}/form-draft/{kind:manual-post|visual}', form_draft),
+        web.get('/mini/api/business/{id}/form-draft/{kind:manual-post|visual|manual-profile|source|prepare|automation}', form_draft),
+        web.post('/mini/api/business/{id}/form-draft/{kind:manual-post|visual|manual-profile|source|prepare|automation}', form_draft),
         web.post("/mini/api/business/{id}/source", add_source),
         web.post("/mini/api/business/{id}/pdf", upload_pdf),
         web.post("/mini/api/business/{id}/image", upload_image),
@@ -658,12 +691,17 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
         web.post("/mini/api/job/{id}/cancel", cancel_job),
         web.post('/mini/api/job/{id}/retry-visual', retry_visual),
         web.get("/mini/api/post/{id}", post),
+        web.get("/mini/api/post/{id}/revisions", post_revisions),
         web.post("/mini/api/post/{id}/{action:edit|approve|reject}", change_post),
         web.post("/mini/api/post/{id}/revise-{kind:text|image}", revise_post),
         web.post("/mini/api/post/{id}/refresh-context", refresh_context),
         web.get("/mini/api/asset/{id}", asset),
+        web.post('/mini/api/asset/{id}/archive', archive_asset),
         web.get("/mini/api/business/{id}/report", report),
     ])
+    from app.miniapp.external import register
+
+    register(app, service, context, json_body)
     return app
 
 

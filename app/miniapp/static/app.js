@@ -159,6 +159,7 @@ async function api(url, body) {
   return response.json().catch(() => { throw new Error("Приложение вернуло неожиданный ответ. Возможно, ссылка на студию устарела."); });
 }
 function postArt(post, additionalClass = "") {
+  if (!post.image_asset_id) return '<div class="text-only-art">' + icon("document") + '<span>Текстовая публикация</span></div>';
   const localImage = demo && preview.asset(post.image_asset_id);
   if (localImage && localImage.business_id === post.business_id) return '<div class="post-art ' + additionalClass + '"><img src="' + safe(localImage.data_url) + '" alt="Изображение к посту"></div>';
   const art = ["pattern-1", "pattern-2", "pattern-3"].includes(post.art) ? post.art : "pattern-1";
@@ -540,12 +541,12 @@ function businessView() {
     + '<p>Поддерживаются текст, публичная страница сайта и PDF с текстовым слоем.</p><ul>'
     + state.sources.map((s) => '<li>' + safe(s.name) + '</li>').join("") + '</ul>'
     + button("Добавить источник", "add-source", "secondary", "plus")
-    + button("Загрузить PDF", "upload-pdf", "secondary", "posts")
+    + button("PDF или Word", "upload-pdf", "secondary", "posts")
     + button("Поиск по документам", "knowledge-search", "secondary", "posts")
     + '</section><section class="panel business-panel"><h2>Канал</h2><p>'
     + safe(b.channel_title || b.channel_id || "Канал пока не подключён.") + '</p>'
     + button(b.channel_id ? "Изменить канал" : "Подключить канал", "channel", "secondary", "telegram")
-    + '</section>' + (currentAccess().role === "owner" ? '<section class="panel business-panel"><h2>Команда и доступ</h2><p>Настройте права участников отдельно для этой компании.</p>' + button('Управлять доступом', 'company-team', 'secondary') + button('Пригласить участника', 'company-invite', 'secondary') + '</section><section class="panel business-panel"><h2>Архив компании</h2><p>Скрыть компанию из списка и остановить подготовку и публикации. Данные сохранятся.</p>' + button("Перенести в архив", "archive-business", "secondary") + '</section>' : '') + '</div></div>';
+    + '</section>' + (currentAccess().role === "owner" ? '<section class="panel business-panel"><h2>API для интеграций</h2><p>Ключ даёт доступ только к этой компании. Генерация создаёт черновики; согласование выполняется в студии.</p>' + button('Управлять API-ключами', 'api-keys', 'secondary') + button('Лимит AI компании', 'company-ai-limit', 'secondary') + '</section><section class="panel business-panel"><h2>Команда и доступ</h2><p>Настройте права участников отдельно для этой компании.</p>' + button('Управлять доступом', 'company-team', 'secondary') + button('Пригласить участника', 'company-invite', 'secondary') + '</section><section class="panel business-panel"><h2>Архив компании</h2><p>Скрыть компанию из списка и остановить подготовку и публикации. Данные сохранятся.</p>' + button("Перенести в архив", "archive-business", "secondary") + '</section>' : '') + '</div></div>';
 }
 function updateNavigation() {
   document.querySelectorAll("nav [data-view]").forEach((button) => {
@@ -688,7 +689,7 @@ function openForm(action, title, detail, fields, submit, id = businessId, revisi
     + '<button class="button primary" type="submit">' + safe(submit) + '</button>'
     + button("Отмена", "close", "secondary") + '</div></form>');
   const form = dialogBody.querySelector('form');
-  if (!demo && ['manual-post','visual'].includes(action)) attachFormSave(form);
+  if (!demo && ['manual-post','visual','manual-profile','source','prepare','automation'].includes(action)) attachFormSave(form);
 }
 function attachFormSave(form) {
   const status = document.createElement('p'); status.className = 'manual-hint'; status.dataset.draftStatus = '1';
@@ -699,7 +700,15 @@ function attachFormSave(form) {
   record.ready = api(record.url).then(saved => {
     record.revision = saved.revision; record.loaded = true;
     if (saved.data && !record.touched && form.isConnected) {
-      for (const name of ['text','request','scheduled_at']) if (form.elements[name]) form.elements[name].value = saved.data[name] || '';
+      if (saved.data.context_revision && saved.data.context_revision !== Number(form.dataset.revision || 0)) {
+        status.textContent='Сохранённая форма относится к прежней версии. Актуальные поля оставлены без изменений.'; return;
+      }
+      for(const [name,value] of Object.entries(saved.data.fields || {})) {
+        const field=form.elements[name]; if(!field || field.type==='file')continue;
+        if(field.type==='checkbox')field.checked=value==='on';else field.value=value;
+      }
+      if (form.elements.text_only) { form.elements.text_only.checked = saved.data.text_only === true; syncPostFormat(form); }
+      for (const name of ['text','request','scheduled_at']) if (form.elements[name] && saved.data[name]) form.elements[name].value = saved.data[name];
       for (const [property,key] of [['assetId','asset_id'],['requestId','request_id'],['imageCaption','image_caption'],['imageRequestId','image_request_id'],['imageRequestText','image_request_text']]) {
         if (saved.data[key]) form.dataset[property] = saved.data[key];
       }
@@ -720,7 +729,9 @@ function saveForm(form, {clear=false}={}) {
     await record.ready;
     if (!record.loaded) throw new Error('Автосохранение не подключено.');
     const data=clear ? null : {
-      text:form.elements.text?.value||'', request:form.elements.request?.value||'', scheduled_at:form.elements.scheduled_at?.value||'',
+      fields:Object.fromEntries([...form.elements].filter(field=>['description','products','audience','tone','constraints','request','kind','value','enabled','interval_hours','first_run_at'].includes(field.name)).map(field=>[field.name,field.type==='checkbox'?(field.checked?'on':''):field.value])),
+      context_revision:Number(form.dataset.revision||0),
+      text_only:form.elements.text_only?.checked===true, text:form.elements.text?.value||'', request:form.elements.request?.value||'', scheduled_at:form.elements.scheduled_at?.value||'',
       asset_id:form.dataset.assetId||'', request_id:form.dataset.requestId||'', image_caption:form.dataset.imageCaption||'',
       image_request_id:form.dataset.imageRequestId||'',image_request_text:form.dataset.imageRequestText||'',
     };
@@ -748,10 +759,11 @@ function showPost(post) {
     && !staleProfile && !staleChannel;
   let actions = "";
   if (editable.has(post.status)) {
-    if (canApprove) actions += button("Согласовать версию " + post.revision, "approve", "primary", "check", attrs + (demo ? "" : ' disabled data-requires-image'));
+    if (canApprove) actions += button("Согласовать версию " + post.revision, "approve", "primary", "check", attrs + (demo || !post.image_asset_id ? "" : ' disabled data-requires-image'));
     actions += button("Текст и время", "edit-post", "secondary", "calendar", attrs);
     actions += button("Правка текста AI", "revise-text", "secondary", "spark", attrs);
-    actions += button("Заменить изображение", "replace-image", "secondary", "image", attrs);
+    if (post.image_asset_id) actions += button("Убрать изображение", "remove-post-image", "secondary", "", attrs);
+    actions += button(post.image_asset_id ? "Заменить изображение" : "Добавить изображение", "replace-image", "secondary", "image", attrs);
     actions += button("Правка изображения AI", "revise-image", "secondary", "spark", attrs);
     if (staleProfile) actions += button("Проверил по новому профилю", "refresh-context", "secondary", "check", attrs);
     if (["review", "approved"].includes(post.status)) actions += button("Отклонить", "reject", "secondary danger", "", attrs);
@@ -775,7 +787,8 @@ function showPost(post) {
     + '<p class="dialog-desc">' + safe(post.last_error || text) + '</p>'
     + (post.status === 'delivery_unknown' ? '<div class="notice">Сначала проверьте канал и уточните доставку в Telegram-боте. Автоматического повтора нет.</div>' : '')
     + link + '<p class="form-error" id="form-error" role="alert"></p><div class="dialog-actions">'
-    + button("Скачать изображение", "download-image", "secondary", "image", demo ? "" : 'disabled data-requires-image')
+    + button("История и сравнение версий", "post-revisions", "secondary", "", attrs)
+    + (post.image_asset_id ? button("Скачать изображение", "download-image", "secondary", "image", demo ? "" : 'disabled data-requires-image') : "")
     + actions + '</div>');
 }
 
@@ -800,6 +813,7 @@ function showVisual(visual) {
     + '<div class="dialog-actions">'
     + button("Скачать изображение", "download-image", "secondary", "image", 'disabled data-requires-image')
     + button("Создать пост с картинкой", "visual-post", "primary", "plus", 'data-id="' + safe(visual.asset.id) + '"')
+    + button(visual.asset.archived ? 'Восстановить в галерею' : 'Перенести в архив', 'archive-visual', 'secondary', '', 'data-id="'+safe(visual.asset.id)+'"')
     + button("Другая идея", "new-visual", "secondary", "spark") + button("Закрыть", "close", "secondary") + '</div>');
 }
 function editableDate(value) {
@@ -900,6 +914,40 @@ document.addEventListener("click", async (event) => {
       const requestId=control.dataset.requestId || (control.dataset.requestId=crypto.randomUUID());
       await api('/job/' + path(id) + '/retry-visual',{request_id:requestId});
       await refresh(); notify('Создано новое задание. Этот явный повтор расходует лимит генерации.');
+    } else if (action === 'company-ai-limit') {
+      const usage=await api('/business/'+path(businessId)+'/ai-limit');
+      openForm('company-ai-limit','Лимит AI компании','Сегодня: '+usage.used_today+' операций. Сутки UTC. Это количество действий, не денежная стоимость. 0 останавливает новые AI-вызовы, пустое поле оставляет общий лимит.',
+        '<label class="form-row"><span>Операций в сутки</span><input type="number" name="limit" min="0" max="10000" value="'+(usage.daily_limit??'')+'"></label>','Сохранить лимит');
+    } else if (action === 'api-keys') {
+      const result=await api('/business/'+path(businessId)+'/api-keys');
+      showDialog(dialogHeading('API-ключи компании', 'Доступ только к выбранной компании. Ключи показываются один раз; их можно отозвать.')
+        + '<p class="post-text">Адрес API: '+safe(location.origin+'/mini/integration/v1')+'</p>'
+        + result.items.map(key=>'<article class="post-sources"><h3>'+safe(key.name)+'</h3><p>'+safe(key.scopes.join(', '))+' · До '+safe(formatDate(key.expires_at))+'</p>'
+          +(key.revoked_at?'<p>Отозван</p>':button('Отозвать','revoke-api-key','secondary','','data-id="'+safe(key.id)+'"'))+'</article>').join('')
+        + button('Создать API-ключ','new-api-key','primary'));
+    } else if (action === 'new-api-key') {
+      openForm('api-key','Новый API-ключ','Ключ не сможет согласовывать или отправлять публикации.',
+        formField('Название интеграции','name','text','maxlength="80"')
+        + '<label class="form-row"><span>Доступ</span><select name="scope"><option value="read">Только чтение</option><option value="generate">Чтение и генерация</option></select></label>'
+        + '<label class="form-row"><span>Срок в днях</span><input name="days" type="number" min="1" max="90" value="30" required></label>', 'Создать ключ');
+    } else if (action === 'revoke-api-key') {
+      await api('/business/'+path(businessId)+'/api-keys/'+path(id)+'/revoke',{});
+      control.closest('article').querySelector('p').textContent='Ключ отозван';control.remove();notify('Доступ этого ключа закрыт.');
+    } else if (action === 'post-revisions') {
+      const result = await api('/post/' + path(id) + '/revisions');
+      showDialog(dialogHeading('История публикации', 'Сравните версии текста, изображения, времени и канала. Любая правка требует нового согласования.')
+        + result.items.map((item,index) => {
+          const previous=result.items[index+1];
+          const changes=previous ? [['text','Текст'],['image_asset_id','Изображение'],['scheduled_at','Время'],['channel_id','Канал'],['profile_version','Профиль']].filter(([key])=>item[key]!==previous[key]).map(([,label])=>label).join(', ') : 'Первоначальная версия';
+          return '<details class="post-sources" '+(index===0?'open':'')+'><summary>Версия '+item.revision+' · '+safe(changes || 'Статус редактирования')+'</summary>'
+            + '<p class="date">'+safe(formatDate(item.updated_at))+' · '+safe(item.channel_id || 'Без канала')+' · '+safe(formatDate(item.scheduled_at))+'</p>'
+            + '<p class="post-text">'+safe(item.text)+'</p>'
+            + (previous && item.text!==previous.text ? '<details><summary>Предыдущий текст</summary><p class="post-text">'+safe(previous.text)+'</p></details>' : '')
+            + postArt(item)+'</details>';
+        }).join(''));
+    } else if (action === 'remove-post-image') {
+      const post=await api('/post/'+path(id)+'/edit',{revision:Number(revision),remove_image:true});
+      await refresh(); showPost(post); notify('Пост стал текстовым. Согласуйте новую версию.');
     } else if (action === 'assign-channel') {
       const post = await api('/post/' + path(id) + '/edit', {revision:Number(revision),channel_id:state.business.channel_id});
       await refresh(); if (post.business_id === businessId) showPost(post);
@@ -914,18 +962,23 @@ document.addEventListener("click", async (event) => {
         formField("Что должно быть на картинке?", "request", "textarea", 'maxlength="4000" placeholder="Например: современный дом со стеклянным фасадом в сосновом лесу, мягкий утренний свет"')
         + '<p class="manual-hint">Можно описать сцену или тему поста. Учитываются материалы и стиль выбранной компании. Разбор идеи выполняет текстовый AI.</p>',
         "Сгенерировать изображение");
-    } else if (action === "visual-gallery") {
+    } else if (action === "visual-gallery" || action === "visual-archive") {
       if (demo) throw new Error("Галерея сгенерированных изображений доступна в рабочей студии.");
       const requestedBusiness = businessId;
-      const result = await api("/business/" + path(requestedBusiness) + "/visuals");
+      const result = await api("/business/" + path(requestedBusiness) + "/visuals" + (action === "visual-archive" ? "?archived=true" : ""));
       if (businessId !== requestedBusiness) return;
       for (const visual of result.items) visualDrafts.set(visual.asset.id, visual);
-      showDialog(dialogHeading("Мои изображения", "Последние 30 изображений выбранной компании.")
+      showDialog(dialogHeading(action === "visual-archive" ? "Архив изображений" : "Мои изображения", "Последние 30 изображений выбранной компании. Архив не удаляет файлы из существующих постов.")
+        + button(action === "visual-archive" ? "Обычная галерея" : "Архив", action === "visual-archive" ? "visual-gallery" : "visual-archive", "secondary")
         + (result.items.length ? '<div class="visual-gallery">' + result.items.map(visual =>
           '<button type="button" class="visual-tile" data-action="open-visual" data-id="' + safe(visual.asset.id) + '">'
           + postArt({business_id: businessId, image_asset_id: visual.asset.id}) + '<span>' + safe(visual.request) + '</span></button>').join('') + '</div>'
           : '<p class="dialog-desc">Изображений пока нет. Опишите первую идею — она сохранится здесь после генерации.</p>')
         + '<div class="dialog-actions">' + button("Создать изображение", "new-visual", "primary", "image") + button("Закрыть", "close", "secondary") + '</div>');
+    } else if (action === 'archive-visual') {
+      const visual=visualDrafts.get(id); if(!visual)throw new Error('Откройте галерею заново.');
+      const asset=await api('/asset/'+path(id)+'/archive',{archived:!visual.asset.archived});
+      visual.asset=asset;showVisual(visual);notify(asset.archived?'Изображение перемещено в архив.':'Изображение восстановлено.');
     } else if (action === "open-visual") {
       const visual = visualDrafts.get(id);
       if (!visual) throw new Error("Откройте галерею ещё раз.");
@@ -966,10 +1019,11 @@ document.addEventListener("click", async (event) => {
       openForm("manual-post", "Новый пост", "Напишите текст. Если своего изображения нет, AI создаст его по смыслу поста. Публикация требует отдельного согласования.",
         formField("Текст публикации", "text", "textarea", 'maxlength="900" placeholder="О чём расскажем аудитории?"')
         + '<span class="manual-text-count" aria-live="polite">0 / 900</span>'
+        + '<label class="form-row"><span><input name="text_only" type="checkbox"> Только текст — без изображения и генерации</span></label><div data-image-fields>'
         + button("Сгенерировать по тексту поста", "generate-post-image", "secondary", "spark")
         + '<label class="form-row"><span>Или загрузите своё изображение — необязательно</span><input name="image" type="file" accept="image/png,image/jpeg"></label>'
         + '<div class="manual-image-preview" hidden></div><p class="manual-hint">' + imageUploadHint() + '</p>'
-        + '<p class="manual-hint" data-image-progress aria-live="polite">Если файл не выбран, при сохранении изображение сгенерируется автоматически.</p>'
+        + '<p class="manual-hint" data-image-progress aria-live="polite">Если файл не выбран, при сохранении изображение сгенерируется автоматически.</p></div>'
         + '<label class="form-row"><span>Дата и время (необязательно)</span><input name="scheduled_at" type="datetime-local"></label>'
         + '<p class="manual-hint">Ввод в часовом поясе устройства. Календарь покажет время в ' + safe(state.business.timezone) + '.</p>', "Сохранить черновик");
     } else if (action === "refresh") {
@@ -1002,8 +1056,8 @@ document.addEventListener("click", async (event) => {
     } else if (action === "cancel-job") {
       await api("/job/" + path(id) + "/cancel", {}); await refresh(); notify("Задание отменено.");
     } else if (action === "upload-pdf") {
-      openForm("pdf", "Загрузить PDF", "Используйте PDF с текстовым слоем, до 10 МБ. После загрузки соберите и подтвердите профиль.",
-        formField("Документ", "file", "file", 'accept="application/pdf,.pdf"'), "Загрузить");
+      openForm("pdf", "PDF или Word", "PDF с текстовым слоем или DOCX, до 8 МБ. После загрузки соберите и подтвердите профиль.",
+        formField("Документ", "file", "file", 'accept="application/pdf,.pdf,.docx"'), "Загрузить");
     } else if (action === "revise-text" || action === "revise-image") {
       openForm(action, action === "revise-text" ? "Доработать текст с AI" : "Доработать изображение",
         "Опишите изменения. Прежнее согласование сразу снимается; результат появится в новой версии.",
@@ -1121,7 +1175,15 @@ dialog.addEventListener("submit", async (event) => {
   let submittingBusiness = businessId;
   const currentForm = () => form.isConnected && dialog.open && businessId === submittingBusiness;
   try {
-    if (action === 'company-invite') {
+    if (action === 'company-ai-limit') {
+      await api('/business/'+path(id)+'/ai-limit',{limit:values.limit===''?null:Number(values.limit)});
+      if(currentForm())dialog.close();notify('Лимит компании сохранён.');
+    } else if (action === 'api-key') {
+      const key=await api('/business/'+path(id)+'/api-keys',{name:values.name,days:Number(values.days),scopes:values.scope==='generate'?['read','generate']:['read']});
+      if(currentForm())showDialog(dialogHeading('Сохраните API-ключ', 'Он показан только сейчас. Храните его в переменной окружения сервера, не в коде сайта или GitHub.')
+        + '<label class="form-row"><span>Ключ</span><input readonly type="text" value="'+safe(key.token)+'" autocomplete="off" spellcheck="false"></label>'
+        + '<p>Заголовок запроса: Authorization: Bearer &lt;ключ&gt;</p><p>Адрес: '+safe(location.origin+'/mini/integration/v1')+'</p>'+button('Закрыть','close','secondary'));
+    } else if (action === 'company-invite') {
       const invitation = await api('/business/' + path(id) + '/team/invite', {role:values.role});
       showDialog(dialogHeading('Приглашение готово', 'Передайте участнику эту команду. Её нужно отправить нашему Telegram-боту. Действует 24 часа, один вход.')
         + '<textarea readonly rows="4" aria-label="Команда приглашения">/start '+safe(invitation.start_parameter)+'</textarea>'
@@ -1169,8 +1231,9 @@ dialog.addEventListener("submit", async (event) => {
       if (currentForm()) dialog.close(); await refresh(); notify("Профиль сохранён. Проверьте сведения и подтвердите его.");
     } else if (action === "manual-post") {
       const requestId = form.dataset.requestId || (form.dataset.requestId = crypto.randomUUID());
-      if (!values.image?.size && !form.dataset.assetId) await generateImageForForm(form, id);
-      const assetId = await uploadManualImage(values.image, id, form);
+      const textOnly = values.text_only === "on";
+      if (!textOnly && !values.image?.size && !form.dataset.assetId) await generateImageForForm(form, id);
+      const assetId = textOnly ? null : await uploadManualImage(values.image, id, form);
       const pendingForm=formSaves.get(form);if(pendingForm)pendingForm.touched=true;
       await saveForm(form);
       const payload = {text: values.text, image_asset_id: assetId, request_id: requestId};
@@ -1193,7 +1256,7 @@ dialog.addEventListener("submit", async (event) => {
       if (currentForm()) showPost(post); await refresh(); notify("Новая версия готова. Проверьте и согласуйте её отдельно.");
     } else if (action === "pdf") {
       const file = values.file;
-      if (!file?.size || file.size > 10000000) throw new Error("Выберите PDF размером до 10 МБ.");
+      if (!file?.size || file.size > 8388608) throw new Error("Выберите PDF или DOCX размером до 8 МБ.");
       if (demo) {
         preview.addPdf(id, file.name);
         persistDemo();
@@ -1202,7 +1265,7 @@ dialog.addEventListener("submit", async (event) => {
         const response = await request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: session.headers(), body: data});
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось загрузить документ.");
       }
-      if (currentForm()) dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
+      if (currentForm()) dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "Документ добавлен. Обновите профиль бизнеса.");
     } else if (action === "business") {
       const business = form.dataset.createdBusiness ? {id: form.dataset.createdBusiness} : await api("/business", values);
       form.dataset.createdBusiness = business.id;
@@ -1231,6 +1294,7 @@ dialog.addEventListener("submit", async (event) => {
       await refresh();
       notify(action === "channel" ? "Канал подключён." : "Источник добавлен.");
     }
+    if (['manual-profile','source','prepare','automation'].includes(action)) await saveForm(form,{clear:true});
   } catch (error) { if (currentForm()) announceError(error); else notify(error.message); }
   finally { for (const [field, disabled] of fieldStates) field.disabled = disabled; submit.disabled = false; submit.textContent = submitLabel; accessRules.apply(dialogBody, currentAccess()); }
 });
@@ -1450,3 +1514,11 @@ void session.waitForInitData().then(() => {
   attachTelegramBridge();
   return refresh({transition: true});
 }).catch(() => {}); // Persistent recovery is rendered by refresh; mutations are never replayed.
+
+function syncPostFormat(form) {
+  const fields=form?.querySelector('[data-image-fields]');
+  if (fields) fields.hidden=form.elements.text_only?.checked===true;
+}
+dialogBody.addEventListener('change', event=>{
+  if(event.target.name==='text_only') syncPostFormat(event.target.closest('form'));
+});

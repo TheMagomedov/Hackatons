@@ -41,6 +41,7 @@ class Settings(BaseModel):
     max_source_bytes_total: int = Field(default=20_000_000, ge=1024, le=100_000_000)
     ai_cache_ttl_seconds: int = Field(default=900, ge=0, le=86400)
     local_text_fallback_model: str = Field(default="", max_length=128)
+    rag_embeddings_dir: str = Field(default='', max_length=1024)
 
     @field_validator("timezone")
     @classmethod
@@ -115,6 +116,7 @@ class Settings(BaseModel):
             "MAX_SOURCE_BYTES_TOTAL": "max_source_bytes_total",
             "AI_CACHE_TTL_SECONDS": "ai_cache_ttl_seconds",
             "LOCAL_TEXT_FALLBACK_MODEL": "local_text_fallback_model",
+            "RAG_EMBEDDINGS_DIR": "rag_embeddings_dir",
         }
         return cls(
             **{field: os.environ[key] for key, field in names.items() if os.environ.get(key, "").strip()}

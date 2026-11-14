@@ -420,6 +420,31 @@ async function stopFixture(child) {
   await page.locator('#dialog-body .preview-art img').waitFor();
   assert.equal(await page.getByRole('button',{name:'Скачать изображение',exact:true}).isEnabled(),true);
   await page.getByRole('button',{name:'Закрыть',exact:true}).first().click();
+  // Text-only authoring must not call FLUX, and can be approved without loading an image.
+  await page.locator('#main [data-action="manual-post"]').click();
+  await page.locator('textarea[name="text"]').fill('Текстовая публикация без фотографии');
+  await page.locator('input[name="text_only"]').check();
+  const future=new Date(Date.now()+3600000);future.setMinutes(future.getMinutes()-future.getTimezoneOffset());
+  await page.locator('input[name="scheduled_at"]').fill(future.toISOString().slice(0,16));
+  const textDraftResponse=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/draft'));
+  await page.getByRole('button',{name:'Сохранить черновик',exact:true}).click();
+  const textOnly=await (await textDraftResponse).json();
+  assert.equal(textOnly.image_asset_id,null);
+  assert.equal(visualRequests.length,2,'Text-only mode never invokes FLUX');
+  await page.locator('[data-action="approve"]').waitFor();
+  assert.equal(await page.locator('[data-action="approve"]').isEnabled(),true);
+  await page.getByRole('button',{name:'История и сравнение версий',exact:true}).click();
+  await page.getByText('Версия 1 · Первоначальная версия',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'Закрыть',exact:true}).first().click();
+  await page.locator('#main [data-action="visual-gallery"]').click();
+  await page.locator('.visual-tile').first().click();
+  await page.getByRole('button',{name:'Перенести в архив',exact:true}).click();
+  await page.getByRole('button',{name:'Восстановить в галерею',exact:true}).waitFor();
+  assert.equal((await backendAPI('get','/business/'+previousBusiness+'/visuals')).items.length,1);
+  await page.getByRole('button',{name:'Восстановить в галерею',exact:true}).click();
+  await page.getByRole('button',{name:'Перенести в архив',exact:true}).waitFor();
+  assert.equal((await backendAPI('get','/business/'+previousBusiness+'/visuals')).items.length,2);
+  await page.getByRole('button',{name:'Закрыть',exact:true}).first().click();
   // Archive hides an idle company without losing its images; restore stays paused.
   const archiveBusiness=await backendAPI('post','/business',{name:'Архив браузерной проверки'});
   await page.reload();
@@ -447,6 +472,17 @@ async function stopFixture(child) {
   await page.getByRole('button',{name:'Создать приглашение',exact:true}).click();
   await page.getByRole('textbox',{name:'Команда приглашения',exact:true}).waitFor();
   assert.match(await page.getByRole('textbox',{name:'Команда приглашения',exact:true}).inputValue(),/^\/start join_[A-Za-z0-9_-]{43}$/);
+  await page.getByRole('button',{name:'Закрыть',exact:true}).first().click();
+  await page.getByRole('button',{name:'Управлять API-ключами',exact:true}).click();
+  await page.getByRole('button',{name:'Создать API-ключ',exact:true}).click();
+  await page.getByRole('textbox',{name:'Название интеграции',exact:true}).fill('Browser acceptance');
+  await page.getByRole('button',{name:'Создать ключ',exact:true}).click();
+  await page.getByRole('textbox',{name:'Ключ',exact:true}).waitFor();
+  assert.match(await page.getByRole('textbox',{name:'Ключ',exact:true}).inputValue(),/^ss_[A-Za-z0-9_-]{43}$/);
+  await page.getByRole('button',{name:'Закрыть',exact:true}).first().click();
+  await page.getByRole('button',{name:'Управлять API-ключами',exact:true}).click();
+  await page.getByRole('button',{name:'Отозвать',exact:true}).click();
+  await page.getByText('Ключ отозван',{exact:true}).waitFor();
   assert.deepEqual(errors,[]);
   console.log('PASS live HTML + signed Telegram session + real API/backend: onboarding, preparation, manual workflow without AI, approval, image failure/decode/retry, startup recovery, navigation freshness and company response races. Demo providers only; no publishing worker.');
  } finally {if(browser) await browser.close(); await stopFixture(fixture.child);}

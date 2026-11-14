@@ -246,6 +246,10 @@ def restore_data(backup_dir: str | Path, destination: str | Path) -> dict:
         try:
             repo.initialize()
             now = datetime.now(UTC)
+            # A restored snapshot must not resurrect revoked integration keys.
+            with repo._transaction() as conn:
+                conn.execute('UPDATE api_keys SET revoked_at=? WHERE revoked_at IS NULL', (now.isoformat(),))
+                conn.execute('DELETE FROM api_key_rate')
             cancelled = 0
             approvals_cleared = 0
             for business in repo.list_businesses():

@@ -1,0 +1,8 @@
+# Optional local OCR and multilingual embeddings. Model files are installed by
+# scripts/setup_knowledge_models.py and never downloaded during a user request.
+tesserocr==2.13.0
+pypdfium2==5.15.2
+fastembed==0.9.1
+onnxruntime==1.32.0
+numpy==2.5.4
+tokenizers==0.23.3

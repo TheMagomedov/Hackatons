@@ -265,8 +265,11 @@ class BackendService:
         current = {source.id for source in self.repo.list_sources(business_id)}
         if current != {item.source.id for item in inputs}:
             raise Conflict("Источники изменились во время поиска. Повторите запрос.")
-        hits = self.knowledge.search(business_id, query, limit=limit, allowed_source_ids=current,
-                                     max_context_chars=5000)
+        hits = await asyncio.to_thread(self.knowledge.search, business_id, query, limit=limit,
+                                     allowed_source_ids=current, max_context_chars=5000)
+        self._business(actor_id, business_id, write=False)
+        if current != {source.id for source in self.repo.list_sources(business_id)}:
+            raise Conflict('Источники изменились во время поиска. Повторите запрос.')
         result = [hit.as_context() for hit in hits]
         guard_payload(result)
         return result
@@ -480,6 +483,21 @@ class BackendService:
             asset_id=asset.id,
             created_at=self.now(),
         )
+        self.repo.add_source(source)
+        return source
+
+    @actor_action
+    def add_docx_source(self, actor_id: int, business_id: str, filename: str, content: bytes) -> Source:
+        from app.ai.documents import DOCX_MIME, extract_docx_text
+
+        self._business(actor_id, business_id)
+        text = extract_docx_text(content)
+        guard_input(text, source='document')
+        self._check_source_limits(business_id, extra_bytes=len(content))
+        asset = self.files.write(business_id, filename, content, DOCX_MIME, self.now())
+        self.repo.add_asset(asset)
+        source = Source(id=str(uuid4()), business_id=business_id, kind='docx',
+                        name=filename[:200], asset_id=asset.id, created_at=self.now())
         self.repo.add_source(source)
         return source
 
@@ -911,13 +929,14 @@ class BackendService:
 
     @actor_action
     def create_manual_draft(
-        self, actor_id: int, business_id: str, text: str, image_asset_id: str, request_id: str,
+        self, actor_id: int, business_id: str, text: str, image_asset_id: str | None, request_id: str,
         *, scheduled_at: datetime | None = None, source_ids: list[str] | None = None,
     ) -> PostView:
         business = self._business(actor_id, business_id)
         text = self._validate_caption(text)
         self._plain_text(request_id, 100, "Укажите идентификатор черновика до 100 символов.")
-        self._plain_text(image_asset_id, 100, "Загрузите изображение для поста.")
+        if image_asset_id is not None:
+            self._plain_text(image_asset_id, 100, "Загрузите изображение для поста.")
         source_ids = [] if source_ids is None else source_ids
         if (not isinstance(source_ids, list) or len(source_ids) > 100
                 or any(not isinstance(item, str) or not item or len(item) > 200 for item in source_ids)):
@@ -932,16 +951,17 @@ class BackendService:
         self._ready(business, require_channel=False)
         if scheduled_at is not None and scheduled_at <= self.now():
             raise InvalidInput("Выберите время публикации в будущем.")
-        asset = self.repo.get_asset(image_asset_id)
-        if asset.business_id != business_id or asset.mime_type not in {"image/png", "image/jpeg"}:
+        asset = self.repo.get_asset(image_asset_id) if image_asset_id is not None else None
+        if asset and (asset.business_id != business_id or asset.mime_type not in {"image/png", "image/jpeg"}):
             raise InvalidInput("Изображение должно принадлежать этому бизнесу.")
-        if self.settings.mode == "live" and asset.is_demo:
+        if self.settings.mode == "live" and asset and asset.is_demo:
             raise InvalidInput("Демонстрационное изображение нельзя использовать в live-режиме.")
-        self.files.read(asset)
+        if asset:
+            self.files.read(asset)
         self.safety.check_text([text])
         self._business(actor_id, business_id)
         return self.repo.create_posts(
-            business_id, [{"text": text, "image_asset_id": asset.id, "channel_id": business.channel_id or '',
+            business_id, [{"text": text, "image_asset_id": asset.id if asset else None, "channel_id": business.channel_id or '',
                            "scheduled_at": scheduled_at, "profile_version": business.profile_version,
                            "is_demo": self.settings.mode == "demo", "used_source_ids": source_ids,
                            "warnings": ["Создано вручную: AI не проверял текст и изображение."]}], self.now(),
@@ -1011,9 +1031,15 @@ class BackendService:
         self._business(actor_id, business_id)
         return result
 
-    def list_visuals(self, actor_id: int, business_id: str) -> list[VisualDraft]:
+    def list_visuals(self, actor_id: int, business_id: str, *, archived: bool = False) -> list[VisualDraft]:
         self._business(actor_id, business_id, write=False)
-        return [VisualDraft.model_validate(row) for row in self.repo.list_visual_results(business_id)]
+        return [VisualDraft.model_validate(row) for row in self.repo.list_visual_results(business_id, archived=archived)]
+
+    @actor_action
+    def archive_asset(self, actor_id: int, asset_id: str, archived: bool) -> Asset:
+        asset = self.repo.get_asset(asset_id)
+        self._business(actor_id, asset.business_id)
+        return self.repo.archive_asset(asset_id, archived, actor_id, self.now())
 
     def _store_image(self, business_id: str, image) -> Asset:
         from app.shared.models import GeneratedImage
@@ -1055,10 +1081,15 @@ class BackendService:
         image_asset_id: str | None = None,
         scheduled_at: datetime | None = None,
         channel_id: str | None = None,
+        remove_image: bool = False,
     ) -> PostView:
         post = self._post(actor_id, post_id)
         business = self._business(actor_id, post.business_id)
         changes = {}
+        if type(remove_image) is not bool or (remove_image and image_asset_id is not None):
+            raise InvalidInput("Выберите удаление или замену изображения.")
+        if remove_image:
+            changes["image_asset_id"] = None
         if text is not None:
             self._ready(business, require_channel=False)
             changes["text"] = self._validate_caption(text)
@@ -1290,15 +1321,20 @@ class BackendService:
         post = self._post(actor_id, post_id)
         business = self._business(actor_id, post.business_id)
         self._ready(business)
-        asset = self.repo.get_asset(post.image_asset_id)
-        if asset.business_id != business.id:
+        asset = self.repo.get_asset(post.image_asset_id) if post.image_asset_id is not None else None
+        if asset and asset.business_id != business.id:
             raise InvalidInput("Некорректное изображение.")
-        self.files.read(asset)
+        if asset:
+            self.files.read(asset)
         self._validate_caption(post.text)
         guard_public_output(post.text)
-        if self.settings.mode == "live" and (post.is_demo or asset.is_demo):
+        if self.settings.mode == "live" and (post.is_demo or (asset and asset.is_demo)):
             raise InvalidInput("Тестовый материал нельзя публиковать в live-режиме.")
         return self.repo.approve_post(post_id, expected_revision, actor_id, self.now())
+
+    def post_revisions(self, actor_id: int, post_id: str) -> list[PostView]:
+        self.get_post(actor_id, post_id)
+        return self.repo.post_revisions(post_id)
 
     @actor_action
     def reject_post(self, actor_id: int, post_id: str, expected_revision: int) -> PostView:
@@ -1518,15 +1554,16 @@ class BackendService:
             return True
         attempted = False
         try:
-            asset = self.repo.get_asset(post.image_asset_id)
-            if asset.business_id != business.id:
+            asset = self.repo.get_asset(post.image_asset_id) if post.image_asset_id is not None else None
+            if asset and asset.business_id != business.id:
                 raise InvalidInput("Изображение относится к другому бизнесу.")
-            image = self.files.read(asset)
-            if self.settings.mode == "live" and (post.is_demo or asset.is_demo):
+            image = self.files.read(asset) if asset else None
+            if self.settings.mode == "live" and (post.is_demo or (asset and asset.is_demo)):
                 raise InvalidInput("Публикация тестового материала запрещена.")
             guard_public_output(post.text)
             await asyncio.to_thread(self.safety.check_text, [post.text])
-            await asyncio.to_thread(self.safety.check_image, image, asset.mime_type)
+            if asset:
+                await asyncio.to_thread(self.safety.check_image, image, asset.mime_type)
             try:
                 current = self._current_context(business)
             except Conflict:
@@ -1549,7 +1586,7 @@ class BackendService:
             # Do not wrap ambiguous network errors in a generic provider error here.
             async with asyncio.timeout(self.settings.provider_timeout_seconds):
                 result = PublicationResult.model_validate(
-                    await self.publisher.publish(post, image, asset.mime_type)
+                    await self.publisher.publish(post, image, asset.mime_type if asset else None)
                 )
             if result.channel_id != post.channel_id:
                 raise DeliveryUnknown("Не удалось подтвердить канал опубликованного сообщения.")
