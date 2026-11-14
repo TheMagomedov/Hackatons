@@ -141,10 +141,9 @@ async function api(url, body) {
   const method = body ? "POST" : "GET";
   accessRules.assertRequest(currentAccess(), method);
   if (demo) { const result = preview.api(url, method, body, dayKey); if (method === "POST") persistDemo(); return result; }
-  const initData = session.initData();
-  if (!initData) throw new Error("Не получены данные входа Telegram. Закройте студию и откройте её заново из меню бота.");
+  if (!session.authenticated()) throw new Error(session.error() || "Не получены данные входа Telegram или ВК. Закройте студию и откройте её заново из меню бота.");
   const response = await request("./api" + url, {
-      method, headers: {"X-Telegram-Init-Data": initData,
+      method, headers: {...session.headers(),
         ...(body ? {"Content-Type": "application/json"} : {})},
       body: body ? JSON.stringify(body) : undefined,
       cache: "no-store",
@@ -166,17 +165,17 @@ function postArt(post, additionalClass = "") {
     + icon("image") + '</div>';
 }
 async function loadImages(container) {
-  if (demo || !session.initData()) return;
+  if (demo || !session.authenticated()) return;
   await Promise.all([...container.querySelectorAll("[data-asset]")].map(loadImage));
 }
 async function loadImage(node) {
   const id = node?.dataset.asset;
-  if (!id || demo || !session.initData()) return;
+  if (!id || demo || !session.authenticated()) return;
   node.setAttribute("aria-busy", "true");
   node.innerHTML = icon("image");
   if (!imageUrls.has(id)) {
     const pending = request("./api/asset/" + path(id), {
-      headers: {"X-Telegram-Init-Data": session.initData()}, cache: "no-store", timeoutMs: 60000,
+      headers: session.headers(), cache: "no-store", timeoutMs: 60000,
     }).then(async (response) => {
       if (!response.ok) throw new Error("Нет изображения");
       const blob = await response.blob();
@@ -1002,7 +1001,7 @@ dialog.addEventListener("submit", async (event) => {
         persistDemo();
       } else {
         const data = new FormData(); data.append("file", file);
-        const response = await request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: {"X-Telegram-Init-Data": session.initData()}, body: data});
+        const response = await request("./api/business/" + path(id) + "/pdf", {method: "POST", headers: session.headers(), body: data});
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось загрузить документ.");
       }
       if (currentForm()) dialog.close(); await refresh(); notify(demo ? "Демонстрационный источник добавлен. Файл не отправлялся." : "PDF добавлен. Обновите профиль бизнеса.");
@@ -1079,7 +1078,7 @@ async function uploadManualImage(file, business, form) {
     assetId = crypto.randomUUID(); preview.addAsset({id: assetId, business_id: business, data_url: await fileData(file)});
   } else {
     const data = new FormData(); data.append("file", file);
-    const response = await request("./api/business/" + path(business) + "/image", {method: "POST", headers: {"X-Telegram-Init-Data": session.initData()}, body: data});
+    const response = await request("./api/business/" + path(business) + "/image", {method: "POST", headers: session.headers(), body: data});
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Не удалось сохранить изображение.");
     assetId = (await response.json()).id;
   }

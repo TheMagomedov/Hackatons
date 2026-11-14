@@ -185,7 +185,7 @@ class OwnerAccess(BaseMiddleware):
         if role == "reviewer":
             readable = ((event.data or "").split(":", 1)[0] in READ_CALLBACKS) if isinstance(
                 event, CallbackQuery,
-            ) else bool(re.match(r"^/(start|menu|cancel|help)(?:@[A-Za-z0-9_]+)?(?:\s|$)", event.text or ""))
+            ) else bool(re.match(r"^/(start|menu|cancel|help|link_vk|unlink_vk)(?:@[A-Za-z0-9_]+)?(?:\s|$)", event.text or ""))
             if not readable:
                 if isinstance(event, CallbackQuery):
                     await event.answer("Режим наблюдателя: доступен только просмотр.", show_alert=True)
@@ -602,6 +602,23 @@ def build_router(service: BackendService) -> Router:
     async def start(message: Message) -> None:
         await home(message, message.from_user.id)
 
+    @router.message(Command("link_vk", "unlink_vk"))
+    async def link_vk(message: Message) -> None:
+        adapter = getattr(service, "vk", None)
+        if adapter is None:
+            await reply(message, "Бот ВК пока не подключён: нужен ключ сообщества в настройках сервера.")
+            return
+        actor = message.from_user.id
+        if message.text.split()[0].split("@")[0] == "/unlink_vk":
+            adapter.unlink(actor)
+            await reply(message, "Привязка ВК и все выданные через неё сеансы студии отозваны.")
+            return
+        token = adapter.issue_link(actor)
+        await message.answer(
+            "Отправьте эту команду в личные сообщения нашего сообщества ВК. "
+            "Код одноразовый, действует 10 минут. Не передавайте его другим людям.\n\n/link " + token
+        )
+
     @router.message(Command("help"))
     async def help_message(message: Message) -> None:
         if service.access_role(message.from_user.id) == "reviewer":
@@ -617,6 +634,7 @@ def build_router(service: BackendService) -> Router:
             "5. «Открыть посты» — проверьте черновик, выберите время и согласуйте отправку версии.\n\n"
             "Автогенерация готовит черновики по интервалу; согласование каждого поста остаётся за вами.\n"
             "/menu — список компаний. /cancel — отменить ожидаемый ответ. "
+            "/link_vk — связать аккаунт ВК; /unlink_vk — отозвать привязку. "
             "Название компании указано перед каждым запросом ввода.",
             menu(mini_app_url=service.settings.mini_app_url),
         )

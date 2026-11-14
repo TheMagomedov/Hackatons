@@ -124,3 +124,38 @@ test('late SDK attaches ready, theme and BackButton once without repeating an AP
   assert.deepEqual(calls,{ready:1,expand:1,back:1,show:1,theme:1},'Repeated bridge signals do not duplicate handlers');
   assert.equal(app.requests.length,before);
 });
+
+test('VK launch exchanges once, removes ticket from URL and sends session to every API request',async()=>{
+  const launch='l'.repeat(43),token='s'.repeat(43);
+  const app=await application({role:'reviewer',can_write:false},false,{
+    sdk:false,hash:'#studioLaunch='+launch,
+    respond:(url,options)=> {
+      if(url==='./session/vk') {
+        assert.equal(options.method,'POST');
+        assert.equal(JSON.parse(options.body).launch,launch);
+        return {ok:true,json:async()=>({session:token})};
+      }
+      assert.equal(options.headers['X-Studio-Session'],token);
+      assert.equal(options.headers['X-Telegram-Init-Data'],undefined);
+      return {ok:true,json:async()=>({runtime_mode:'live',access:{role:'reviewer',can_write:false},businesses:[],business:null,sources:[],posts:[],counts:{}})};
+    },
+  });
+  assert.equal(app.context.location.hash,'#overview');
+  assert.equal(app.context.window.TirazhSession.initData(),'');
+  assert.equal(app.context.window.TirazhSession.authenticated(),true);
+  assert.equal(app.context.window.Telegram,undefined);
+  assert.equal(app.nodes.get('#main').dataset.screen,'empty');
+  await app.context.window.TirazhSession.waitForInitData();
+  assert.equal(app.requests.filter(r=>r.url==='./session/vk').length,1);
+});
+
+test('failed VK exchange produces recoverable error without sending workspace requests',async()=>{
+  const app=await application(undefined,false,{
+    sdk:false,hash:'#studioLaunch='+'l'.repeat(43),
+    respond:()=>({ok:false,json:async()=>({error:'expired'})}),
+  });
+  assert.equal(app.nodes.get('#main').dataset.screen,'error');
+  assert.match(app.nodes.get('#main').innerHTML,/Отправьте \/menu боту/);
+  assert.equal(app.requests.length,1);
+  assert.equal(app.context.window.TirazhSession.authenticated(),false);
+});

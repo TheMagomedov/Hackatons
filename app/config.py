@@ -20,6 +20,8 @@ class Settings(BaseModel):
     owner_id: int = Field(default=1, gt=0)
     timezone: str = "Europe/Moscow"
     telegram_bot_token: SecretStr | None = None
+    vk_group_id: int | None = Field(default=None, gt=0)
+    vk_group_token: SecretStr | None = None
     ai_factory: str | None = None
     image_factory: str | None = None
     report_factory: str | None = None
@@ -51,6 +53,10 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def live_credentials(self) -> "Settings":
+        if self.vk_group_id is not None or self.vk_group_token is not None:
+            if (self.mode != "live" or not self.vk_group_id or not self.mini_app_url
+                    or not self.vk_group_token or not self.vk_group_token.get_secret_value().strip()):
+                raise InvalidInput("Для ВК нужны live-режим, VK_GROUP_ID, VK_GROUP_TOKEN и MINI_APP_URL.")
         if self.mini_app_url:
             try:
                 url = urlsplit(self.mini_app_url)
@@ -88,6 +94,8 @@ class Settings(BaseModel):
             "OWNER_TELEGRAM_ID": "owner_id",
             "APP_TIMEZONE": "timezone",
             "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+            "VK_GROUP_ID": "vk_group_id",
+            "VK_GROUP_TOKEN": "vk_group_token",
             "AI_PROVIDER_FACTORY": "ai_factory",
             "IMAGE_PROVIDER_FACTORY": "image_factory",
             "REPORT_PROVIDER_FACTORY": "report_factory",

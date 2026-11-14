@@ -6,7 +6,7 @@
     "test:ui": "node tests/ui/smoke.cjs",
     "test:ui:a11y": "node tests/ui/a11y.cjs",
     "test:ui:content": "node tests/ui/content.cjs",
-    "test:ui:backend": "node tests/ui/backend.cjs"
+    "test:ui:backend": "node tests/ui/backend.cjs && node tests/ui/vk.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1"

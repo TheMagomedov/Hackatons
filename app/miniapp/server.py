@@ -147,10 +147,17 @@ async def guard(request, handler):
         if request.path.startswith("/mini/api/"):
             if SERVICE not in request.app:
                 raise NotFound("API недоступен в режиме предпросмотра.")
-            actor = validate_init_data(
-                request.headers.get("X-Telegram-Init-Data", ""), request.app[TOKEN],
-                request.app[SERVICE].now(),
-            )
+            studio_session = request.headers.get("X-Studio-Session", "")
+            if studio_session:
+                vk = getattr(request.app[SERVICE], "vk", None)
+                if vk is None:
+                    raise Forbidden("Вход через ВК не настроен.")
+                actor = vk.session_actor(studio_session)
+            else:
+                actor = validate_init_data(
+                    request.headers.get("X-Telegram-Init-Data", ""), request.app[TOKEN],
+                    request.app[SERVICE].now(),
+                )
             request.app[SERVICE].require_access(actor, write=request.method not in ("GET", "HEAD"))
             request[ACTOR] = actor
         response = await handler(request)
@@ -215,6 +222,15 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
             "status": "ok", "mode": "live" if SERVICE in request.app else "preview",
             "runtime_mode": request.app[SERVICE].settings.mode if SERVICE in request.app else "preview",
         })
+
+    async def vk_session(request):
+        vk = getattr(request.app.get(SERVICE), "vk", None)
+        if vk is None:
+            raise NotFound("Вход через ВК не настроен.")
+        body = await json_body(request)
+        if not isinstance(body, dict) or set(body) != {"launch"}:
+            raise InvalidInput("Нужна одноразовая ссылка входа.")
+        return web.json_response({"session": vk.exchange(body["launch"])})
 
     async def static_file(request):
         name = request.match_info["name"]
@@ -505,6 +521,7 @@ def create_app(service: BackendService | None = None, *, token: str = "") -> web
     app.add_routes([
         web.get("/mini/", index),
         web.get("/mini/health", health),
+        web.post("/mini/session/vk", vk_session),
         web.get(r"/mini/{name:styles\.css|overview\.css|calendar\.css|brand\.css|app\.js|session\.js|demo-store\.js|preview-runtime\.js|transport\.js|access\.js|inter-variable\.woff2|inter-OFL\.txt|brand-logo(?:-white)?\.png|brand-pattern-[123]\.png|brand-(?:intro|avenir-regular|avenir-medium|avenir-demi|avenir-bold)\.ttf}", static_file),
         web.get("/mini/api/state", state),
         web.get("/mini/api/business/{id}/posts", posts),
