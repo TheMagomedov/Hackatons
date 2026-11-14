@@ -1179,7 +1179,8 @@ async function generateImageForForm(form, business) {
   for (const [field] of saved) field.disabled = true;
   form.dataset.imageBusy = "1";
   const progress = form.querySelector('[data-image-progress]');
-  progress.textContent = "AI подбирает сцену по тексту, затем создаётся картинка. Дождитесь результата — это может занять несколько минут.";
+  progress.textContent = "AI подбирает сцену по тексту, затем создаётся картинка. Дождитесь результата — это может занять несколько минут."
+    + (state.capabilities?.image_local ? " Если FLUX занят, запрос дождётся своей очереди." : "");
   if (form.dataset.imageRequestText !== text || !form.dataset.imageRequestId) {
     form.dataset.imageRequestId = crypto.randomUUID(); form.dataset.imageRequestText = text;
   }

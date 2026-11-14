@@ -42,6 +42,10 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _LocalFluxBusy(Exception):
+    """The packaged gateway explicitly rejected a job before submitting it."""
+
+
 class UrllibImageTransport:
     """Default blocking transport. The provider always calls it in a worker thread."""
 
@@ -95,7 +99,9 @@ class OpenAIImageProvider:
 
     Cancellation or timeout stops awaiting the result. Python cannot terminate an
     already running urllib worker, so the remote generation may still complete.
-    The adapter never automatically repeats that request.
+    An accepted or ambiguously failed request is never automatically repeated.
+    Local FLUX calls wait their turn; only its explicit pre-submission busy
+    response can be polled again within the original deadline.
     """
 
     is_demo = False
@@ -167,6 +173,7 @@ class OpenAIImageProvider:
         self._timeout_seconds = float(timeout_seconds)
         self._endpoint = endpoint
         self._local_flux = allow_local_flux
+        self._local_lock = asyncio.Lock()
         self._limits = limits
         self._transport = transport if transport is not None else UrllibImageTransport()
 
@@ -205,7 +212,7 @@ class OpenAIImageProvider:
             method="POST",
         )
         try:
-            response = await asyncio.wait_for(
+            response = await self._send_local(http_request) if self._local_flux else await asyncio.wait_for(
                 asyncio.to_thread(
                     self._transport.send,
                     http_request,
@@ -215,14 +222,20 @@ class OpenAIImageProvider:
                 timeout=self._timeout_seconds,
             )
         except (asyncio.TimeoutError, TimeoutError, socket.timeout):
-            raise MediaTimeoutError("The image service request timed out.") from None
+            raise MediaTimeoutError(
+                "Не удалось дождаться изображения FLUX. Проверьте «Мои изображения» и очередь задач перед повтором."
+                if self._local_flux else "The image service request timed out."
+            ) from None
         except urllib.error.HTTPError as error:
             status = error.code
             error.close()
             if status in (401, 403):
                 raise MediaAuthenticationError("The image service rejected its credentials.") from None
             if status == 429:
-                raise MediaRateLimitError("The image service usage limit was reached.") from None
+                raise MediaRateLimitError(
+                    "Локальный сервис изображений временно отклонил запрос. Попробуйте позже."
+                    if self._local_flux else "Лимит внешнего сервиса изображений исчерпан. Проверьте квоту провайдера."
+                ) from None
             if status in (408, 504):
                 raise MediaTimeoutError("The image service request timed out.") from None
             if status >= 500:
@@ -244,6 +257,57 @@ class OpenAIImageProvider:
             provider="flux1-dev" if self._local_flux else "openai",
             is_demo=False,
         )
+
+    def _local_attempt(self, request, timeout):
+        try:
+            return self._transport.send(request, timeout, self._limits.max_response_bytes)
+        except urllib.error.HTTPError as error:
+            busy = False
+            try:
+                if error.code == 429:
+                    body = error.read(1025)
+                    payload = json.loads(body, object_pairs_hook=_unique_json_object) if len(body) <= 1024 else None
+                    busy = (isinstance(payload, dict) and isinstance(payload.get("error"), dict)
+                            and payload["error"].get("code") == "busy")
+            except (ValueError, TypeError, OSError, RecursionError):
+                pass
+            finally:
+                error.close()
+            if busy:
+                raise _LocalFluxBusy() from None
+            raise
+
+    async def _send_local(self, request):
+        # Share one FIFO across visual, batch-post and revision calls. Queue
+        # waiting consumes the same bounded deadline as generation itself.
+        deadline = asyncio.get_running_loop().time() + self._timeout_seconds
+        async with asyncio.timeout(self._timeout_seconds):
+            await self._local_lock.acquire()
+            worker = None
+            try:
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError()
+                    worker = asyncio.create_task(asyncio.to_thread(self._local_attempt, request, remaining))
+                    try:
+                        return await asyncio.shield(worker)
+                    except _LocalFluxBusy:
+                        # Gateway code 'busy' guarantees no ComfyUI submission.
+                        # Never repeat timeouts, disconnects, other 429s or 5xx.
+                        await asyncio.sleep(min(10.0, max(0.0, deadline - asyncio.get_running_loop().time())))
+            finally:
+                if worker is not None and not worker.done():
+                    # Cancellation cannot stop urllib: keep ownership until the
+                    # original call actually finishes, then consume its error.
+                    def release(finished):
+                        self._local_lock.release()
+                        if not finished.cancelled():
+                            finished.exception()
+
+                    worker.add_done_callback(release)
+                else:
+                    self._local_lock.release()
 
     def _decode_response(self, response: bytes) -> bytes:
         if not isinstance(response, bytes) or len(response) > self._limits.max_response_bytes:
